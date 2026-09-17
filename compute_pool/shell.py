@@ -1,4 +1,4 @@
-"""
+﻿"""
 Interactive Remote GPU Shell for Compute Pool.
 
 Boots an interactive terminal inside a live Kaggle Tesla T4 GPU container.
@@ -20,7 +20,9 @@ from rich.console import Console
 from rich.panel import Panel
 
 from compute_pool.auth.kaggle_auth import load_credentials
+from compute_pool.jobs.model import Job, JobSpec, JobState
 from compute_pool.probe import _get_authenticated_api
+from compute_pool.storage.local import load_all_jobs, upsert_job
 
 console = Console()
 
@@ -121,6 +123,22 @@ def launch_gpu_shell(
     kernel_ref = f"{username}/{SHELL_KERNEL_SLUG}"
     session_id = f"cp-shell-{uuid.uuid4().hex[:12]}"
 
+    # Register as an active running job in the state store
+    shell_job = Job(
+        id=f"job-shell-s{slot}",
+        spec=JobSpec(
+            name=f"interactive-shell-slot{slot}",
+            script="ttyd + cloudflared web terminal",
+            gpu=True,
+            gpu_memory_gb=15,
+        ),
+        state=JobState.RUNNING,
+        assigned_slot=slot,
+        assigned_username=username,
+        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+    )
+    upsert_job(shell_job)
+
     console.print(f"\n[bold cyan]Booting Interactive GPU Terminal (Slot {slot}: {username})...[/bold cyan]")
     console.print("  [dim]Provisioning 2x Tesla T4 GPU worker with live Web Terminal...[/dim]")
 
@@ -153,6 +171,8 @@ def launch_gpu_shell(
         try:
             api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
         except Exception as exc:
+            shell_job.transition(JobState.FAILED, error=str(exc))
+            upsert_job(shell_job)
             raise RuntimeError(f"Failed to push shell kernel to Kaggle: {exc}") from exc
 
     console.print("  [dim]Worker queued on Kaggle GPU cluster. Waiting for tunnel connection...[/dim]\n")
@@ -183,6 +203,8 @@ def launch_gpu_shell(
     print()  # newline after status dots
 
     if not web_url:
+        shell_job.transition(JobState.FAILED, error="Connection timeout")
+        upsert_job(shell_job)
         raise TimeoutError(
             f"Interactive terminal failed to establish tunnel connection within {timeout_seconds}s.\n"
             f"Check status on Kaggle: https://www.kaggle.com/code/{kernel_ref}"
@@ -267,3 +289,9 @@ def stop_gpu_shell(slot: int | None = None) -> None:
         except Exception as exc:
             console.print(f"[yellow]Notice for Slot {s}: {exc}[/yellow]")
 
+        # Update job state in local store
+        for j in load_all_jobs():
+            if j.id == f"job-shell-s{s}" or (j.assigned_slot == s and j.kaggle_kernel_slug == SHELL_KERNEL_SLUG):
+                if j.state == JobState.RUNNING:
+                    j.transition(JobState.COMPLETED)
+                    upsert_job(j)

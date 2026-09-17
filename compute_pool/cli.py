@@ -274,13 +274,14 @@ def job_list():
         console.print("\n[dim]No jobs found. Submit one with: compute-pool job submit <spec.yaml>[/dim]\n")
         return
 
-    console.print("\n[bold cyan]Compute Pool — Jobs[/bold cyan]\n")
-    table = Table(show_header=True, header_style="bold magenta", expand=False)
-    table.add_column("Job ID", style="bold")
-    table.add_column("Name")
-    table.add_column("State", min_width=10)
-    table.add_column("Slot", justify="center")
-    table.add_column("Account")
+    console.print("\n[bold cyan]Compute Pool -- Jobs[/bold cyan]\n")
+    from rich import box
+    table = Table(show_header=True, header_style="bold magenta", expand=False, box=box.ASCII)
+    table.add_column("Job ID", style="bold", no_wrap=True)
+    table.add_column("Name", no_wrap=True)
+    table.add_column("State", min_width=10, no_wrap=True)
+    table.add_column("Slot", justify="center", no_wrap=True)
+    table.add_column("Account", no_wrap=True)
     table.add_column("Submitted", no_wrap=True)
 
     STATE_COLORS = {

@@ -63,6 +63,7 @@ class TestShellModule:
             slot=1,
             username="user1",
             web_url="https://test.trycloudflare.com",
+            files_url="https://files.trycloudflare.com",
             duration_minutes=60,
         )
 

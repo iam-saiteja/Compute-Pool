@@ -639,7 +639,10 @@ subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
 ], check=True)
-
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/filebrowser/filebrowser/releases/download/v2.32.0/linux-amd64-filebrowser.tar.gz | tar -xz -C /usr/local/bin filebrowser && chmod +x /usr/local/bin/filebrowser"
+], check=False)
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
@@ -660,7 +663,16 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias halt='/usr/local/bin/stop'\\n")
     f.write("alias exit='/usr/local/bin/stop'\\n")
 
-ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
+ttyd_proc = subprocess.Popen([
+    "/usr/local/bin/ttyd", "-W", "-p", "7681",
+    "-t", "enableClipboard=true",
+    "-t", "fontSize=15",
+    "-t", "disableLeaveAlert=true",
+    "bash"
+])
+fb_proc = subprocess.Popen([
+    "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8080", "--noauth"
+])
 time.sleep(1)
 
 cf_proc = subprocess.Popen(
@@ -682,6 +694,25 @@ for line in cf_proc.stdout:
             pass
         break
 
+cf_fb_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8080", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+for line in cf_fb_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
+    if m:
+        files_url = m.group(0)
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-files", data=files_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        break
+
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
     try:
@@ -695,6 +726,7 @@ for _ in range(int(DURATION_MINUTES * 60 / 3)):
 
 subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
 subprocess.run(["pkill", "-9", "-f", "ttyd"], check=False)
+subprocess.run(["pkill", "-9", "-f", "filebrowser"], check=False)
 sys.exit(0)
 """
 
@@ -994,7 +1026,21 @@ def launch_gpu_shell(
     if not web_url:
         raise TimeoutError(f"Interactive terminal failed to establish tunnel connection within {timeout_seconds}s.")
 
-    _display_single_shell_panel(slot, username, web_url, duration_minutes)
+    # Fetch File Manager URL if available
+    files_url = ""
+    for _ in range(5):
+        try:
+            r_f = httpx.get(f"https://ntfy.sh/{session_id}-files/raw?poll=1", timeout=3)
+            if r_f.status_code == 200 and r_f.text.strip():
+                m_f = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r_f.text)
+                if m_f:
+                    files_url = m_f.group(0).strip()
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    _display_single_shell_panel(slot, username, web_url, files_url, duration_minutes)
 
     if open_web:
         console.print("\n[green]* Opening Web Terminal in your default browser...[/green]")
@@ -1003,7 +1049,7 @@ def launch_gpu_shell(
         except Exception:
             pass
 
-    return {"web": web_url, "kernel_ref": f"{username}/{kernel_slug}"}
+    return {"web": web_url, "files": files_url, "kernel_ref": f"{username}/{kernel_slug}"}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1039,7 +1085,8 @@ def _display_cluster_panel(master_user: str, worker_user: str, web_url: str, fil
     )
 
 
-def _display_single_shell_panel(slot: int, username: str, web_url: str, duration_minutes: int) -> None:
+def _display_single_shell_panel(slot: int, username: str, web_url: str, files_url: str = "", duration_minutes: int = 120) -> None:
+    files_line = f"  [bold yellow]File Manager URL (FTP / Drag & Drop Uploads):[/bold yellow]\n  [bold underline cyan]{files_url}[/bold underline cyan]\n\n" if files_url else ""
     body = (
         f"[bold green]* GPU Worker Active & Connected[/bold green]\n\n"
         f"  [bold white]Account Slot:[/bold white]   Slot {slot} ({username})\n"
@@ -1047,6 +1094,7 @@ def _display_single_shell_panel(slot: int, username: str, web_url: str, duration
         f"  [bold white]Max Duration:[/bold white]   {duration_minutes} minutes\n\n"
         f"  [bold yellow]Web Terminal URL:[/bold yellow]\n"
         f"  [bold underline cyan]{web_url}[/bold underline cyan]\n\n"
+        f"{files_line}"
         f"  [dim]* Type [bold white]stop[/bold white] or [bold white]exit[/bold white] in the terminal to immediately terminate & release GPU.[/dim]\n"
         f"  [dim]* Or run [bold white]compute-pool shell-stop[/bold white] from your local CLI.[/dim]"
     )

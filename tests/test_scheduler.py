@@ -6,11 +6,13 @@ from compute_pool.accounts.manager import AccountStatus
 
 class TestScheduler:
     def _make_status(self, slot, username, connected, hours_left):
+        used_secs = int((30.0 - hours_left) * 3600)
         return AccountStatus(
             slot=slot,
             username=username,
             connected=connected,
-            estimated_gpu_hours_remaining=hours_left,
+            gpu_seconds_used=used_secs,
+            gpu_seconds_total=108000,
         )
 
     def test_assigns_to_slot_with_most_hours(self, tmp_path, monkeypatch):

@@ -29,10 +29,10 @@ def schedule_job(job: Job) -> Job:
     statuses = get_all_statuses()
 
     for s in statuses:
-        icon = "[green]✓[/green]" if s.connected else "[red]✗[/red]"
+        icon = "[green]*[/green]" if s.connected else "[red]x[/red]"
         console.print(
             f"  Slot {s.slot} {icon}  {s.username:20s}  "
-            f"~{s.estimated_gpu_hours_remaining:.1f}h remaining"
+            f"{s.gpu_hours_remaining:.2f}h remaining"
         )
 
     job.transition(JobState.SCHEDULING)
@@ -53,7 +53,7 @@ def schedule_job(job: Job) -> Job:
     upsert_job(job)
 
     console.print(
-        f"\n  [green]→ Job [bold]{job.id}[/bold] assigned to "
+        f"\n  [green]-> Job [bold]{job.id}[/bold] assigned to "
         f"slot {winner.slot} ({winner.username})[/green]"
     )
     return job

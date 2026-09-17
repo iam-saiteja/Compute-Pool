@@ -2,11 +2,12 @@
 compute-pool CLI
 
 Commands:
-    compute-pool login --slot {1|2}       Authenticate a Kaggle account
-    compute-pool accounts status          Show both account statuses + quota
-    compute-pool job submit <spec.yaml>   Submit a job (schedule + assign)
-    compute-pool job list                 List all jobs
-    compute-pool job status <job-id>      Show one job's full status
+    compute-pool login --slot {1|2}         Authenticate a Kaggle account
+    compute-pool accounts status            Show both account statuses + quota + cached GPU info
+    compute-pool accounts probe --slot N    Push nvidia-smi kernel, show real GPU hardware
+    compute-pool job submit <spec.yaml>     Submit a job (schedule + assign)
+    compute-pool job list                   List all jobs
+    compute-pool job status <job-id>        Show one job's full status
 """
 from __future__ import annotations
 
@@ -58,11 +59,11 @@ def login(
 
 @accounts_app.command("status")
 def accounts_status():
-    """Show live status and estimated GPU quota for both accounts."""
+    """Show live status, GPU quota, and cached GPU hardware for both accounts."""
     from rich.panel import Panel
     from rich.columns import Columns
-    from rich.text import Text
     from compute_pool.accounts.manager import get_all_statuses
+    from compute_pool.probe import load_cached_gpu_info
 
     console.print("\n[bold cyan]Compute Pool — Account Status[/bold cyan]\n")
     statuses = get_all_statuses()
@@ -73,31 +74,46 @@ def accounts_status():
     for s in statuses:
         if s.connected:
             status_line = "[bold green]* Connected[/bold green]"
-            total_left += s.estimated_gpu_hours_remaining
+            total_left += s.gpu_hours_remaining
         else:
             status_line = "[bold red]x Disconnected[/bold red]"
 
-        bar_filled = int((s.estimated_gpu_hours_remaining / 30.0) * 20)
+        bar_filled = int((s.gpu_hours_remaining / (s.gpu_hours_total or 30.0)) * 20)
         bar = "[green]" + "#" * bar_filled + "[/green]" + "[dim]" + "-" * (20 - bar_filled) + "[/dim]"
+
+        # Load cached GPU probe result
+        gpu = load_cached_gpu_info(s.slot)
+        if gpu and not gpu.error and gpu.gpu_name != "Unknown":
+            gpu_line = f"[bold yellow]{gpu.gpu_name}[/bold yellow] x{gpu.gpu_count}  [cyan]{gpu.vram_gb} GB VRAM[/cyan]"
+            driver_line = f"  Driver: {gpu.driver_version} | CUDA: {gpu.cuda_version}"
+            probed_at = f"  (probed {gpu.probed_at[:10]})"
+        else:
+            gpu_line = "[dim]Not probed — run: compute-pool accounts probe --slot {}[/dim]".format(s.slot)
+            driver_line = ""
+            probed_at = ""
 
         lines = [
             f"[bold]{s.username}[/bold]   (slot {s.slot})",
             "",
             f"  Status      : {status_line}",
-            f"  Kernels 7d  : {s.kernels_run_this_week}",
-            f"  GPU-h used  : ~{s.estimated_gpu_hours_used:.1f}h",
-            f"  GPU-h left  : [bold]~{s.estimated_gpu_hours_remaining:.1f}h[/bold] / 30h",
+            f"  GPU HW      : {gpu_line}",
+        ]
+        if driver_line:
+            lines.append(driver_line)
+            lines.append(probed_at)
+        lines += [
+            "",
+            f"  GPU-h used  : {s.gpu_hours_used:.2f}h",
+            f"  GPU-h left  : [bold]{s.gpu_hours_remaining:.2f}h[/bold] / {s.gpu_hours_total:.1f}h",
             f"  Quota       : {bar}",
         ]
+        if s.quota_refresh_time:
+            lines.append(f"  Resets      : {s.quota_refresh_time[:10]}")
         if s.error:
             lines.append(f"\n  [red]{s.error}[/red]")
 
         color = "green" if s.connected else "red"
-        panels.append(Panel(
-            "\n".join(lines),
-            border_style=color,
-            expand=True,
-        ))
+        panels.append(Panel("\n".join(lines), border_style=color, expand=True))
 
     console.print(Columns(panels, equal=True, expand=True))
 
@@ -105,13 +121,63 @@ def accounts_status():
     pool_bar_filled = int((min(total_left, 60.0) / 60.0) * 40)
     pool_bar = "[cyan]" + "#" * pool_bar_filled + "[/cyan]" + "[dim]" + "-" * (40 - pool_bar_filled) + "[/dim]"
     console.print(
-        f"\n  [bold]Total pooled quota[/bold] : [bold cyan]~{total_left:.1f}h[/bold cyan] GPU-hours available"
+        f"\n  [bold]Total pooled quota[/bold] : [bold cyan]{total_left:.2f}h[/bold cyan] GPU-hours available"
     )
     console.print(f"  {pool_bar}")
     console.print(
-        "\n  [dim]Quota estimated from kernel run history "
-        "(Kaggle doesn't expose exact remaining hours via API).[/dim]\n"
+        "\n  [dim]Exact quota from Kaggle API. "
+        "Probe real GPU via: compute-pool accounts probe --slot N[/dim]\n"
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool accounts probe
+# ─────────────────────────────────────────────────────────────────────────────
+
+@accounts_app.command("probe")
+def accounts_probe(
+    slot: int = typer.Option(..., "--slot", "-s", help="Account slot to probe (1 or 2)"),
+):
+    """
+    Push a GPU probe kernel to Kaggle and display real hardware info (nvidia-smi).
+
+    This provisions a real Kaggle GPU instance to inspect live hardware.
+    Results are cached — run once per account.
+    """
+    from rich.panel import Panel
+    from compute_pool.probe import run_probe
+
+    if slot not in (1, 2):
+        console.print("[red]Error:[/red] --slot must be 1 or 2.")
+        raise typer.Exit(1)
+
+    console.print(f"\n[bold cyan]Compute Pool — GPU Probe (Slot {slot})[/bold cyan]")
+    console.print("  Executing nvidia-smi kernel on Kaggle GPU worker...\n")
+
+    info = run_probe(slot)
+
+    if info.error:
+        console.print(f"\n  [red]Probe failed:[/red] {info.error}\n")
+        raise typer.Exit(1)
+
+    lines = [
+        f"[bold]{info.username}[/bold]   (slot {slot})",
+        "",
+        f"  GPU model    : [bold yellow]{info.gpu_name}[/bold yellow]",
+        f"  GPU count    : {info.gpu_count}",
+        f"  VRAM per GPU : [cyan]{info.vram_gb} GB[/cyan]  ({info.vram_mb} MiB)",
+        f"  Driver       : {info.driver_version}",
+        f"  CUDA Version : {info.cuda_version}",
+        f"  Probed at    : {info.probed_at[:19].replace('T', ' ')} UTC",
+    ]
+    console.print(Panel("\n".join(lines), border_style="yellow", title="Live GPU Worker Hardware", expand=False))
+
+    if info.raw_smi:
+        console.print("\n  [dim]Raw nvidia-smi output:[/dim]")
+        for line in info.raw_smi.splitlines()[:30]:
+            console.print(f"  [dim]{line}[/dim]")
+    console.print()
+
 
 
 
@@ -122,12 +188,14 @@ def accounts_status():
 @job_app.command("submit")
 def job_submit(
     spec_file: Path = typer.Argument(..., help="Path to job YAML spec file"),
+    run: bool = typer.Option(False, "--run", "-r", help="Immediately dispatch and run on remote GPU"),
 ):
-    """Submit a job to the compute pool."""
+    """Submit a job to the compute pool (and optionally execute on GPU)."""
     import yaml
     from compute_pool.jobs.model import Job, JobSpec
     from compute_pool.scheduler.simple import schedule_job
     from compute_pool.storage.local import upsert_job
+    from compute_pool.jobs.runner import run_job_remote
 
     if not spec_file.exists():
         console.print(f"[red]Error:[/red] File not found: {spec_file}")
@@ -167,6 +235,27 @@ def job_submit(
     if job.error:
         console.print(f"  [red]Error    : {job.error}[/red]")
     console.print()
+
+    if run and job.assigned_slot:
+        run_job_remote(job.id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool job run
+# ─────────────────────────────────────────────────────────────────────────────
+
+@job_app.command("run")
+def job_run(
+    job_id: str = typer.Argument(..., help="Job ID to run on remote Kaggle GPU"),
+):
+    """Run an assigned job on its remote Kaggle GPU worker."""
+    from compute_pool.jobs.runner import run_job_remote
+    try:
+        run_job_remote(job_id)
+    except Exception as e:
+        console.print(f"[red]Error running job {job_id}:[/red] {e}")
+        raise typer.Exit(1)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

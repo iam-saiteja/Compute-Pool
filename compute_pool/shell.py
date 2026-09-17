@@ -255,8 +255,13 @@ if os.path.exists("/kaggle/working/.cluster_worker_url"):
 
 local_gpus = []
 try:
+    smi_bin = "nvidia-smi"
+    for candidate in ["/usr/bin/nvidia-smi", "/usr/local/cuda/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"]:
+        if os.path.exists(candidate):
+            smi_bin = candidate
+            break
     out = subprocess.check_output(
-        ["/usr/bin/nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
+        [smi_bin, "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
         text=True
     )
     for line in out.strip().splitlines():

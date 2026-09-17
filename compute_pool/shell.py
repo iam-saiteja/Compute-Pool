@@ -141,8 +141,11 @@ class ClusterWorkerHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-socketserver.TCPServer.allow_reuse_address = True
-httpd = socketserver.TCPServer(("0.0.0.0", 8888), ClusterWorkerHandler)
+class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+httpd = ThreadedTCPServer(("0.0.0.0", 8888), ClusterWorkerHandler)
 threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
 # 3. Expose Worker RPC over Cloudflare tunnel

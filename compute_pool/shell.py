@@ -199,53 +199,8 @@ subprocess.run([
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
-# 2. Start ttyd on port 7681
-ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
-time.sleep(1)
-
-# 3. Start cloudflared tunnel for Web Terminal
-cf_proc = subprocess.Popen(
-    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True
-)
-
-for line in cf_proc.stdout:
-    clean = line.strip()
-    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
-    if m:
-        terminal_url = m.group(0)
-        print("========================================", flush=True)
-        print(f"WEB_TERMINAL: {terminal_url}", flush=True)
-        print("========================================", flush=True)
-        try:
-            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
-        break
-
-# 4. Background thread to discover Worker RPC endpoint & configure cluster mesh tools
-def setup_cluster_tools():
-    worker_url = ""
-    for _ in range(90):
-        try:
-            r = urllib.request.urlopen(f"https://ntfy.sh/{WORKER_SESSION_ID}/raw?poll=1", timeout=3)
-            txt = r.read().decode("utf-8").strip()
-            m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", txt)
-            if m:
-                worker_url = m.group(0).strip()
-                break
-        except Exception:
-            pass
-        time.sleep(2)
-    
-    with open("/kaggle/working/.cluster_worker_url", "w") as f:
-        f.write(worker_url)
-
-    # 4a. Install unified cluster-smi
-    smi_script = '''#!/usr/bin/env python3
+# 2. Configure cluster mesh scripts synchronously into /usr/local/bin
+smi_script = '''#!/usr/bin/env python3
 import subprocess, json, urllib.request, os
 
 worker_url = ""
@@ -257,7 +212,7 @@ local_gpus = []
 try:
     smi_bin = "nvidia-smi"
     for candidate in ["/usr/bin/nvidia-smi", "/usr/local/cuda/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"]:
-        if os.path.exists(candidate):
+        if os.path.exists(candidate) and candidate != "/usr/local/bin/nvidia-smi":
             smi_bin = candidate
             break
     out = subprocess.check_output(
@@ -310,12 +265,15 @@ status_str = "4/4 GPUs Active (ONLINE)" if len(all_gpus) >= 4 else f"{len(all_gp
 print(f"| Cluster VRAM: {used_vram}MiB / {total_vram:.0f}GB ({len(all_gpus)} GPUs) | Status: {status_str:<32} |")
 print("+-----------------------------------------------------------------------------------------+")
 '''
-    with open("/usr/local/bin/cluster-smi", "w") as f:
-        f.write(smi_script)
-    os.chmod("/usr/local/bin/cluster-smi", 0o755)
+with open("/usr/local/bin/cluster-smi", "w") as f:
+    f.write(smi_script)
+os.chmod("/usr/local/bin/cluster-smi", 0o755)
 
-    # 4b. Install cluster-exec
-    exec_script = '''#!/usr/bin/env python3
+with open("/usr/local/bin/nvidia-smi", "w") as f:
+    f.write(smi_script)
+os.chmod("/usr/local/bin/nvidia-smi", 0o755)
+
+exec_script = '''#!/usr/bin/env python3
 import sys, subprocess, json, urllib.request, os
 
 if len(sys.argv) < 2:
@@ -353,12 +311,11 @@ if worker_url:
 else:
     print("[!] Worker Node 1 is not connected.")
 '''
-    with open("/usr/local/bin/cluster-exec", "w") as f:
-        f.write(exec_script)
-    os.chmod("/usr/local/bin/cluster-exec", 0o755)
+with open("/usr/local/bin/cluster-exec", "w") as f:
+    f.write(exec_script)
+os.chmod("/usr/local/bin/cluster-exec", 0o755)
 
-    # 4c. Install cluster-status
-    status_script = '''#!/usr/bin/env python3
+status_script = '''#!/usr/bin/env python3
 import os, urllib.request, json, time
 
 worker_url = ""
@@ -380,22 +337,84 @@ if worker_url:
 else:
     print("Node 1 (Worker Slot 2) : CONNECTING...")
 '''
-    with open("/usr/local/bin/cluster-status", "w") as f:
-        f.write(status_script)
-    os.chmod("/usr/local/bin/cluster-status", 0o755)
+with open("/usr/local/bin/cluster-status", "w") as f:
+    f.write(status_script)
+os.chmod("/usr/local/bin/cluster-status", 0o755)
 
-    # 4d. Configure ~/.bashrc aliases and traps
-    with open(os.path.expanduser("~/.bashrc"), "a") as f:
-        f.write("\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@cluster-master\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
-        f.write("alias nvidia-smi='/usr/local/bin/cluster-smi'\\n")
-        f.write("alias gpus='/usr/local/bin/cluster-smi'\\n")
-        f.write("alias watch-gpu='watch -n 1 /usr/local/bin/cluster-smi'\\n")
-        f.write("alias real-smi='/usr/bin/nvidia-smi'\\n")
-        f.write("alias stop='python3 -c \\\"import urllib.request, os; p=open(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\").read().strip() if os.path.exists(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\") else \\\\\\\"\\\\\\\"; os.system(\\\\\\\"curl -s \\\\\\\" + p + \\\\\\\"/stop >/dev/null 2>&1\\\\\\\") if p else None; os.system(\\\\\\\"kill -9 -1\\\\\\\")\\\"'\\n")
-        f.write("alias halt='stop'\\n")
-        f.write("trap 'python3 -c \\\"import urllib.request, os; p=open(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\").read().strip() if os.path.exists(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\") else \\\\\\\"\\\\\\\"; os.system(\\\\\\\"curl -s \\\\\\\" + p + \\\\\\\"/stop >/dev/null 2>&1\\\\\\\") if p else None; os.system(\\\\\\\"kill -9 -1\\\\\\\")\\\"' EXIT\\n")
+watch_script = '''#!/bin/bash
+watch -n 1 /usr/local/bin/cluster-smi
+'''
+with open("/usr/local/bin/watch-gpu", "w") as f:
+    f.write(watch_script)
+os.chmod("/usr/local/bin/watch-gpu", 0o755)
 
-threading.Thread(target=setup_cluster_tools, daemon=True).start()
+stop_script = '''#!/bin/bash
+if [ -f /kaggle/working/.cluster_worker_url ]; then
+    WURL=$(cat /kaggle/working/.cluster_worker_url)
+    if [ -n "$WURL" ]; then
+        curl -s "$WURL/stop" >/dev/null 2>&1
+    fi
+fi
+kill -9 -1
+'''
+with open("/usr/local/bin/stop", "w") as f:
+    f.write(stop_script)
+os.chmod("/usr/local/bin/stop", 0o755)
+
+# Configure bash environment
+with open(os.path.expanduser("~/.bashrc"), "a") as f:
+    f.write("\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@cluster-master\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
+    f.write("alias gpus='/usr/local/bin/cluster-smi'\\n")
+    f.write("alias watch-gpu='/usr/local/bin/watch-gpu'\\n")
+    f.write("alias halt='/usr/local/bin/stop'\\n")
+    f.write("trap '/usr/local/bin/stop' EXIT\\n")
+
+# 3. Start ttyd on port 7681 with interactive login bash
+ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash", "--login", "-i"])
+time.sleep(1)
+
+# 4. Start cloudflared tunnel for Web Terminal
+cf_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+for line in cf_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
+    if m:
+        terminal_url = m.group(0)
+        print("========================================", flush=True)
+        print(f"WEB_TERMINAL: {terminal_url}", flush=True)
+        print("========================================", flush=True)
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        break
+
+# 5. Background thread to discover Worker RPC endpoint
+def setup_cluster_worker_discovery():
+    worker_url = ""
+    for _ in range(90):
+        try:
+            r = urllib.request.urlopen(f"https://ntfy.sh/{WORKER_SESSION_ID}/raw?poll=1", timeout=3)
+            txt = r.read().decode("utf-8").strip()
+            m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", txt)
+            if m:
+                worker_url = m.group(0).strip()
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+    
+    with open("/kaggle/working/.cluster_worker_url", "w") as f:
+        f.write(worker_url)
+
+threading.Thread(target=setup_cluster_worker_discovery, daemon=True).start()
 
 # Keep master alive until exit
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"

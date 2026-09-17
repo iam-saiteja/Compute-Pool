@@ -1,0 +1,1 @@
+"""Local JSON state store."""

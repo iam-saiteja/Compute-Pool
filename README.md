@@ -7,9 +7,10 @@
 ## Features
 
 - **Multi-Account GPU Pooling**: Aggregate 2+ Kaggle accounts into a shared pool (~60h/week total quota, **4x Tesla T4 GPUs**, ~60 GB VRAM).
+- **Dual-Node Concurrent Interactive Shells**: Boot independent live terminals on **BOTH accounts simultaneously** with a single command (`compute-pool shell-all --web`).
 - **Live Hardware Probing**: Real-time `nvidia-smi` kernel probe detecting GPU count, VRAM, CUDA 13.0, and driver versions.
 - **Distributed Multi-Node Training**: Train models in parallel across distinct Kaggle accounts simultaneously (`compute-pool distributed run`).
-- **Interactive Remote GPU Terminal**: Zero-install browser terminal with root bash, 256-color support, CUDA tools, and shell aliases (`compute-pool shell`).
+- **Zero-Install Web Terminals**: Secure HTTPS/WSS browser terminals with root bash, 256-color support, and CUDA tools.
 - **Instant Lifecycle & Stop Controls**: Cancel jobs and terminate remote GPU containers in `< 0.5s` to preserve quota (`compute-pool job stop`, `compute-pool shell-stop`).
 - **Quota-Aware Intelligent Scheduler**: Automatically assigns workloads to the account slot with the most remaining GPU hours.
 - **Provider-Compliant Architecture**: 100% official Kaggle API integration with isolated execution environments.
@@ -27,10 +28,10 @@ Compute Pool Orchestration Architecture
 │   ├── scheduler/      # Quota-aware job scheduler & slot assigner
 │   ├── jobs/           # Job model, state machine & remote Kaggle GPU runner
 │   ├── distributed/    # Multi-node parallel training coordinator
-│   ├── shell/          # Interactive web terminal bridge (ttyd + Cloudflare tunnel)
+│   ├── shell/          # Dual-node & single-node interactive web terminal bridges
 │   ├── storage/        # Local JSON persistent state database
 │   └── cli.py          # Full-featured Typer CLI
-└── tests/              # Comprehensive test suite (17/17 tests passing)
+└── tests/              # Comprehensive test suite (18/18 tests passing)
 ```
 
 ---
@@ -64,57 +65,38 @@ compute-pool login --slot 2
 compute-pool accounts status
 ```
 
-Output:
-```text
-Compute Pool -- Account Status
-
-+-------------------------------------------+
-| saitejathanniru   (slot 1)                |
-|   Status      : * Connected               |
-|   GPU HW      : Tesla T4 x2  15.0 GB VRAM |
-|   GPU-h left  : 29.43h / 30.0h            |
-+-------------------------------------------+
-+-------------------------------------------+
-| thannirusahithya01   (slot 2)             |
-|   Status      : * Connected               |
-|   GPU HW      : Tesla T4 x2  15.0 GB VRAM |
-|   GPU-h left  : 29.68h / 30.0h            |
-+-------------------------------------------+
-
-  Total pooled quota : 59.11h GPU-hours available
-```
-
-### 4. Probe Remote GPU Hardware
-
-```bash
-compute-pool accounts probe --slot 1
-compute-pool accounts probe --slot 2
-```
-
 ---
 
-## Interactive Remote GPU Terminal
+## Interactive Remote GPU Terminals
 
-Boot an interactive root bash terminal inside a live Tesla T4 GPU container:
-
+### 1. Launch Dual Interactive Shells on BOTH Accounts Simultaneously (4x Tesla T4 GPUs):
 ```bash
-# Launch interactive terminal on Slot 1
-compute-pool shell --slot 1
+# Boot interactive terminals on BOTH accounts and automatically open both tabs in browser:
+compute-pool shell-all --web
 
-# Launch and automatically open in your default browser
-compute-pool shell --slot 1 --web
-
-# Launch on Slot 2 with custom duration (e.g. 60 minutes)
-compute-pool shell --slot 2 --duration 60 --web
+# Or:
+compute-pool shell --all --web
 ```
 
-### Stopping Terminal Sessions:
+### 2. Launch on a Specific Single Slot:
 ```bash
-# Stop active terminal on Slot 1 and immediately release GPU:
+# Launch interactive terminal on Slot 1:
+compute-pool shell --slot 1 --web
+
+# Launch interactive terminal on Slot 2:
+compute-pool shell --slot 2 --web
+```
+
+### 3. Stop / Terminate Active Shells:
+```bash
+# Stop all active interactive GPU terminals and immediately free GPUs:
+compute-pool shell-stop
+
+# Stop only Slot 1:
 compute-pool shell-stop --slot 1
 
-# Stop all active terminal sessions:
-compute-pool shell-stop
+# Stop only Slot 2:
+compute-pool shell-stop --slot 2
 ```
 
 ---
@@ -139,42 +121,6 @@ Compute Pool -- Distributed Cluster Job (job-24d5ee6b)
 
 ---
 
-## Single Job Submission & Lifecycle
-
-### Submit and Run a Job
-```bash
-# Submit a YAML spec to the pool queue:
-compute-pool job submit examples/hello_gpu.yaml
-
-# Run immediately:
-compute-pool job run examples/hello_gpu.yaml
-```
-
-### Monitor Jobs
-```bash
-# List all jobs:
-compute-pool job list
-
-# View detailed status of a single job:
-compute-pool job status <job-id>
-```
-
-### Cancel & Stop Running Jobs
-```bash
-# Stop a specific running job and terminate its GPU worker:
-compute-pool job stop <job-id>
-# Or:
-compute-pool job cancel <job-id>
-
-# Cancel all running/queued jobs:
-compute-pool job stop --all
-
-# Emergency account-wide stop & reset:
-compute-pool accounts stop
-```
-
----
-
 ## Complete CLI Reference
 
 | Command | Description |
@@ -183,15 +129,16 @@ compute-pool accounts stop
 | `compute-pool accounts status` | Show live status, quota, and cached GPU specs |
 | `compute-pool accounts probe --slot N` | Push live `nvidia-smi` kernel and extract hardware specs |
 | `compute-pool accounts stop [--slot N]` | Terminate all active jobs/sessions and idle account(s) |
-| `compute-pool shell [--slot 1\|2] [--web]` | Boot interactive remote GPU terminal |
-| `compute-pool shell-stop [--slot N]` | Terminate running shell terminal and release GPU |
+| `compute-pool shell-all [--web]` | **Boot dual interactive terminals on BOTH accounts (4x T4 GPUs)** |
+| `compute-pool shell [--slot 1\|2] [--all] [--web]` | Boot interactive remote GPU terminal(s) |
+| `compute-pool shell-stop [--slot N]` | Terminate running shell terminal(s) and release GPU |
+| `compute-pool distributed run <spec.yaml>` | Run distributed multi-node parallel training |
 | `compute-pool job submit <spec.yaml>` | Submit and schedule a job |
 | `compute-pool job run <spec.yaml>` | Submit, schedule, and run immediately |
 | `compute-pool job list` | List all historical and active jobs |
 | `compute-pool job status <job-id>` | Inspect detailed state and metadata of a job |
 | `compute-pool job stop <job-id>` | Cancel a running remote GPU job |
 | `compute-pool job stop --all` | Cancel all active jobs |
-| `compute-pool distributed run <spec.yaml>` | Run distributed multi-node parallel training |
 
 ---
 
@@ -202,7 +149,7 @@ Run the full automated test suite:
 ```bash
 pytest
 ```
-*17/17 tests passing across jobs, scheduler, and interactive shell modules.*
+*18/18 tests passing across jobs, scheduler, single shell, and dual-cluster shell modules.*
 
 ---
 

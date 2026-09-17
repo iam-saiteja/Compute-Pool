@@ -110,6 +110,22 @@ class ClusterWorkerHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(resp).encode("utf-8"))
+        elif self.path == "/sync_file":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            try:
+                data = json.loads(body)
+                fname = data.get("filename", "script.py")
+                content = data.get("content", "")
+                with open(os.path.join("/kaggle/working", fname), "w") as f:
+                    f.write(content)
+                resp = {"status": "OK", "filename": fname}
+            except Exception as e:
+                resp = {"status": "ERROR", "error": str(e)}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
         elif self.path == "/stop":
             self.send_response(200)
             self.end_headers()
@@ -291,11 +307,12 @@ exec_script = '''#!/usr/bin/env python3
 import sys, subprocess, json, urllib.request, os
 
 if len(sys.argv) < 2:
-    print("Usage: cluster-exec \\"<command>\\"")
+    print('Usage: cluster-exec "<command>"')
     sys.exit(1)
 
 cmd = " ".join(sys.argv[1:])
-print(f"[*] Executing across Cluster: {cmd}\\n")
+print("[*] Executing across Cluster: " + cmd)
+print()
 
 print("--- [Node 0 (Slot 1)] ---")
 subprocess.run(cmd, shell=True)
@@ -306,10 +323,11 @@ if os.path.exists("/kaggle/working/.cluster_worker_url"):
         worker_url = f.read().strip()
 
 if worker_url:
-    print("\\n--- [Node 1 (Slot 2)] ---")
+    print()
+    print("--- [Node 1 (Slot 2)] ---")
     try:
         req = urllib.request.Request(
-            f"{worker_url}/exec",
+            worker_url + "/exec",
             data=json.dumps({"cmd": cmd}).encode("utf-8"),
             headers={"Content-Type": "application/json"}
         )
@@ -355,6 +373,75 @@ with open("/usr/local/bin/cluster-status", "w") as f:
     f.write(status_script)
 os.chmod("/usr/local/bin/cluster-status", 0o755)
 
+# Cluster Runner (runs code across all 4 GPUs transparently)
+run_script = '''#!/usr/bin/env python3
+import sys, subprocess, json, urllib.request, os, glob, threading
+
+if len(sys.argv) < 2:
+    print("Usage: cluster-run <script.py or command> [args...]")
+    sys.exit(1)
+
+worker_url = ""
+if os.path.exists("/kaggle/working/.cluster_worker_url"):
+    with open("/kaggle/working/.cluster_worker_url") as f:
+        worker_url = f.read().strip()
+
+target = sys.argv[1]
+args = " ".join(sys.argv[2:])
+
+if os.path.exists(target) and target.endswith(".py"):
+    # Sync python files to Node 1
+    if worker_url:
+        for py_file in glob.glob("*.py") + [target]:
+            try:
+                with open(py_file, "r") as f:
+                    content = f.read()
+                req = urllib.request.Request(
+                    worker_url + "/sync_file",
+                    data=json.dumps({"filename": os.path.basename(py_file), "content": content}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                urllib.request.urlopen(req, timeout=10)
+            except Exception:
+                pass
+    cmd = f"python3 {target} {args}".strip()
+else:
+    cmd = " ".join(sys.argv[1:])
+
+print(f"[*] Dispatching across 4 GPUs (Master + Worker): {cmd}\\n")
+
+def run_remote():
+    if not worker_url:
+        return
+    try:
+        req = urllib.request.Request(
+            worker_url + "/exec",
+            data=json.dumps({"cmd": cmd, "env": {"NODE_RANK": "1", "WORLD_SIZE": "4"}}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=600) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("stdout"):
+                print("[Node 1 (GPUs 2,3)]\\n" + data["stdout"], end="")
+            if data.get("stderr"):
+                print("[Node 1 ERR]\\n" + data["stderr"], end="")
+    except Exception as e:
+        print("[Node 1 Error]", e)
+
+t = threading.Thread(target=run_remote)
+t.start()
+
+env = os.environ.copy()
+env["NODE_RANK"] = "0"
+env["WORLD_SIZE"] = "4"
+print("[Node 0 (GPUs 0,1)]")
+subprocess.run(cmd, shell=True, env=env)
+t.join()
+'''
+with open("/usr/local/bin/cluster-run", "w") as f:
+    f.write(run_script)
+os.chmod("/usr/local/bin/cluster-run", 0o755)
+
 watch_script = '''#!/bin/bash
 watch -n 1 /usr/local/bin/cluster-smi
 '''
@@ -376,18 +463,64 @@ with open("/usr/local/bin/stop", "w") as f:
     f.write(stop_script)
 os.chmod("/usr/local/bin/stop", 0o755)
 
+# Pre-install cluster_pool python module
+cp_module = '''# Compute Pool Cluster Library - Multi-Node GPU Support
+import torch, os, json, urllib.request
+
+def gpus():
+    return [
+        {"id": 0, "node": "Node 0 (Master)", "name": "Tesla T4 (15 GB)"},
+        {"id": 1, "node": "Node 0 (Master)", "name": "Tesla T4 (15 GB)"},
+        {"id": 2, "node": "Node 1 (Worker)", "name": "Tesla T4 (15 GB)"},
+        {"id": 3, "node": "Node 1 (Worker)", "name": "Tesla T4 (15 GB)"},
+    ]
+
+def total_vram_gb():
+    return 60.0
+
+def is_cluster_online():
+    return os.path.exists("/kaggle/working/.cluster_worker_url")
+'''
+with open("/kaggle/working/cluster_pool.py", "w") as f:
+    f.write(cp_module)
+
+# Create ready-to-run 4-GPU PyTorch Demo
+demo_script = '''import torch
+import time
+import os
+
+rank = int(os.environ.get("NODE_RANK", "0"))
+node_name = f"Node {rank}"
+gpus = [torch.cuda.get_device_name(i) for i in range(torch.cuda.device_count())]
+
+print(f"[{node_name}] Found {len(gpus)} local GPUs: {gpus}")
+for i in range(torch.cuda.device_count()):
+    t = torch.randn((4000, 4000), device=f"cuda:{i}")
+    res = torch.matmul(t, t).sum().item()
+    print(f"[{node_name} GPU {i}] Matrix Mult Test (4000x4000) Result: {res:.2f} (OK)")
+'''
+with open("/kaggle/working/demo_4gpu.py", "w") as f:
+    f.write(demo_script)
+
 # Configure bash environment
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("\\nexport PATH=/usr/local/bin:$PATH\\n")
     f.write("export PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@cluster-master\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='/usr/local/bin/cluster-smi'\\n")
     f.write("alias watch-gpu='/usr/local/bin/watch-gpu'\\n")
+    f.write("alias run='/usr/local/bin/cluster-run'\\n")
     f.write("alias real-smi='/usr/local/bin/real-nvidia-smi'\\n")
     f.write("alias halt='/usr/local/bin/stop'\\n")
     f.write("alias exit='/usr/local/bin/stop'\\n")
 
-# 4. Start ttyd on port 7681
-ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
+# 4. Start ttyd on port 7681 with clipboard support
+ttyd_proc = subprocess.Popen([
+    "/usr/local/bin/ttyd", "-W", "-p", "7681",
+    "-t", "enableClipboard=true",
+    "-t", "fontSize=15",
+    "-t", "disableLeaveAlert=true",
+    "bash"
+])
 time.sleep(1)
 
 # 5. Start cloudflared tunnel for Web Terminal

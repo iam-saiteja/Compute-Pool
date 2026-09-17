@@ -55,11 +55,14 @@ subprocess.run([
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
-# 3. Configure shell environment with aliases
+# 3. Configure shell environment with aliases and exit traps
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write(f"\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@{NODE_LABEL}\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='nvidia-smi'\\n")
     f.write("alias watch-gpu='watch -n 1 nvidia-smi'\\n")
+    f.write("alias stop='kill -9 -1'\\n")
+    f.write("alias halt='kill -9 -1'\\n")
+    f.write("trap 'kill -9 -1' EXIT\\n")
 
 # 4. Start ttyd with bash
 ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
@@ -398,7 +401,8 @@ def _display_shell_panel(slot: int, username: str, web_url: str, duration_minute
         f"  [bold white]Max Duration:[/bold white]   {duration_minutes} minutes\n\n"
         f"  [bold yellow]Web Terminal URL:[/bold yellow]\n"
         f"  [bold underline cyan]{web_url}[/bold underline cyan]\n\n"
-        f"  [dim]Click the URL above to access full root bash, CUDA drivers & nvidia-smi live.[/dim]"
+        f"  [dim]* Type [bold white]stop[/bold white] or [bold white]exit[/bold white] in the terminal to immediately terminate & release GPU.[/dim]\n"
+        f"  [dim]* Or run [bold white]compute-pool shell-stop[/bold white] from your local CLI.[/dim]"
     )
     console.print(
         Panel(
@@ -418,7 +422,8 @@ def _display_dual_shell_panel(user1: str, user2: str, url1: str, url2: str, dura
         f"  Web Terminal: [bold underline cyan]{url1}[/bold underline cyan]\n\n"
         f"+-- [bold yellow]Node 1: Slot 2 ({user2}) - 2x Tesla T4[/bold yellow] -------------------------+\n"
         f"  Web Terminal: [bold underline cyan]{url2}[/bold underline cyan]\n\n"
-        f"  [dim]Both nodes have independent root bash environments with PyTorch & CUDA 13.0.[/dim]"
+        f"  [dim]* Type [bold white]stop[/bold white] or [bold white]exit[/bold white] in either terminal to immediately terminate & release GPU.[/dim]\n"
+        f"  [dim]* Or run [bold white]compute-pool shell-stop[/bold white] from your local CLI.[/dim]"
     )
     console.print(
         Panel(

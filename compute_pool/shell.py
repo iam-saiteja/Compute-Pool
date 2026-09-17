@@ -670,6 +670,32 @@ def _get_shell_slug(slot: int) -> str:
     return f"interactive-gpu-terminal-s{slot}"
 
 
+def _force_stop_slot(api, username: str, slug: str) -> None:
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            meta = {
+                "id": f"{username}/{slug}",
+                "title": slug,
+                "code_file": "stop.py",
+                "language": "python",
+                "kernel_type": "script",
+                "is_private": "true",
+                "enable_gpu": "false",
+                "enable_tpu": "false",
+                "enable_internet": "false",
+                "dataset_sources": [],
+                "competition_sources": [],
+                "kernel_sources": [],
+                "model_sources": [],
+            }
+            (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
+            (tmp_path / "stop.py").write_text("import sys\nsys.exit(0)\n")
+            api.kernels_push(str(tmp_path))
+    except Exception:
+        pass
+
+
 def _push_kernel_payload(slot: int, slug: str, script_body: str) -> dict:
     """Helper to authenticate and push a GPU kernel payload for a given slot."""
     creds = load_credentials(slot)
@@ -706,20 +732,24 @@ def _push_kernel_payload(slot: int, slug: str, script_body: str) -> dict:
         (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
         (tmp_path / "script.py").write_text(script_body)
 
-        for attempt in range(4):
+        for attempt in range(5):
             try:
                 resp = api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
                 err_msg = resp.get("error") if isinstance(resp, dict) else getattr(resp, "error", None)
                 if err_msg:
                     err_str = str(err_msg).strip()
                     if "Maximum batch GPU session count" in err_str or "429" in err_str or "Conflict" in err_str:
-                        time.sleep(5)
+                        console.print(f"  [yellow]* Slot {slot} GPU session occupied. Automatically releasing old session (attempt {attempt+1}/5)...[/yellow]")
+                        _force_stop_slot(api, username, slug)
+                        time.sleep(8)
                         continue
                     return {"slot": slot, "username": username, "status": "FAILED", "error": err_str}
                 return {"slot": slot, "username": username, "status": "QUEUED", "kernel_ref": kernel_ref, "error": None}
             except Exception as exc:
                 if "409" in str(exc) or "Conflict" in str(exc) or "Maximum batch" in str(exc) or "429" in str(exc):
-                    time.sleep(5)
+                    console.print(f"  [yellow]* Slot {slot} busy. Releasing and retrying (attempt {attempt+1}/5)...[/yellow]")
+                    _force_stop_slot(api, username, slug)
+                    time.sleep(8)
                     continue
                 return {"slot": slot, "username": username, "status": "FAILED", "error": str(exc)}
 
@@ -727,7 +757,7 @@ def _push_kernel_payload(slot: int, slug: str, script_body: str) -> dict:
             "slot": slot,
             "username": username,
             "status": "FAILED",
-            "error": "Kaggle GPU session limit reached (Maximum batch GPU sessions reached). Please ensure no interactive sessions are running at kaggle.com and wait 1-2 minutes.",
+            "error": "Kaggle GPU session limit reached. Please ensure no interactive notebook sessions are open at kaggle.com and retry.",
         }
 
 

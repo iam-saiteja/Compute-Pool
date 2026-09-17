@@ -117,8 +117,8 @@ class TestLocalStorage:
 
         reindexed = storage.reindex_jobs()
         assert len(reindexed) == 2
-        assert reindexed[0].id == "job-0"
-        assert reindexed[1].id == "job-1"
+        assert reindexed[0].id == "0"
+        assert reindexed[1].id == "1"
 
     def test_upsert_updates_existing(self, tmp_path, monkeypatch):
         import compute_pool.storage.local as storage

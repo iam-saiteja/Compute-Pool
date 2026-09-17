@@ -46,7 +46,7 @@ def _default_job_id() -> str:
         from compute_pool.storage.local import next_job_id
         return next_job_id()
     except Exception:
-        return "job-0"
+        return "0"
 
 
 @dataclass

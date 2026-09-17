@@ -44,22 +44,20 @@ def save_all_jobs(jobs: list[Job]) -> None:
 
 
 def next_job_id() -> str:
-    """Generate the next sequential 0-indexed job ID (job-0, job-1, ...)."""
+    """Generate the next sequential 0-indexed job ID ('0', '1', '2', ...)."""
     jobs = load_all_jobs()
     if not jobs:
-        return "job-0"
+        return "0"
 
     indices = []
     for j in jobs:
-        m = re.match(r"^job-(\d+)$", j.id)
+        m = re.match(r"^(?:job-)?(\d+)$", str(j.id))
         if m:
             indices.append(int(m.group(1)))
-        elif j.id.isdigit():
-            indices.append(int(j.id))
 
     if indices:
-        return f"job-{max(indices) + 1}"
-    return f"job-{len(jobs)}"
+        return str(max(indices) + 1)
+    return str(len(jobs))
 
 
 def upsert_job(job: Job) -> None:
@@ -76,7 +74,7 @@ def _normalize_id_match(target: str, candidate_id: str) -> bool:
         return True
     if cand_clean == f"job-{target_clean}":
         return True
-    if target_clean.startswith("job-") and cand_clean == target_clean[4:]:
+    if target_clean == f"job-{cand_clean}":
         return True
     return False
 
@@ -105,7 +103,7 @@ def delete_job(job_id: Union[str, int]) -> Optional[Job]:
 
     if target_job:
         save_all_jobs(remaining)
-        job_dir = DATA_DIR / "jobs" / target_job.id
+        job_dir = DATA_DIR / "jobs" / str(target_job.id)
         if job_dir.exists() and job_dir.is_dir():
             shutil.rmtree(job_dir, ignore_errors=True)
 
@@ -127,7 +125,7 @@ def clear_jobs(all_jobs: bool = False) -> list[Job]:
     for j in jobs:
         if all_jobs or j.state not in active_states:
             deleted.append(j)
-            job_dir = DATA_DIR / "jobs" / j.id
+            job_dir = DATA_DIR / "jobs" / str(j.id)
             if job_dir.exists() and job_dir.is_dir():
                 shutil.rmtree(job_dir, ignore_errors=True)
         else:
@@ -139,7 +137,7 @@ def clear_jobs(all_jobs: bool = False) -> list[Job]:
 
 def reindex_jobs() -> list[Job]:
     """
-    Re-index all existing jobs chronologically from job-0 to job-N.
+    Re-index all existing jobs chronologically from 0 to N.
     Renames local artifact directories to match new IDs.
     Returns the updated job list.
     """
@@ -148,8 +146,8 @@ def reindex_jobs() -> list[Job]:
     jobs.sort(key=lambda j: j.created_at or "")
 
     for idx, j in enumerate(jobs):
-        old_id = j.id
-        new_id = f"job-{idx}"
+        old_id = str(j.id)
+        new_id = str(idx)
         if old_id != new_id:
             old_dir = DATA_DIR / "jobs" / old_id
             new_dir = DATA_DIR / "jobs" / new_id

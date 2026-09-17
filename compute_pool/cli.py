@@ -322,13 +322,18 @@ def job_list():
         return
 
     console.print("\n[bold cyan]Compute Pool -- Jobs[/bold cyan]\n")
-    table = Table(show_header=True, header_style="bold magenta", expand=False, box=box.ASCII)
-    table.add_column("Job ID", style="bold cyan", no_wrap=True)
-    table.add_column("Name", no_wrap=True)
-    table.add_column("State", min_width=10, no_wrap=True)
-    table.add_column("Slot", justify="center", no_wrap=True)
-    table.add_column("Account", no_wrap=True)
-    table.add_column("Submitted", no_wrap=True)
+    table = Table(
+        show_header=True,
+        header_style="bold magenta",
+        box=box.ASCII,
+        padding=(0, 1),
+    )
+    table.add_column("ID", style="bold cyan", justify="right", min_width=4)
+    table.add_column("Name", style="bold white", min_width=15, overflow="fold")
+    table.add_column("State", justify="center", min_width=10)
+    table.add_column("Slot", justify="center", min_width=4)
+    table.add_column("Account", style="white", min_width=15, overflow="fold")
+    table.add_column("Submitted", style="dim", min_width=11)
 
     STATE_COLORS = {
         "QUEUED": "yellow",
@@ -343,13 +348,15 @@ def job_list():
 
     for j in reversed(jobs):
         color = STATE_COLORS.get(j.state.value, "white")
-        submitted = j.created_at[:16].replace("T", " ")
+        # Format as "09-17 14:46"
+        created = j.created_at or ""
+        submitted = (created[5:16].replace("T", " ")) if len(created) >= 16 else created
         table.add_row(
-            j.id,
-            j.spec.name,
+            str(j.id),
+            str(j.spec.name),
             f"[{color}]{j.state.value}[/{color}]",
             str(j.assigned_slot or "-"),
-            j.assigned_username or "-",
+            str(j.assigned_username or "-"),
             submitted,
         )
 
@@ -414,7 +421,7 @@ def job_delete(
 
     if reindex and deleted_count > 0:
         reindex_jobs()
-        console.print("  [cyan]* Remaining jobs re-indexed sequentially from job-0.[/cyan]")
+        console.print("  [cyan]* Remaining jobs re-indexed sequentially from 0.[/cyan]")
 
     console.print(f"\n[bold green]Done. Deleted {deleted_count} job record(s).[/bold green]\n")
 
@@ -449,7 +456,7 @@ def job_clear(
 
     if reindex:
         reindex_jobs()
-        console.print("  [cyan]* Remaining jobs re-indexed sequentially from job-0.[/cyan]")
+        console.print("  [cyan]* Remaining jobs re-indexed sequentially from 0.[/cyan]")
     console.print()
 
 
@@ -459,7 +466,7 @@ def job_clear(
 
 @job_app.command("reindex")
 def job_reindex():
-    """Re-index all existing jobs chronologically from job-0 to job-N."""
+    """Re-index all existing jobs chronologically from 0 to N."""
     from compute_pool.storage.local import reindex_jobs
 
     jobs = reindex_jobs()
@@ -467,7 +474,7 @@ def job_reindex():
         console.print("[dim]No jobs in store to re-index.[/dim]\n")
         return
 
-    console.print(f"\n[bold green]* Re-indexed {len(jobs)} job(s) sequentially starting from job-0:[/bold green]")
+    console.print(f"\n[bold green]* Re-indexed {len(jobs)} job(s) sequentially starting from 0:[/bold green]")
     for j in jobs:
         console.print(f"  - [bold cyan]{j.id}[/bold cyan] : {j.spec.name} ({j.state.value})")
     console.print()

@@ -161,6 +161,8 @@ def run_distributed_job(spec_file: Path) -> None:
     )
 
     job = Job(spec=spec)
+    job.assigned_slot = "1, 2"
+    job.assigned_username = "saitejathanniru, thannirusahithya01"
     job.transition(JobState.RUNNING)
     upsert_job(job)
 

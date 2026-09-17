@@ -12,7 +12,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Optional
+from typing import Optional, Union
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -47,7 +47,7 @@ class Job:
     id: str = field(default_factory=lambda: f"job-{uuid.uuid4().hex[:8]}")
     spec: JobSpec = field(default_factory=lambda: JobSpec(name="unnamed", script=""))
     state: JobState = JobState.QUEUED
-    assigned_slot: Optional[int] = None          # 1 or 2
+    assigned_slot: Optional[Union[int, str]] = None          # 1, 2, or "1, 2"
     assigned_username: Optional[str] = None
     kaggle_kernel_slug: Optional[str] = None
     retry_count: int = 0

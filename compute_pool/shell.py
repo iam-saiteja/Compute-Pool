@@ -1,4 +1,4 @@
-﻿"""
+"""
 Interactive Remote GPU Shell for Compute Pool.
 
 Boots interactive terminals inside live Kaggle Tesla T4 GPU containers.
@@ -304,12 +304,9 @@ def launch_dual_gpu_shells(
         kaggle_kernel_slug=_get_shell_slug(2),
     ))
 
-    # Push kernels concurrently
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        f1 = executor.submit(_launch_single_slot_proc, 1, duration_minutes, session1_id)
-        f2 = executor.submit(_launch_single_slot_proc, 2, duration_minutes, session2_id)
-        res1 = f1.result()
-        res2 = f2.result()
+    # Push kernels sequentially to avoid KaggleApi env race condition
+    res1 = _launch_single_slot_proc(1, duration_minutes, session1_id)
+    res2 = _launch_single_slot_proc(2, duration_minutes, session2_id)
 
     if res1.get("status") == "FAILED" or res2.get("status") == "FAILED":
         err = f"Slot 1: {res1.get('error')} | Slot 2: {res2.get('error')}"

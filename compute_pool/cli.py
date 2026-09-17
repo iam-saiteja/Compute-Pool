@@ -184,13 +184,13 @@ def job_list():
         return
 
     console.print("\n[bold cyan]Compute Pool — Jobs[/bold cyan]\n")
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Job ID", width=14)
-    table.add_column("Name", width=20)
-    table.add_column("State", width=14)
-    table.add_column("Slot", width=6)
-    table.add_column("Account", width=20)
-    table.add_column("Submitted", width=22)
+    table = Table(show_header=True, header_style="bold magenta", expand=False)
+    table.add_column("Job ID", style="bold")
+    table.add_column("Name")
+    table.add_column("State", min_width=10)
+    table.add_column("Slot", justify="center")
+    table.add_column("Account")
+    table.add_column("Submitted", no_wrap=True)
 
     STATE_COLORS = {
         "QUEUED": "yellow",
@@ -205,13 +205,14 @@ def job_list():
 
     for j in reversed(jobs):
         color = STATE_COLORS.get(j.state.value, "white")
+        submitted = j.created_at[:16].replace("T", " ")   # "2026-09-17 09:36"
         table.add_row(
             j.id,
             j.spec.name,
             f"[{color}]{j.state.value}[/{color}]",
             str(j.assigned_slot or "-"),
             j.assigned_username or "-",
-            j.created_at[:19].replace("T", " "),
+            submitted,
         )
 
     console.print(table)

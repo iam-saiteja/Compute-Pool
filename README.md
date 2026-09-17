@@ -1,4 +1,4 @@
-﻿# Compute Pool
+# Compute Pool
 
 > **Provider-compliant distributed compute orchestration system that pools voluntarily shared, unused Kaggle free-tier GPU capacity across multiple accounts into a single high-throughput compute cluster.**
 
@@ -32,6 +32,27 @@ Compute Pool Orchestration Architecture
 │   ├── storage/        # Local JSON persistent state database
 │   └── cli.py          # Full-featured Typer CLI
 └── tests/              # Comprehensive test suite (18/18 tests passing)
+```
+
+### Dual-Node Interactive Shell Lifecycle
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI as Local CLI (Compute Pool)
+    participant K1 as Kaggle Worker 1 (saitejathanniru)
+    participant K2 as Kaggle Worker 2 (thannirusahithya01)
+    participant CF as Cloudflare Tunnel Edge
+
+    CLI->>K1: Dispatch Kernel (2x Tesla T4)
+    CLI->>K2: Dispatch Kernel (2x Tesla T4)
+    Note over K1,K2: Cloud VM Allocation & Container Initialization (~30-50s)
+    K1->>K1: Install ttyd + cloudflared (~5s)
+    K2->>K2: Install ttyd + cloudflared (~5s)
+    K1->>CF: Establish Secure HTTPS/WSS Tunnel
+    K2->>CF: Establish Secure HTTPS/WSS Tunnel
+    CF-->>CLI: Rendezvous Handshake (<2s)
+    CLI-->>CLI: Open Both Browser Tabs Automatically
 ```
 
 ---

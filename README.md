@@ -101,7 +101,20 @@ compute-pool shell --web
 compute-pool shell --duration 120 --web
 ```
 
-### 2. Launch Single-Node Terminal (2x Tesla T4 GPUs):
+When booted, Compute Pool provides two entrypoints:
+1. 🖥️ **Master Web Terminal**: Single interactive control terminal for all 4 GPUs with live `nvidia-smi` and `run`.
+2. 📁 **Cluster File Manager (FTP)**: Visual drag-and-drop file browser to upload datasets/weights directly from your PC and download outputs/checkpoints with one click.
+
+### 2. Built-in Cluster Commands:
+| Command | Action |
+|---|---|
+| `run <script.py>` | Automatically synchronizes code to Node 1 and executes simultaneously across **all 4 GPUs**. |
+| `nvidia-smi` / `gpus` | Live ASCII table aggregating all 4 GPUs and 60 GB VRAM across both nodes. |
+| `watch-gpu` | 1-second live auto-refreshing 4-GPU dashboard. |
+| `cluster-status` | Inter-node mesh health and RPC latency diagnostic. |
+| `stop` / `exit` | Gracefully shuts down both nodes and immediately releases GPU quotas. |
+
+### 3. Launch Single-Node Terminal (2x Tesla T4 GPUs):
 ```bash
 # Launch interactive terminal on Slot 1 only:
 compute-pool shell --slot 1 --web
@@ -110,7 +123,7 @@ compute-pool shell --slot 1 --web
 compute-pool shell --slot 2 --web
 ```
 
-### 3. Stop / Terminate Active Cluster:
+### 4. Stop / Terminate Active Cluster:
 ```bash
 # Stop active cluster terminals and immediately release all 4 GPUs:
 compute-pool shell-stop
@@ -154,8 +167,7 @@ Compute Pool -- Distributed Cluster Job (job-24d5ee6b)
 | `compute-pool accounts status` | Show live status, quota, and cached GPU specs |
 | `compute-pool accounts probe --slot N` | Push live `nvidia-smi` kernel and extract hardware specs |
 | `compute-pool accounts stop [--slot N]` | Terminate all active jobs/sessions and idle account(s) |
-| `compute-pool shell-all [--web]` | **Boot dual interactive terminals on BOTH accounts (4x T4 GPUs)** |
-| `compute-pool shell [--slot 1\|2] [--all] [--web]` | Boot interactive remote GPU terminal(s) |
+| `compute-pool shell [--slot 1\|2] [--web]` | **Boot unified 4-GPU cluster with Web Terminal & File Manager** |
 | `compute-pool shell-stop [--slot N]` | Terminate running shell terminal(s) and release GPU |
 | `compute-pool distributed run <spec.yaml>` | Run distributed multi-node parallel training |
 | `compute-pool job submit <spec.yaml>` | Submit and schedule a job |

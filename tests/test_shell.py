@@ -56,6 +56,7 @@ class TestShellModule:
             master_user="user1",
             worker_user="user2",
             web_url="https://master.trycloudflare.com",
+            files_url="https://files.trycloudflare.com",
             duration_minutes=60,
         )
         _display_single_shell_panel(

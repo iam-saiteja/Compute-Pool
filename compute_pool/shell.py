@@ -209,11 +209,15 @@ NODE_LABEL = "cluster-master"
 
 print("[*] Initializing Compute Pool Master GPU Terminal (4x Tesla T4 Cluster)...", flush=True)
 
-# 1. Install ttyd and cloudflared
+# 1. Install ttyd, filebrowser, and cloudflared
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
 ], check=True)
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/filebrowser/filebrowser/releases/download/v2.32.0/linux-amd64-filebrowser.tar.gz | tar -xz -C /usr/local/bin filebrowser && chmod +x /usr/local/bin/filebrowser"
+], check=False)
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
@@ -518,7 +522,7 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias halt='/usr/local/bin/stop'\\n")
     f.write("alias exit='/usr/local/bin/stop'\\n")
 
-# 4. Start ttyd on port 7681 with clipboard support
+# 4. Start ttyd on port 7681 and filebrowser on port 8080
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
     "-t", "enableClipboard=true",
@@ -526,9 +530,12 @@ ttyd_proc = subprocess.Popen([
     "-t", "disableLeaveAlert=true",
     "bash"
 ])
+fb_proc = subprocess.Popen([
+    "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8080", "--noauth"
+])
 time.sleep(1)
 
-# 5. Start cloudflared tunnel for Web Terminal
+# 5. Start cloudflared tunnels for Web Terminal (7681) & File Manager (8080)
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -546,6 +553,28 @@ for line in cf_proc.stdout:
         print("========================================", flush=True)
         try:
             req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        break
+
+cf_fb_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8080", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+for line in cf_fb_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
+    if m:
+        files_url = m.group(0)
+        print("========================================", flush=True)
+        print(f"FILE_MANAGER: {files_url}", flush=True)
+        print("========================================", flush=True)
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-files", data=files_url.encode("utf-8"))
             urllib.request.urlopen(req, timeout=10)
         except Exception:
             pass
@@ -585,6 +614,7 @@ for _ in range(int(DURATION_MINUTES * 60 / 3)):
 
 subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
 subprocess.run(["pkill", "-9", "-f", "ttyd"], check=False)
+subprocess.run(["pkill", "-9", "-f", "filebrowser"], check=False)
 sys.exit(0)
 """
 
@@ -859,7 +889,21 @@ def launch_cluster_shell(
     if not master_web_url:
         raise TimeoutError(f"Cluster terminal failed to establish tunnel connection within {timeout_seconds}s.")
 
-    _display_cluster_panel(creds1["username"], creds2["username"], master_web_url, duration_minutes)
+    # Fetch File Manager URL if available
+    master_files_url = ""
+    for _ in range(5):
+        try:
+            r_f = httpx.get(f"https://ntfy.sh/{session_master_id}-files/raw?poll=1", timeout=3)
+            if r_f.status_code == 200 and r_f.text.strip():
+                m_f = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r_f.text)
+                if m_f:
+                    master_files_url = m_f.group(0).strip()
+                    break
+        except Exception:
+            pass
+        time.sleep(1)
+
+    _display_cluster_panel(creds1["username"], creds2["username"], master_web_url, master_files_url, duration_minutes)
 
     if open_web:
         console.print("\n[green]* Opening Master Web Terminal in your default browser...[/green]")
@@ -870,6 +914,7 @@ def launch_cluster_shell(
 
     return {
         "web": master_web_url,
+        "files": master_files_url,
         "master_ref": f"{creds1['username']}/{_get_shell_slug(1)}",
         "worker_ref": f"{creds2['username']}/{_get_shell_slug(2)}",
     }
@@ -964,7 +1009,8 @@ def launch_gpu_shell(
 # ─────────────────────────────────────────────────────────────────────────────
 # 6. UI Panels & Teardown
 # ─────────────────────────────────────────────────────────────────────────────
-def _display_cluster_panel(master_user: str, worker_user: str, web_url: str, duration_minutes: int) -> None:
+def _display_cluster_panel(master_user: str, worker_user: str, web_url: str, files_url: str = "", duration_minutes: int = 120) -> None:
+    files_line = f"  [bold yellow]Cluster File Manager URL (FTP / Drag & Drop):[/bold yellow]\n  [bold underline cyan]{files_url}[/bold underline cyan]\n\n" if files_url else ""
     body = (
         f"[bold green]* Unified 4-GPU Interactive Cluster Online & Ready[/bold green]\n\n"
         f"  [bold white]Cluster Hardware:[/bold white]   [bold cyan]4x Tesla T4 GPUs (~60 GB VRAM total)[/bold cyan]\n"
@@ -973,10 +1019,11 @@ def _display_cluster_panel(master_user: str, worker_user: str, web_url: str, dur
         f"  [bold white]Max Duration:[/bold white]       {duration_minutes} minutes\n\n"
         f"  [bold yellow]Master Web Terminal URL (Single Control Entrypoint):[/bold yellow]\n"
         f"  [bold underline cyan]{web_url}[/bold underline cyan]\n\n"
+        f"{files_line}"
         f"+-- [bold yellow]Cluster Built-in Commands[/bold yellow] ---------------------------------------------+\n"
         f"  * [bold white]nvidia-smi[/bold white] / [bold white]gpus[/bold white] : Live unified table showing all 4 GPUs\n"
         f"  * [bold white]watch-gpu[/bold white]         : Live 1-second auto-refresh 4-GPU monitor\n"
-        f"  * [bold white]cluster-exec <cmd>[/bold white]: Execute command across both nodes simultaneously\n"
+        f"  * [bold white]run <script.py>[/bold white]   : Run across all 4 GPUs (auto code-sync + parallel)\n"
         f"  * [bold white]cluster-status[/bold white]     : Inter-node mesh health & latency check\n"
         f"  * [bold white]stop[/bold white] / [bold white]exit[/bold white]       : Instantly teardown both nodes and release GPUs\n"
         f"+-------------------------------------------------------------------------+\n\n"

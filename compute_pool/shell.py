@@ -1,8 +1,10 @@
 """
 Interactive Remote GPU Shell for Compute Pool.
 
-Boots interactive terminals inside live Kaggle Tesla T4 GPU containers.
-Supports single-slot and dual-node cluster shells with full root bash, CUDA tools & live GPU inspection.
+Boots a unified 4-GPU Master-Worker Interactive Cluster Terminal.
+Node 0 (Slot 1: 2x Tesla T4) acts as the interactive Master with web terminal.
+Node 1 (Slot 2: 2x Tesla T4) acts as an attached compute worker over an inter-node mesh.
+Provides real-time 4-GPU monitoring (nvidia-smi / watch-gpu) and multi-node execution (cluster-exec, cluster-status).
 """
 from __future__ import annotations
 
@@ -28,8 +30,389 @@ from compute_pool.storage.local import load_all_jobs, upsert_job
 
 console = Console()
 
-# Remote startup script executed inside the Kaggle GPU container
-SHELL_BOOTSTRAP_TEMPLATE = """\
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. Worker Node Template (Node 1 - Slot 2: Attached Compute Node)
+# ─────────────────────────────────────────────────────────────────────────────
+WORKER_BOOTSTRAP_TEMPLATE = """\
+import http.server
+import json
+import os
+import re
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+
+SESSION_ID = "__SESSION_ID__"
+DURATION_MINUTES = __DURATION_MINUTES__
+NODE_LABEL = "node1-slot2"
+
+print(f"[*] Initializing Compute Pool GPU Cluster Worker ({NODE_LABEL})...", flush=True)
+
+# 1. Install cloudflared for secure RPC tunnel
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
+], check=True)
+
+# 2. Worker RPC Server
+class ClusterWorkerHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "OK", "node": NODE_LABEL}).encode("utf-8"))
+        elif self.path == "/smi":
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
+                    text=True
+                )
+                gpus = []
+                for line in out.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) >= 7:
+                        gpus.append({
+                            "name": parts[1],
+                            "mem_used": int(float(parts[2])),
+                            "mem_total": int(float(parts[3])),
+                            "util": int(float(parts[4])),
+                            "temp": int(float(parts[5])),
+                            "power": parts[6] + "W"
+                        })
+                self.wfile.write(json.dumps({"gpus": gpus}).encode("utf-8"))
+            except Exception as e:
+                self.wfile.write(json.dumps({"error": str(e), "gpus": []}).encode("utf-8"))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/exec":
+            length = int(self.headers.get("Content-Length", 0))
+            body = self.rfile.read(length).decode("utf-8")
+            try:
+                data = json.loads(body)
+                cmd = data.get("cmd", "")
+                env = os.environ.copy()
+                env.update(data.get("env", {}))
+                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
+                resp = {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
+            except Exception as e:
+                resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode("utf-8"))
+        elif self.path == "/stop":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+            def _die():
+                time.sleep(0.5)
+                os.system("pkill -9 -f cloudflared; kill -9 -1")
+            threading.Thread(target=_die).start()
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+socketserver.TCPServer.allow_reuse_address = True
+httpd = socketserver.TCPServer(("0.0.0.0", 8888), ClusterWorkerHandler)
+threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+# 3. Expose Worker RPC over Cloudflare tunnel
+cf_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8888", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+for line in cf_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
+    if m:
+        worker_url = m.group(0)
+        print("========================================", flush=True)
+        print(f"WORKER_RPC: {worker_url}", flush=True)
+        print("========================================", flush=True)
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=worker_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+            print("[*] Worker RPC published to cluster.", flush=True)
+        except Exception as exc:
+            print("[!] Worker publish failed:", exc, flush=True)
+        break
+
+# Keep worker alive until stop signal or duration
+stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
+for _ in range(int(DURATION_MINUTES * 60 / 3)):
+    try:
+        req = urllib.request.Request(stop_url)
+        with urllib.request.urlopen(req, timeout=2) as r:
+            if r.read().decode("utf-8").strip() == "STOP":
+                break
+    except Exception:
+        pass
+    time.sleep(3)
+
+subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
+sys.exit(0)
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. Master Node Template (Node 0 - Slot 1: Interactive Control Center)
+# ─────────────────────────────────────────────────────────────────────────────
+MASTER_BOOTSTRAP_TEMPLATE = """\
+import os
+import subprocess
+import sys
+import time
+import re
+import urllib.request
+import json
+import threading
+
+SESSION_ID = "__SESSION_ID__"
+WORKER_SESSION_ID = "__WORKER_SESSION_ID__"
+DURATION_MINUTES = __DURATION_MINUTES__
+NODE_LABEL = "cluster-master"
+
+print("[*] Initializing Compute Pool Master GPU Terminal (4x Tesla T4 Cluster)...", flush=True)
+
+# 1. Install ttyd and cloudflared
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
+], check=True)
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
+], check=True)
+
+# 2. Start ttyd on port 7681
+ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
+time.sleep(1)
+
+# 3. Start cloudflared tunnel for Web Terminal
+cf_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+for line in cf_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
+    if m:
+        terminal_url = m.group(0)
+        print("========================================", flush=True)
+        print(f"WEB_TERMINAL: {terminal_url}", flush=True)
+        print("========================================", flush=True)
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        break
+
+# 4. Background thread to discover Worker RPC endpoint & configure cluster mesh tools
+def setup_cluster_tools():
+    worker_url = ""
+    for _ in range(90):
+        try:
+            r = urllib.request.urlopen(f"https://ntfy.sh/{WORKER_SESSION_ID}/raw?poll=1", timeout=3)
+            txt = r.read().decode("utf-8").strip()
+            m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", txt)
+            if m:
+                worker_url = m.group(0).strip()
+                break
+        except Exception:
+            pass
+        time.sleep(2)
+    
+    with open("/kaggle/working/.cluster_worker_url", "w") as f:
+        f.write(worker_url)
+
+    # 4a. Install unified cluster-smi
+    smi_script = '''#!/usr/bin/env python3
+import subprocess, json, urllib.request, os
+
+worker_url = ""
+if os.path.exists("/kaggle/working/.cluster_worker_url"):
+    with open("/kaggle/working/.cluster_worker_url") as f:
+        worker_url = f.read().strip()
+
+local_gpus = []
+try:
+    out = subprocess.check_output(
+        ["/usr/bin/nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
+        text=True
+    )
+    for line in out.strip().splitlines():
+        p = [x.strip() for x in line.split(",")]
+        if len(p) >= 7:
+            local_gpus.append({
+                "name": p[1], "mem_used": int(float(p[2])), "mem_total": int(float(p[3])),
+                "util": int(float(p[4])), "temp": int(float(p[5])), "power": p[6] + "W"
+            })
+except Exception:
+    pass
+
+remote_gpus = []
+if worker_url:
+    try:
+        req = urllib.request.Request(f"{worker_url}/smi")
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            remote_gpus = data.get("gpus", [])
+    except Exception:
+        pass
+
+all_gpus = []
+for i, g in enumerate(local_gpus):
+    all_gpus.append((i, "Node 0 (Slot 1)", g))
+for i, g in enumerate(remote_gpus):
+    all_gpus.append((len(local_gpus) + i, "Node 1 (Slot 2)", g))
+
+print("+-----------------------------------------------------------------------------------------+")
+print("| NVIDIA-SMI (Cluster Pool: 4x Tesla T4)     CUDA Version: 13.0     Driver: 580.159.04   |")
+print("+-----------------------------------------+------------------------+----------------------+")
+print("| GPU  Name                 Node / Slot   | Memory-Usage           | GPU-Util  Temp  Pwr  |")
+print("|=========================================+========================+======================|")
+if all_gpus:
+    for idx, node, g in all_gpus:
+        name_str = f"{g.get('name', 'Tesla T4'):<12} {node:<13}"
+        mem_str = f"{g.get('mem_used', 0)}MiB / {g.get('mem_total', 15360)}MiB"
+        util_str = f"{g.get('util', 0):>3}%   {g.get('temp', 40):>3}C  {g.get('power', '15W'):>4}"
+        print(f"|  {idx:>2}  {name_str} | {mem_str:<22} | {util_str:<20} |")
+else:
+    print("| No GPUs detected or cluster synchronizing...                                            |")
+print("+-----------------------------------------+------------------------+----------------------+")
+total_vram = sum(g.get('mem_total', 15360) for _, _, g in all_gpus) / 1024.0 if all_gpus else 60.0
+used_vram = sum(g.get('mem_used', 0) for _, _, g in all_gpus) if all_gpus else 0
+status_str = "4/4 GPUs Active (ONLINE)" if len(all_gpus) >= 4 else f"{len(all_gpus)}/4 GPUs Active (CONNECTING...)"
+print(f"| Cluster VRAM: {used_vram}MiB / {total_vram:.0f}GB ({len(all_gpus)} GPUs) | Status: {status_str:<32} |")
+print("+-----------------------------------------------------------------------------------------+")
+'''
+    with open("/usr/local/bin/cluster-smi", "w") as f:
+        f.write(smi_script)
+    os.chmod("/usr/local/bin/cluster-smi", 0o755)
+
+    # 4b. Install cluster-exec
+    exec_script = '''#!/usr/bin/env python3
+import sys, subprocess, json, urllib.request, os
+
+if len(sys.argv) < 2:
+    print("Usage: cluster-exec \\"<command>\\"")
+    sys.exit(1)
+
+cmd = " ".join(sys.argv[1:])
+print(f"[*] Executing across Cluster: {cmd}\\n")
+
+print("--- [Node 0 (Slot 1)] ---")
+subprocess.run(cmd, shell=True)
+
+worker_url = ""
+if os.path.exists("/kaggle/working/.cluster_worker_url"):
+    with open("/kaggle/working/.cluster_worker_url") as f:
+        worker_url = f.read().strip()
+
+if worker_url:
+    print("\\n--- [Node 1 (Slot 2)] ---")
+    try:
+        req = urllib.request.Request(
+            f"{worker_url}/exec",
+            data=json.dumps({"cmd": cmd}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if data.get("stdout"):
+                print(data["stdout"], end="")
+            if data.get("stderr"):
+                print(data["stderr"], end="")
+            sys.exit(data.get("exit_code", 0))
+    except Exception as e:
+        print("Worker RPC error:", e)
+else:
+    print("[!] Worker Node 1 is not connected.")
+'''
+    with open("/usr/local/bin/cluster-exec", "w") as f:
+        f.write(exec_script)
+    os.chmod("/usr/local/bin/cluster-exec", 0o755)
+
+    # 4c. Install cluster-status
+    status_script = '''#!/usr/bin/env python3
+import os, urllib.request, json, time
+
+worker_url = ""
+if os.path.exists("/kaggle/working/.cluster_worker_url"):
+    with open("/kaggle/working/.cluster_worker_url") as f:
+        worker_url = f.read().strip()
+
+print("Compute Pool 4-GPU Cluster Status")
+print("=================================")
+print("Node 0 (Master Slot 1) : ONLINE (Local - 2x Tesla T4)")
+if worker_url:
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(f"{worker_url}/health", timeout=3) as r:
+            lat = (time.time() - t0) * 1000
+            print(f"Node 1 (Worker Slot 2) : ONLINE (RPC Mesh latency: {lat:.1f}ms - 2x Tesla T4)")
+    except Exception as e:
+        print(f"Node 1 (Worker Slot 2) : UNREACHABLE ({e})")
+else:
+    print("Node 1 (Worker Slot 2) : CONNECTING...")
+'''
+    with open("/usr/local/bin/cluster-status", "w") as f:
+        f.write(status_script)
+    os.chmod("/usr/local/bin/cluster-status", 0o755)
+
+    # 4d. Configure ~/.bashrc aliases and traps
+    with open(os.path.expanduser("~/.bashrc"), "a") as f:
+        f.write("\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@cluster-master\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
+        f.write("alias nvidia-smi='/usr/local/bin/cluster-smi'\\n")
+        f.write("alias gpus='/usr/local/bin/cluster-smi'\\n")
+        f.write("alias watch-gpu='watch -n 1 /usr/local/bin/cluster-smi'\\n")
+        f.write("alias real-smi='/usr/bin/nvidia-smi'\\n")
+        f.write("alias stop='python3 -c \\\"import urllib.request, os; p=open(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\").read().strip() if os.path.exists(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\") else \\\\\\\"\\\\\\\"; os.system(\\\\\\\"curl -s \\\\\\\" + p + \\\\\\\"/stop >/dev/null 2>&1\\\\\\\") if p else None; os.system(\\\\\\\"kill -9 -1\\\\\\\")\\\"'\\n")
+        f.write("alias halt='stop'\\n")
+        f.write("trap 'python3 -c \\\"import urllib.request, os; p=open(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\").read().strip() if os.path.exists(\\\\\\\"/kaggle/working/.cluster_worker_url\\\\\\\") else \\\\\\\"\\\\\\\"; os.system(\\\\\\\"curl -s \\\\\\\" + p + \\\\\\\"/stop >/dev/null 2>&1\\\\\\\") if p else None; os.system(\\\\\\\"kill -9 -1\\\\\\\")\\\"' EXIT\\n")
+
+threading.Thread(target=setup_cluster_tools, daemon=True).start()
+
+# Keep master alive until exit
+stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
+for _ in range(int(DURATION_MINUTES * 60 / 3)):
+    try:
+        req = urllib.request.Request(stop_url)
+        with urllib.request.urlopen(req, timeout=2) as r:
+            if r.read().decode("utf-8").strip() == "STOP":
+                break
+    except Exception:
+        pass
+    time.sleep(3)
+
+subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
+subprocess.run(["pkill", "-9", "-f", "ttyd"], check=False)
+sys.exit(0)
+"""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Single-Node Shell Template
+# ─────────────────────────────────────────────────────────────────────────────
+SINGLE_SHELL_BOOTSTRAP_TEMPLATE = """\
 import os
 import subprocess
 import sys
@@ -43,19 +426,16 @@ NODE_LABEL = "__NODE_LABEL__"
 
 print(f"[*] Setting up Compute Pool Interactive GPU Web Terminal ({NODE_LABEL})...", flush=True)
 
-# 1. Install ttyd (fast Web terminal server)
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
 ], check=True)
 
-# 2. Install cloudflared (HTTPS/WSS tunnel)
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
-# 3. Configure shell environment with aliases and exit traps
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write(f"\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@{NODE_LABEL}\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='nvidia-smi'\\n")
@@ -64,11 +444,9 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias halt='kill -9 -1'\\n")
     f.write("trap 'kill -9 -1' EXIT\\n")
 
-# 4. Start ttyd with bash
 ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
 time.sleep(1)
 
-# 5. Start cloudflared tunnel
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -76,48 +454,29 @@ cf_proc = subprocess.Popen(
     text=True
 )
 
-terminal_url = ""
 for line in cf_proc.stdout:
     clean = line.strip()
     m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
     if m:
         terminal_url = m.group(0)
-        print("========================================", flush=True)
-        print(f"WEB_TERMINAL: {terminal_url}", flush=True)
-        print("========================================", flush=True)
-        
-        # Publish URL to rendezvous point for instant client pickup
         try:
             req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
             urllib.request.urlopen(req, timeout=10)
-            print("[*] Tunnel URL published to client.", flush=True)
-        except Exception as exc:
-            print("[!] Rendezvous publish failed:", exc, flush=True)
+        except Exception:
+            pass
         break
 
-# 6. Monitor bash shell and stop signals
-# If user types 'exit' in terminal or stops session from CLI, terminate immediately
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
-    # Check if ttyd/bash exited
-    if ttyd_proc.poll() is not None:
-        print("[*] User exited shell session. Shutting down container...", flush=True)
-        break
-    
-    # Check if stop was requested via ntfy signal
     try:
         req = urllib.request.Request(stop_url)
         with urllib.request.urlopen(req, timeout=2) as r:
-            body = r.read().decode("utf-8").strip()
-            if body == "STOP":
-                print("[*] Received stop signal. Terminating container...", flush=True)
+            if r.read().decode("utf-8").strip() == "STOP":
                 break
     except Exception:
         pass
-
     time.sleep(3)
 
-# Force cleanup
 subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
 subprocess.run(["pkill", "-9", "-f", "ttyd"], check=False)
 sys.exit(0)
@@ -128,8 +487,8 @@ def _get_shell_slug(slot: int) -> str:
     return f"interactive-gpu-terminal-s{slot}"
 
 
-def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) -> dict:
-    """Worker function executed in an isolated process/thread for slot authentication."""
+def _push_kernel_payload(slot: int, slug: str, script_body: str) -> dict:
+    """Helper to authenticate and push a GPU kernel payload for a given slot."""
     creds = load_credentials(slot)
     if not creds:
         return {"slot": slot, "username": "unknown", "status": "FAILED", "error": f"No credentials for slot {slot}"}
@@ -143,14 +502,12 @@ def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) 
     api = KaggleApi()
     api.authenticate()
 
-    kernel_slug = _get_shell_slug(slot)
-    kernel_ref = f"{username}/{kernel_slug}"
-
+    kernel_ref = f"{username}/{slug}"
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         meta = {
             "id": kernel_ref,
-            "title": kernel_slug,
+            "title": slug,
             "code_file": "script.py",
             "language": "python",
             "kernel_type": "script",
@@ -164,38 +521,142 @@ def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) 
             "model_sources": [],
         }
         (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
-        
-        script = (
-            SHELL_BOOTSTRAP_TEMPLATE
-            .replace("__SESSION_ID__", session_id)
-            .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
-            .replace("__NODE_LABEL__", f"node{slot-1}-slot{slot}")
-        )
-        (tmp_path / "script.py").write_text(script)
+        (tmp_path / "script.py").write_text(script_body)
 
-        last_err = None
         for attempt in range(3):
             try:
                 resp = api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
                 if isinstance(resp, dict) and resp.get("error"):
                     err_msg = resp.get("error")
                     if "Maximum batch GPU session count" in str(err_msg):
-                        # Force stop previous shell to free quota
                         stop_gpu_shell(slot=slot)
                         time.sleep(2)
                         continue
                     return {"slot": slot, "username": username, "status": "FAILED", "error": err_msg}
                 return {"slot": slot, "username": username, "status": "QUEUED", "kernel_ref": kernel_ref, "error": None}
             except Exception as exc:
-                last_err = exc
                 if "409" in str(exc) or "Conflict" in str(exc):
                     time.sleep(2)
                     continue
                 return {"slot": slot, "username": username, "status": "FAILED", "error": str(exc)}
 
-        return {"slot": slot, "username": username, "status": "FAILED", "error": str(last_err)}
+        return {"slot": slot, "username": username, "status": "FAILED", "error": "Push failed after retries"}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. Launch Unified 4-GPU Cluster Shell (1 Master Browser Tab)
+# ─────────────────────────────────────────────────────────────────────────────
+def launch_cluster_shell(
+    duration_minutes: int = 120,
+    open_web: bool = False,
+    timeout_seconds: int = 240,
+) -> dict[str, str]:
+    """
+    Launch unified 4-GPU interactive cluster terminal.
+    Node 0 (Slot 1) acts as Master control terminal.
+    Node 1 (Slot 2) connects as attached compute worker.
+    Opens exactly 1 Master terminal tab with unified 4-GPU nvidia-smi.
+    """
+    creds1 = load_credentials(1)
+    creds2 = load_credentials(2)
+    if not creds1 or not creds2:
+        raise ValueError(
+            "Both Slot 1 and Slot 2 must be configured for the 4-GPU cluster.\n"
+            "Run: compute-pool login --slot 1 and compute-pool login --slot 2"
+        )
+
+    session_master_id = f"cp-master-{uuid.uuid4().hex[:10]}"
+    session_worker_id = f"cp-worker-{uuid.uuid4().hex[:10]}"
+
+    console.print("\n[bold cyan]Booting Unified 4-GPU Interactive Cluster (Master-Worker Architecture)...[/bold cyan]")
+    console.print(f"  Master Node 0 : Slot 1 ({creds1['username']}) - 2x Tesla T4 (15 GB each)")
+    console.print(f"  Worker Node 1 : Slot 2 ({creds2['username']}) - 2x Tesla T4 (15 GB each)")
+    console.print("  [dim]Dispatching both cluster nodes simultaneously...[/dim]\n")
+
+    # Register active jobs in local state
+    upsert_job(Job(
+        id="job-cluster-master",
+        spec=JobSpec(name="cluster-master-node0", script="master web terminal", gpu=True, gpu_memory_gb=30),
+        state=JobState.RUNNING,
+        assigned_slot=1,
+        assigned_username=creds1["username"],
+        kaggle_kernel_slug=_get_shell_slug(1),
+    ))
+    upsert_job(Job(
+        id="job-cluster-worker",
+        spec=JobSpec(name="cluster-worker-node1", script="attached compute worker", gpu=True, gpu_memory_gb=30),
+        state=JobState.RUNNING,
+        assigned_slot=2,
+        assigned_username=creds2["username"],
+        kaggle_kernel_slug=_get_shell_slug(2),
+    ))
+
+    # Push Master script (Node 0)
+    master_script = (
+        MASTER_BOOTSTRAP_TEMPLATE
+        .replace("__SESSION_ID__", session_master_id)
+        .replace("__WORKER_SESSION_ID__", session_worker_id)
+        .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
+    )
+    res_master = _push_kernel_payload(1, _get_shell_slug(1), master_script)
+
+    # Push Worker script (Node 1)
+    worker_script = (
+        WORKER_BOOTSTRAP_TEMPLATE
+        .replace("__SESSION_ID__", session_worker_id)
+        .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
+    )
+    res_worker = _push_kernel_payload(2, _get_shell_slug(2), worker_script)
+
+    if res_master.get("status") == "FAILED" or res_worker.get("status") == "FAILED":
+        err = f"Master: {res_master.get('error')} | Worker: {res_worker.get('error')}"
+        raise RuntimeError(f"Failed to launch cluster nodes: {err}")
+
+    console.print("  [dim]Cluster workers queued on GPU cloud. Establishing secure Master Web Terminal...[/dim]\n")
+
+    start_time = time.time()
+    master_web_url = ""
+    dots = 0
+
+    while time.time() - start_time < timeout_seconds:
+        try:
+            r = httpx.get(f"https://ntfy.sh/{session_master_id}/raw?poll=1", timeout=4)
+            if r.status_code == 200 and r.text.strip():
+                m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r.text)
+                if m:
+                    master_web_url = m.group(0).strip()
+                    break
+        except Exception:
+            pass
+
+        print(f"\r  Connecting to Master GPU Terminal {'.' * (dots % 4 + 1)}    ", end="", flush=True)
+        dots += 1
+        time.sleep(3)
+
+    print()
+
+    if not master_web_url:
+        raise TimeoutError(f"Cluster terminal failed to establish tunnel connection within {timeout_seconds}s.")
+
+    _display_cluster_panel(creds1["username"], creds2["username"], master_web_url, duration_minutes)
+
+    if open_web:
+        console.print("\n[green]* Opening Master Web Terminal in your default browser...[/green]")
+        try:
+            webbrowser.open(master_web_url)
+        except Exception:
+            pass
+
+    return {
+        "web": master_web_url,
+        "master_ref": f"{creds1['username']}/{_get_shell_slug(1)}",
+        "worker_ref": f"{creds2['username']}/{_get_shell_slug(2)}",
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. Launch Single-Slot GPU Terminal
+# ─────────────────────────────────────────────────────────────────────────────
 def launch_gpu_shell(
     slot: int,
     duration_minutes: int = 120,
@@ -205,21 +666,17 @@ def launch_gpu_shell(
     """Launch an interactive GPU terminal session on a specific slot (1 or 2)."""
     creds = load_credentials(slot)
     if creds is None:
-        raise ValueError(
-            f"No credentials configured for slot {slot}.\n"
-            f"Run: compute-pool login --slot {slot}"
-        )
+        raise ValueError(f"No credentials configured for slot {slot}. Run: compute-pool login --slot {slot}")
 
     username = creds["username"]
     session_id = f"cp-shell-s{slot}-{uuid.uuid4().hex[:10]}"
     kernel_slug = _get_shell_slug(slot)
 
-    # Register as an active running job in the state store
-    shell_job = Job(
+    upsert_job(Job(
         id=f"job-shell-s{slot}",
         spec=JobSpec(
             name=f"interactive-shell-slot{slot}",
-            script="ttyd + cloudflared web terminal",
+            script="single node web terminal",
             gpu=True,
             gpu_memory_gb=15,
         ),
@@ -227,16 +684,19 @@ def launch_gpu_shell(
         assigned_slot=slot,
         assigned_username=username,
         kaggle_kernel_slug=kernel_slug,
-    )
-    upsert_job(shell_job)
+    ))
 
     console.print(f"\n[bold cyan]Booting Interactive GPU Terminal (Slot {slot}: {username})...[/bold cyan]")
     console.print("  [dim]Provisioning 2x Tesla T4 GPU worker with live Web Terminal...[/dim]")
 
-    res = _launch_single_slot_proc(slot, duration_minutes, session_id)
+    script = (
+        SINGLE_SHELL_BOOTSTRAP_TEMPLATE
+        .replace("__SESSION_ID__", session_id)
+        .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
+        .replace("__NODE_LABEL__", f"node{slot-1}-slot{slot}")
+    )
+    res = _push_kernel_payload(slot, kernel_slug, script)
     if res.get("status") == "FAILED":
-        shell_job.transition(JobState.FAILED, error=res.get("error"))
-        upsert_job(shell_job)
         raise RuntimeError(f"Failed to push shell kernel: {res.get('error')}")
 
     console.print("  [dim]Worker queued on Kaggle GPU cluster. Waiting for tunnel connection...[/dim]\n")
@@ -266,17 +726,12 @@ def launch_gpu_shell(
     print()
 
     if not web_url:
-        shell_job.transition(JobState.FAILED, error="Connection timeout")
-        upsert_job(shell_job)
-        raise TimeoutError(
-            f"Interactive terminal failed to establish tunnel connection within {timeout_seconds}s.\n"
-            f"Check status on Kaggle: https://www.kaggle.com/code/{username}/{kernel_slug}"
-        )
+        raise TimeoutError(f"Interactive terminal failed to establish tunnel connection within {timeout_seconds}s.")
 
-    _display_shell_panel(slot, username, web_url, duration_minutes)
+    _display_single_shell_panel(slot, username, web_url, duration_minutes)
 
     if open_web:
-        console.print(f"\n[green]* Opening Web Terminal in your default browser...[/green]")
+        console.print("\n[green]* Opening Web Terminal in your default browser...[/green]")
         try:
             webbrowser.open(web_url)
         except Exception:
@@ -285,115 +740,38 @@ def launch_gpu_shell(
     return {"web": web_url, "kernel_ref": f"{username}/{kernel_slug}"}
 
 
-def launch_dual_gpu_shells(
-    duration_minutes: int = 120,
-    open_web: bool = False,
-    timeout_seconds: int = 240,
-) -> dict[str, dict]:
-    """
-    Launch interactive GPU terminals across BOTH accounts simultaneously.
-    Provides 4x Tesla T4 GPUs across two independent live terminal tabs.
-    """
-    creds1 = load_credentials(1)
-    creds2 = load_credentials(2)
-    if not creds1 or not creds2:
-        raise ValueError(
-            "Both Slot 1 and Slot 2 must be configured for dual shell.\n"
-            "Run: compute-pool login --slot 1 and compute-pool login --slot 2"
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. UI Panels & Teardown
+# ─────────────────────────────────────────────────────────────────────────────
+def _display_cluster_panel(master_user: str, worker_user: str, web_url: str, duration_minutes: int) -> None:
+    body = (
+        f"[bold green]* Unified 4-GPU Interactive Cluster Online & Ready[/bold green]\n\n"
+        f"  [bold white]Cluster Hardware:[/bold white]   [bold cyan]4x Tesla T4 GPUs (~60 GB VRAM total)[/bold cyan]\n"
+        f"  [bold white]Master Node 0:[/bold white]      Slot 1 ({master_user}) - 2x Tesla T4\n"
+        f"  [bold white]Worker Node 1:[/bold white]      Slot 2 ({worker_user}) - 2x Tesla T4 (Attached)\n"
+        f"  [bold white]Max Duration:[/bold white]       {duration_minutes} minutes\n\n"
+        f"  [bold yellow]Master Web Terminal URL (Single Control Entrypoint):[/bold yellow]\n"
+        f"  [bold underline cyan]{web_url}[/bold underline cyan]\n\n"
+        f"+-- [bold yellow]Cluster Built-in Commands[/bold yellow] ---------------------------------------------+\n"
+        f"  * [bold white]nvidia-smi[/bold white] / [bold white]gpus[/bold white] : Live unified table showing all 4 GPUs\n"
+        f"  * [bold white]watch-gpu[/bold white]         : Live 1-second auto-refresh 4-GPU monitor\n"
+        f"  * [bold white]cluster-exec <cmd>[/bold white]: Execute command across both nodes simultaneously\n"
+        f"  * [bold white]cluster-status[/bold white]     : Inter-node mesh health & latency check\n"
+        f"  * [bold white]stop[/bold white] / [bold white]exit[/bold white]       : Instantly teardown both nodes and release GPUs\n"
+        f"+-------------------------------------------------------------------------+\n\n"
+        f"  [dim]* Or run [bold white]compute-pool shell-stop[/bold white] from your local terminal at any time.[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title="[bold green]Compute Pool -- Unified 4-GPU Master-Worker Cluster[/bold green]",
+            border_style="green",
+            padding=(1, 2),
         )
-
-    session1_id = f"cp-shell-s1-{uuid.uuid4().hex[:10]}"
-    session2_id = f"cp-shell-s2-{uuid.uuid4().hex[:10]}"
-
-    console.print("\n[bold cyan]Booting Dual-Node Interactive GPU Terminals (4x Tesla T4 GPUs)...[/bold cyan]")
-    console.print(f"  Node 0 : Slot 1 ({creds1['username']}) - 2x Tesla T4 (15 GB each)")
-    console.print(f"  Node 1 : Slot 2 ({creds2['username']}) - 2x Tesla T4 (15 GB each)")
-    console.print("  [dim]Dispatching both terminal workers in parallel...[/dim]\n")
-
-    # Register jobs
-    upsert_job(Job(
-        id="job-shell-s1",
-        spec=JobSpec(name="interactive-shell-slot1", script="ttyd web terminal", gpu=True, gpu_memory_gb=15),
-        state=JobState.RUNNING,
-        assigned_slot=1,
-        assigned_username=creds1["username"],
-        kaggle_kernel_slug=_get_shell_slug(1),
-    ))
-    upsert_job(Job(
-        id="job-shell-s2",
-        spec=JobSpec(name="interactive-shell-slot2", script="ttyd web terminal", gpu=True, gpu_memory_gb=15),
-        state=JobState.RUNNING,
-        assigned_slot=2,
-        assigned_username=creds2["username"],
-        kaggle_kernel_slug=_get_shell_slug(2),
-    ))
-
-    # Push kernels sequentially to avoid KaggleApi env race condition
-    res1 = _launch_single_slot_proc(1, duration_minutes, session1_id)
-    res2 = _launch_single_slot_proc(2, duration_minutes, session2_id)
-
-    if res1.get("status") == "FAILED" or res2.get("status") == "FAILED":
-        err = f"Slot 1: {res1.get('error')} | Slot 2: {res2.get('error')}"
-        raise RuntimeError(f"Failed to launch dual shells: {err}")
-
-    console.print("  [dim]Both workers queued on GPU cluster. Waiting for tunnel connections...[/dim]\n")
-
-    start_time = time.time()
-    url1, url2 = "", ""
-    dots = 0
-
-    while time.time() - start_time < timeout_seconds:
-        if not url1:
-            try:
-                r1 = httpx.get(f"https://ntfy.sh/{session1_id}/raw?poll=1", timeout=4)
-                if r1.status_code == 200 and r1.text.strip():
-                    m1 = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r1.text)
-                    if m1:
-                        url1 = m1.group(0).strip()
-            except Exception:
-                pass
-
-        if not url2:
-            try:
-                r2 = httpx.get(f"https://ntfy.sh/{session2_id}/raw?poll=1", timeout=4)
-                if r2.status_code == 200 and r2.text.strip():
-                    m2 = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r2.text)
-                    if m2:
-                        url2 = m2.group(0).strip()
-            except Exception:
-                pass
-
-        if url1 and url2:
-            break
-
-        print(f"\r  Connecting to dual GPU workers {'.' * (dots % 4 + 1)}    ", end="", flush=True)
-        dots += 1
-        time.sleep(3)
-
-    print()
-
-    if not url1 or not url2:
-        raise TimeoutError("One or both GPU terminals timed out establishing tunnels.")
-
-    # Display Dual Cluster Panel
-    _display_dual_shell_panel(creds1["username"], creds2["username"], url1, url2, duration_minutes)
-
-    if open_web:
-        console.print("\n[green]* Opening both Web Terminals in your default browser...[/green]")
-        try:
-            webbrowser.open(url1)
-            time.sleep(0.5)
-            webbrowser.open(url2)
-        except Exception:
-            pass
-
-    return {
-        "node0": {"slot": 1, "username": creds1["username"], "web": url1},
-        "node1": {"slot": 2, "username": creds2["username"], "web": url2},
-    }
+    )
 
 
-def _display_shell_panel(slot: int, username: str, web_url: str, duration_minutes: int) -> None:
+def _display_single_shell_panel(slot: int, username: str, web_url: str, duration_minutes: int) -> None:
     body = (
         f"[bold green]* GPU Worker Active & Connected[/bold green]\n\n"
         f"  [bold white]Account Slot:[/bold white]   Slot {slot} ({username})\n"
@@ -408,27 +786,6 @@ def _display_shell_panel(slot: int, username: str, web_url: str, duration_minute
         Panel(
             body,
             title="[bold green]Compute Pool -- Live Interactive GPU Terminal[/bold green]",
-            border_style="green",
-            padding=(1, 2),
-        )
-    )
-
-
-def _display_dual_shell_panel(user1: str, user2: str, url1: str, url2: str, duration_minutes: int) -> None:
-    body = (
-        f"[bold green]* Dual GPU Nodes Active & Connected (4x Tesla T4 GPUs / ~60 GB VRAM)[/bold green]\n\n"
-        f"  [bold white]Max Duration:[/bold white]   {duration_minutes} minutes\n\n"
-        f"+-- [bold yellow]Node 0: Slot 1 ({user1}) - 2x Tesla T4[/bold yellow] -------------------------+\n"
-        f"  Web Terminal: [bold underline cyan]{url1}[/bold underline cyan]\n\n"
-        f"+-- [bold yellow]Node 1: Slot 2 ({user2}) - 2x Tesla T4[/bold yellow] -------------------------+\n"
-        f"  Web Terminal: [bold underline cyan]{url2}[/bold underline cyan]\n\n"
-        f"  [dim]* Type [bold white]stop[/bold white] or [bold white]exit[/bold white] in either terminal to immediately terminate & release GPU.[/dim]\n"
-        f"  [dim]* Or run [bold white]compute-pool shell-stop[/bold white] from your local CLI.[/dim]"
-    )
-    console.print(
-        Panel(
-            body,
-            title="[bold green]Compute Pool -- Dual-Node Interactive Cluster Shells[/bold green]",
             border_style="green",
             padding=(1, 2),
         )
@@ -478,7 +835,8 @@ def stop_gpu_shell(slot: int | None = None) -> None:
 
         # Update job state in local store
         for j in load_all_jobs():
-            if j.id in [f"job-shell-s{s}", f"job-shell-s1", f"job-shell-s2"] or (j.assigned_slot == s and "shell" in j.spec.name):
+            if j.id in [f"job-shell-s{s}", f"job-cluster-master", f"job-cluster-worker"] or (j.assigned_slot == s and "shell" in j.spec.name):
                 if j.state == JobState.RUNNING:
                     j.transition(JobState.CANCELLED)
                     upsert_job(j)
+

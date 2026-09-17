@@ -7,13 +7,13 @@
 ## Features
 
 - **Multi-Account GPU Pooling**: Aggregate 2+ Kaggle accounts into a shared pool (~60h/week total quota, **4x Tesla T4 GPUs**, ~60 GB VRAM).
-- **Dual-Node Concurrent Interactive Shells**: Boot independent live terminals on **BOTH accounts simultaneously** with a single command (`compute-pool shell-all --web`).
+- **Unified 4-GPU Master-Worker Cluster**: Single Master Web Terminal with background attached compute worker. Access and control **all 4 Tesla T4 GPUs simultaneously** (`compute-pool shell --web`).
 - **Live Hardware Probing**: Real-time `nvidia-smi` kernel probe detecting GPU count, VRAM, CUDA 13.0, and driver versions.
-- **Distributed Multi-Node Training**: Train models in parallel across distinct Kaggle accounts simultaneously (`compute-pool distributed run`).
-- **Zero-Install Web Terminals**: Secure HTTPS/WSS browser terminals with root bash, 256-color support, and CUDA tools.
-- **Instant Lifecycle & Stop Controls**: Cancel jobs and terminate remote GPU containers in `< 0.5s` to preserve quota (`compute-pool job stop`, `compute-pool shell-stop`).
+- **Unified Cluster `nvidia-smi`**: Run `nvidia-smi` / `watch-gpu` inside the terminal to monitor all 4 GPUs in a single table in real time.
+- **Distributed Multi-Node Training**: Train models across distinct Kaggle accounts simultaneously (`cluster-exec`, `compute-pool distributed run`).
+- **Zero-Install Web Terminals**: Secure HTTPS/WSS browser terminal with root bash, 256-color support, and CUDA tools.
+- **Instant Lifecycle & Stop Controls**: Cancel jobs and terminate remote GPU containers in `< 0.5s` to preserve quota (`compute-pool job stop`, `compute-pool shell-stop`, `exit`/`stop` in terminal).
 - **Quota-Aware Intelligent Scheduler**: Automatically assigns workloads to the account slot with the most remaining GPU hours.
-- **Provider-Compliant Architecture**: 100% official Kaggle API integration with isolated execution environments.
 
 ---
 
@@ -28,31 +28,33 @@ Compute Pool Orchestration Architecture
 │   ├── scheduler/      # Quota-aware job scheduler & slot assigner
 │   ├── jobs/           # Job model, state machine & remote Kaggle GPU runner
 │   ├── distributed/    # Multi-node parallel training coordinator
-│   ├── shell/          # Dual-node & single-node interactive web terminal bridges
+│   ├── shell/          # Master-Worker 4-GPU cluster & single-node interactive shells
 │   ├── storage/        # Local JSON persistent state database
 │   └── cli.py          # Full-featured Typer CLI
 └── tests/              # Comprehensive test suite (18/18 tests passing)
 ```
 
-### Dual-Node Interactive Shell Lifecycle
+### Unified 4-GPU Cluster Architecture
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant CLI as Local CLI (Compute Pool)
-    participant K1 as Kaggle Worker 1 (saitejathanniru)
-    participant K2 as Kaggle Worker 2 (thannirusahithya01)
+    participant M as Node 0: Master (saitejathanniru)
+    participant W as Node 1: Worker (thannirusahithya01)
     participant CF as Cloudflare Tunnel Edge
+    participant B as User Browser (1 Tab)
 
-    CLI->>K1: Dispatch Kernel (2x Tesla T4)
-    CLI->>K2: Dispatch Kernel (2x Tesla T4)
-    Note over K1,K2: Cloud VM Allocation & Container Initialization (~30-50s)
-    K1->>K1: Install ttyd + cloudflared (~5s)
-    K2->>K2: Install ttyd + cloudflared (~5s)
-    K1->>CF: Establish Secure HTTPS/WSS Tunnel
-    K2->>CF: Establish Secure HTTPS/WSS Tunnel
-    CF-->>CLI: Rendezvous Handshake (<2s)
-    CLI-->>CLI: Open Both Browser Tabs Automatically
+    CLI->>M: Dispatch Master Kernel (2x Tesla T4)
+    CLI->>W: Dispatch Worker Kernel (2x Tesla T4)
+    Note over M,W: Cloud VM & Container Initialization (~30-50s)
+    W->>W: Start RPC Telemetry Server (Port 8888)
+    W->>CF: Expose RPC Tunnel
+    W-->>M: Inter-Node RPC Mesh Connect
+    M->>CF: Expose Master Web Terminal (Port 7681)
+    CF-->>CLI: Handshake Completed
+    CLI->>B: Open Single Master Web Terminal
+    Note over B,M: 4x Tesla T4 GPUs (60 GB VRAM) Active & Monitored
 ```
 
 ---
@@ -88,29 +90,29 @@ compute-pool accounts status
 
 ---
 
-## Interactive Remote GPU Terminals
+## Interactive 4-GPU Cluster Terminal
 
-### 1. Launch Dual Interactive Shells on BOTH Accounts Simultaneously (4x Tesla T4 GPUs):
+### 1. Launch Unified 4-GPU Master-Worker Cluster (4x Tesla T4 GPUs):
 ```bash
-# Boot interactive terminals on BOTH accounts and automatically open both tabs in browser:
-compute-pool shell-all --web
+# Boot unified 4-GPU cluster and automatically open the Master Web Terminal:
+compute-pool shell --web
 
-# Or:
-compute-pool shell --all --web
+# Or specify custom session duration:
+compute-pool shell --duration 120 --web
 ```
 
-### 2. Launch on a Specific Single Slot:
+### 2. Launch Single-Node Terminal (2x Tesla T4 GPUs):
 ```bash
-# Launch interactive terminal on Slot 1:
+# Launch interactive terminal on Slot 1 only:
 compute-pool shell --slot 1 --web
 
-# Launch interactive terminal on Slot 2:
+# Launch interactive terminal on Slot 2 only:
 compute-pool shell --slot 2 --web
 ```
 
-### 3. Stop / Terminate Active Shells:
+### 3. Stop / Terminate Active Cluster:
 ```bash
-# Stop all active interactive GPU terminals and immediately free GPUs:
+# Stop active cluster terminals and immediately release all 4 GPUs:
 compute-pool shell-stop
 
 # Stop only Slot 1:
@@ -119,6 +121,8 @@ compute-pool shell-stop --slot 1
 # Stop only Slot 2:
 compute-pool shell-stop --slot 2
 ```
+
+*(You can also type `stop` or `exit` directly inside the Master Web Terminal to instantly kill both nodes and release GPUs).*
 
 ---
 

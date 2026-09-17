@@ -433,17 +433,16 @@ def distributed_run(
 
 @app.command("shell")
 def gpu_shell(
-    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Account slot to launch GPU shell on (1 or 2, omit for both)"),
-    all_slots: bool = typer.Option(False, "--all", "-a", help="Launch interactive terminals on BOTH accounts (4x Tesla T4 GPUs)"),
+    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Account slot to launch single-node GPU shell (1 or 2, omit for 4-GPU cluster)"),
     duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default 120)"),
-    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminal(s) in default browser"),
+    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminal in default browser"),
 ):
-    """Boot interactive remote terminal(s) inside live Tesla T4 GPU container(s) with root bash & CUDA."""
-    from compute_pool.shell import launch_gpu_shell, launch_dual_gpu_shells
+    """Boot unified 4-GPU Master-Worker Interactive Cluster Terminal (or single node with --slot)."""
+    from compute_pool.shell import launch_gpu_shell, launch_cluster_shell
 
     try:
-        if all_slots or slot is None:
-            launch_dual_gpu_shells(duration_minutes=duration, open_web=web)
+        if slot is None:
+            launch_cluster_shell(duration_minutes=duration, open_web=web)
         else:
             if slot not in (1, 2):
                 console.print("[red]Error:[/red] --slot must be 1 or 2.")
@@ -454,25 +453,11 @@ def gpu_shell(
         raise typer.Exit(1)
 
 
-@app.command("shell-all")
-def gpu_shell_all(
-    duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default 120)"),
-    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminals in default browser"),
-):
-    """Boot dual interactive remote terminals across BOTH accounts (4x Tesla T4 GPUs)."""
-    from compute_pool.shell import launch_dual_gpu_shells
-    try:
-        launch_dual_gpu_shells(duration_minutes=duration, open_web=web)
-    except (ValueError, RuntimeError, TimeoutError) as exc:
-        console.print(f"[red]Shell error:[/red] {exc}")
-        raise typer.Exit(1)
-
-
 @app.command("shell-stop")
 def gpu_shell_stop(
-    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Slot to stop (1, 2, or omitted for both)"),
+    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Slot to stop (1, 2, or omitted for entire cluster)"),
 ):
-    """Stop running interactive GPU shell sessions and immediately free GPUs."""
+    """Stop running interactive GPU cluster/shell sessions and immediately free GPUs."""
     from compute_pool.shell import stop_gpu_shell
     stop_gpu_shell(slot=slot)
 

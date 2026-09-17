@@ -215,16 +215,15 @@ def _display_shell_panel(
         f"  [bold white]Account Slot:[/bold white]   Slot {slot} ({username})\n"
         f"  [bold white]Hardware:[/bold white]       2x Tesla T4 GPUs (15 GB VRAM each)\n"
         f"  [bold white]Max Duration:[/bold white]   {duration_minutes} minutes\n\n"
-        f"╭── [bold yellow]Interactive Web Terminal URL[/bold yellow] ───────────────────────╮\n"
-        f"│ [bold underline cyan]{web_url}[/bold underline cyan]\n"
-        f"╰──────────────────────────────────────────────────────────╯\n\n"
-        f"[dim]Click the URL above to access full root bash, CUDA drivers & nvidia-smi in real time.[/dim]"
+        f"  [bold yellow]Web Terminal URL:[/bold yellow]\n"
+        f"  [bold underline cyan]{web_url}[/bold underline cyan]\n\n"
+        f"  [dim]Click the URL above to access full root bash, CUDA drivers & nvidia-smi live.[/dim]"
     )
 
     console.print(
         Panel(
             body,
-            title="[bold green]Compute Pool — Live Interactive GPU Terminal[/bold green]",
+            title="[bold green]Compute Pool -- Live Interactive GPU Terminal[/bold green]",
             border_style="green",
             padding=(1, 2),
         )

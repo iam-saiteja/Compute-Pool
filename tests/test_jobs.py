@@ -11,9 +11,9 @@ from compute_pool.jobs.model import Job, JobSpec, JobState
 
 class TestJobModel:
     def test_default_id_format(self):
-        job = Job()
+        job = Job(id="job-0")
         assert job.id.startswith("job-")
-        assert len(job.id) == 12  # "job-" + 8 hex chars
+        assert job.id == "job-0"
 
     def test_default_state_is_queued(self):
         job = Job()
@@ -62,28 +62,70 @@ class TestLocalStorage:
         monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
         monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
 
-        job = Job(spec=JobSpec(name="store-test", script="pass"))
+        job = Job(id="job-0", spec=JobSpec(name="store-test", script="pass"))
         storage.upsert_job(job)
 
         loaded = storage.load_all_jobs()
         assert len(loaded) == 1
-        assert loaded[0].id == job.id
+        assert loaded[0].id == "job-0"
         assert loaded[0].spec.name == "store-test"
 
-    def test_get_job_returns_none_for_missing(self, tmp_path, monkeypatch):
+    def test_get_job_by_index_or_string(self, tmp_path, monkeypatch):
         import compute_pool.storage.local as storage
         monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
         monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
 
-        result = storage.get_job("job-doesnotexist")
-        assert result is None
+        job = Job(id="job-0", spec=JobSpec(name="index-test", script="pass"))
+        storage.upsert_job(job)
+
+        assert storage.get_job(0) is not None
+        assert storage.get_job("0") is not None
+        assert storage.get_job("job-0") is not None
+        assert storage.get_job("job-doesnotexist") is None
+
+    def test_delete_and_clear_jobs(self, tmp_path, monkeypatch):
+        import compute_pool.storage.local as storage
+        monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
+
+        j0 = Job(id="job-0", spec=JobSpec(name="j0", script="pass"))
+        j1 = Job(id="job-1", spec=JobSpec(name="j1", script="pass"))
+        j1.transition(JobState.COMPLETED)
+        storage.upsert_job(j0)
+        storage.upsert_job(j1)
+
+        # Delete single job by index
+        deleted = storage.delete_job(0)
+        assert deleted is not None
+        assert deleted.id == "job-0"
+        assert len(storage.load_all_jobs()) == 1
+
+        # Clear finished jobs
+        cleared = storage.clear_jobs(all_jobs=False)
+        assert len(cleared) == 1
+        assert len(storage.load_all_jobs()) == 0
+
+    def test_reindex_jobs(self, tmp_path, monkeypatch):
+        import compute_pool.storage.local as storage
+        monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
+
+        j1 = Job(id="job-old-a", spec=JobSpec(name="a", script="pass"))
+        j2 = Job(id="job-old-b", spec=JobSpec(name="b", script="pass"))
+        storage.upsert_job(j1)
+        storage.upsert_job(j2)
+
+        reindexed = storage.reindex_jobs()
+        assert len(reindexed) == 2
+        assert reindexed[0].id == "job-0"
+        assert reindexed[1].id == "job-1"
 
     def test_upsert_updates_existing(self, tmp_path, monkeypatch):
         import compute_pool.storage.local as storage
         monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
         monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
 
-        job = Job(spec=JobSpec(name="update-test", script="pass"))
+        job = Job(id="job-0", spec=JobSpec(name="update-test", script="pass"))
         storage.upsert_job(job)
 
         job.transition(JobState.COMPLETED)
@@ -99,7 +141,7 @@ class TestLocalStorage:
         monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
         monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
 
-        job = Job(spec=JobSpec(name="running-job", script="pass"))
+        job = Job(id="job-0", spec=JobSpec(name="running-job", script="pass"))
         job.transition(JobState.RUNNING)
         job.assigned_slot = 1
         job.kaggle_kernel_slug = "test-slug"

@@ -41,10 +41,18 @@ class JobSpec:
     max_retries: int = 3
 
 
+def _default_job_id() -> str:
+    try:
+        from compute_pool.storage.local import next_job_id
+        return next_job_id()
+    except Exception:
+        return "job-0"
+
+
 @dataclass
 class Job:
     """Live job record tracked in state store."""
-    id: str = field(default_factory=lambda: f"job-{uuid.uuid4().hex[:8]}")
+    id: str = field(default_factory=_default_job_id)
     spec: JobSpec = field(default_factory=lambda: JobSpec(name="unnamed", script=""))
     state: JobState = JobState.QUEUED
     assigned_slot: Optional[Union[int, str]] = None          # 1, 2, or "1, 2"

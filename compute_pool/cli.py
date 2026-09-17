@@ -1,19 +1,15 @@
 """
-compute-pool CLI
+Compute Pool CLI — Multi-Account GPU Pooling & Cluster Computing.
 
-Commands:
-    compute-pool login --slot {1|2}         Authenticate a Kaggle account
-    compute-pool accounts status            Show both account statuses + quota + cached GPU info
-    compute-pool accounts probe --slot N    Push nvidia-smi kernel, show real GPU hardware
-    compute-pool job submit <spec.yaml>     Submit a job (schedule + assign)
-    compute-pool job list                   List all jobs
-    compute-pool job status <job-id>        Show one job's full status
+Pool voluntarily shared Kaggle free-tier GPU compute across two accounts.
+Provides interactive 4-GPU cluster shells, distributed training orchestration,
+hardware probing, automated quota balancing, and sequential job management.
 """
 from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 from rich.console import Console
@@ -21,14 +17,27 @@ from rich.table import Table
 
 app = typer.Typer(
     name="compute-pool",
-    help="Pool voluntarily shared Kaggle free-tier GPU compute across two accounts.",
+    help="Compute Pool: Multi-account pooled Kaggle GPU cluster manager & interactive shells.",
     add_completion=False,
+    no_args_is_help=True,
 )
-accounts_app = typer.Typer(help="Account management commands.")
-job_app = typer.Typer(help="Job management commands.")
-dist_app = typer.Typer(help="Distributed multi-node cluster commands.")
+accounts_app = typer.Typer(
+    help="Manage Kaggle account credentials, live quotas, and GPU hardware probes.",
+    no_args_is_help=True,
+)
+job_app = typer.Typer(
+    help="Manage, dispatch, monitor, and clean sequential 0-indexed compute jobs.",
+    no_args_is_help=True,
+)
+dist_app = typer.Typer(
+    help="Run distributed multi-node parallel jobs across pooled accounts.",
+    no_args_is_help=True,
+)
+
+# Register sub-apps (including 'jobs' as an alias for 'job')
 app.add_typer(accounts_app, name="accounts")
 app.add_typer(job_app, name="job")
+app.add_typer(job_app, name="jobs")
 app.add_typer(dist_app, name="distributed")
 
 console = Console()
@@ -38,11 +47,16 @@ console = Console()
 # compute-pool login
 # ─────────────────────────────────────────────────────────────────────────────
 
-@app.command()
+@app.command("login")
 def login(
-    slot: int = typer.Option(..., "--slot", "-s", help="Account slot (1 or 2)"),
+    slot: int = typer.Option(..., "--slot", "-s", help="Account slot to authenticate (1 or 2)"),
 ):
-    """Authenticate a Kaggle account for the given slot."""
+    """
+    Authenticate a Kaggle account for Slot 1 or Slot 2.
+
+    Prompts for username and API key (or kaggle.json path) and stores
+    credentials securely in ~/.compute_pool/credentials.json.
+    """
     if slot not in (1, 2):
         console.print("[red]Error:[/red] --slot must be 1 or 2.")
         raise typer.Exit(1)
@@ -61,7 +75,7 @@ def login(
 
 @accounts_app.command("status")
 def accounts_status():
-    """Show live status, GPU quota, and cached GPU hardware for both accounts."""
+    """Show live status, remaining GPU quotas (30h/week), and hardware for both accounts."""
     from rich.panel import Panel
     from rich.columns import Columns
     from compute_pool.accounts.manager import get_all_statuses
@@ -90,7 +104,7 @@ def accounts_status():
             driver_line = f"  Driver: {gpu.driver_version} | CUDA: {gpu.cuda_version}"
             probed_at = f"  (probed {gpu.probed_at[:10]})"
         else:
-            gpu_line = "[dim]Not probed — run: compute-pool accounts probe --slot {}[/dim]".format(s.slot)
+            gpu_line = f"[dim]Not probed — run: compute-pool accounts probe --slot {s.slot}[/dim]"
             driver_line = ""
             probed_at = ""
 
@@ -143,8 +157,8 @@ def accounts_probe(
     """
     Push a GPU probe kernel to Kaggle and display real hardware info (nvidia-smi).
 
-    This provisions a real Kaggle GPU instance to inspect live hardware.
-    Results are cached — run once per account.
+    Provisions a live Kaggle GPU instance to verify hardware, CUDA, and driver versions.
+    Results are cached locally.
     """
     from rich.panel import Panel
     from compute_pool.probe import run_probe
@@ -181,6 +195,31 @@ def accounts_probe(
     console.print()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool accounts stop
+# ─────────────────────────────────────────────────────────────────────────────
+
+@accounts_app.command("stop")
+def accounts_stop(
+    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Slot to stop (1, 2, or omitted for all slots)"),
+):
+    """Stop all active GPU sessions/kernels on account slot(s) and free quotas."""
+    from compute_pool.shell import stop_gpu_shell
+    from compute_pool.jobs.runner import stop_remote_job
+    from compute_pool.storage.local import load_all_jobs
+    from compute_pool.jobs.model import JobState
+
+    # Stop any active shell sessions
+    stop_gpu_shell(slot=slot)
+
+    # Cancel active jobs on that slot
+    jobs = load_all_jobs()
+    for j in jobs:
+        if j.state in (JobState.RUNNING, JobState.ASSIGNED, JobState.QUEUED, JobState.SCHEDULING):
+            if slot is None or j.assigned_slot == slot:
+                stop_remote_job(j.id)
+
+    console.print(f"[bold green]* Account slot(s) idle and compute released.[/bold green]\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -190,9 +229,9 @@ def accounts_probe(
 @job_app.command("submit")
 def job_submit(
     spec_file: Path = typer.Argument(..., help="Path to job YAML spec file"),
-    run: bool = typer.Option(False, "--run", "-r", help="Immediately dispatch and run on remote GPU"),
+    run: bool = typer.Option(False, "--run", "-r", help="Immediately dispatch and run on remote Kaggle GPU"),
 ):
-    """Submit a job to the compute pool (and optionally execute on GPU)."""
+    """Submit a job spec YAML to the compute pool (and optionally execute on GPU)."""
     import yaml
     from compute_pool.jobs.model import Job, JobSpec
     from compute_pool.scheduler.simple import schedule_job
@@ -209,7 +248,7 @@ def job_submit(
         console.print(f"[red]Error parsing YAML:[/red] {exc}")
         raise typer.Exit(1)
 
-    job_data = raw.get("job", raw)
+    job_data = raw.get("job", raw) if isinstance(raw, dict) else {}
     spec = JobSpec(
         name=job_data.get("name", spec_file.stem),
         script=job_data.get("script", ""),
@@ -224,7 +263,7 @@ def job_submit(
     upsert_job(job)
 
     console.print(f"\n[bold cyan]Compute Pool — Job Submit[/bold cyan]")
-    console.print(f"  Job ID   : [bold]{job.id}[/bold]")
+    console.print(f"  Job ID   : [bold green]{job.id}[/bold green]")
     console.print(f"  Name     : {spec.name}")
     console.print(f"  GPU      : {'Yes' if spec.gpu else 'No'}  ({spec.gpu_memory_gb} GB)")
     console.print(f"  Max time : {spec.max_runtime_hours}h")
@@ -248,26 +287,34 @@ def job_submit(
 
 @job_app.command("run")
 def job_run(
-    job_id: str = typer.Argument(..., help="Job ID to run on remote Kaggle GPU"),
+    job_id: str = typer.Argument(..., help="Job ID or index (e.g. 0, job-0)"),
 ):
     """Run an assigned job on its remote Kaggle GPU worker."""
     from compute_pool.jobs.runner import run_job_remote
+    from compute_pool.storage.local import get_job
+
+    target = get_job(job_id)
+    if not target:
+        console.print(f"[red]Error:[/red] Job '{job_id}' not found in state store.")
+        raise typer.Exit(1)
+
     try:
-        run_job_remote(job_id)
+        run_job_remote(target.id)
     except Exception as e:
-        console.print(f"[red]Error running job {job_id}:[/red] {e}")
+        console.print(f"[red]Error running job {target.id}:[/red] {e}")
         raise typer.Exit(1)
 
 
-
 # ─────────────────────────────────────────────────────────────────────────────
-# compute-pool job list
+# compute-pool job list (or ls)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @job_app.command("list")
+@job_app.command("ls")
 def job_list():
-    """List all submitted jobs."""
+    """List all submitted compute jobs with sequential IDs and real-time status."""
     from compute_pool.storage.local import load_all_jobs
+    from rich import box
 
     jobs = load_all_jobs()
     if not jobs:
@@ -275,9 +322,8 @@ def job_list():
         return
 
     console.print("\n[bold cyan]Compute Pool -- Jobs[/bold cyan]\n")
-    from rich import box
     table = Table(show_header=True, header_style="bold magenta", expand=False, box=box.ASCII)
-    table.add_column("Job ID", style="bold", no_wrap=True)
+    table.add_column("Job ID", style="bold cyan", no_wrap=True)
     table.add_column("Name", no_wrap=True)
     table.add_column("State", min_width=10, no_wrap=True)
     table.add_column("Slot", justify="center", no_wrap=True)
@@ -297,7 +343,7 @@ def job_list():
 
     for j in reversed(jobs):
         color = STATE_COLORS.get(j.state.value, "white")
-        submitted = j.created_at[:16].replace("T", " ")   # "2026-09-17 09:36"
+        submitted = j.created_at[:16].replace("T", " ")
         table.add_row(
             j.id,
             j.spec.name,
@@ -308,23 +354,24 @@ def job_list():
         )
 
     console.print(table)
-    console.print()
+    console.print(f"  [dim]Total: {len(jobs)} job(s) recorded. Run: compute-pool job status <id> for details.[/dim]\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# compute-pool job status
+# compute-pool job status (or show)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @job_app.command("status")
+@job_app.command("show")
 def job_status(
-    job_id: str = typer.Argument(..., help="Job ID (e.g. job-a1b2c3d4)"),
+    job_id: str = typer.Argument(..., help="Job ID or index (e.g. 0, job-0)"),
 ):
-    """Show full status for a specific job."""
+    """Show full status, metadata, and execution logs for a specific job."""
     from compute_pool.storage.local import get_job
 
     job = get_job(job_id)
     if job is None:
-        console.print(f"[red]Job not found:[/red] {job_id}")
+        console.print(f"[red]Job not found:[/red] '{job_id}'")
         raise typer.Exit(1)
 
     console.print(f"\n[bold cyan]Job: {job.id}[/bold cyan]")
@@ -343,18 +390,102 @@ def job_status(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# compute-pool job delete (or rm / remove)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@job_app.command("delete")
+@job_app.command("rm")
+@job_app.command("remove")
+def job_delete(
+    job_ids: List[str] = typer.Argument(..., help="One or more Job IDs/indices to delete (e.g. 0 1 job-2)"),
+    reindex: bool = typer.Option(False, "--reindex", "-r", help="Automatically re-index remaining jobs from 0..N"),
+):
+    """Delete one or more job records and their local artifacts from storage."""
+    from compute_pool.storage.local import delete_job, reindex_jobs
+
+    deleted_count = 0
+    for jid in job_ids:
+        deleted = delete_job(jid)
+        if deleted:
+            console.print(f"  [green]* Deleted job record:[/green] [bold]{deleted.id}[/bold] ({deleted.spec.name})")
+            deleted_count += 1
+        else:
+            console.print(f"  [yellow]x Job not found:[/yellow] '{jid}'")
+
+    if reindex and deleted_count > 0:
+        reindex_jobs()
+        console.print("  [cyan]* Remaining jobs re-indexed sequentially from job-0.[/cyan]")
+
+    console.print(f"\n[bold green]Done. Deleted {deleted_count} job record(s).[/bold green]\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool job clear (or clean / prune)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@job_app.command("clear")
+@job_app.command("clean")
+@job_app.command("prune")
+def job_clear(
+    all_jobs: bool = typer.Option(False, "--all", "-a", help="Delete ALL jobs (including queued/running)"),
+    reindex: bool = typer.Option(False, "--reindex", "-r", help="Re-index remaining active jobs from 0..N"),
+):
+    """
+    Clear job records from local storage.
+
+    By default, deletes completed, failed, and cancelled jobs.
+    Use --all / -a to delete all job records completely.
+    """
+    from compute_pool.storage.local import clear_jobs, reindex_jobs
+
+    deleted = clear_jobs(all_jobs=all_jobs)
+    if not deleted:
+        console.print("[dim]No matching jobs found to clear.[/dim]\n")
+        return
+
+    console.print(f"\n[bold green]* Cleared {len(deleted)} job record(s) and cleaned artifact files.[/bold green]")
+    for j in deleted:
+        console.print(f"  [dim]- Removed {j.id} ({j.spec.name} - {j.state.value})[/dim]")
+
+    if reindex:
+        reindex_jobs()
+        console.print("  [cyan]* Remaining jobs re-indexed sequentially from job-0.[/cyan]")
+    console.print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool job reindex
+# ─────────────────────────────────────────────────────────────────────────────
+
+@job_app.command("reindex")
+def job_reindex():
+    """Re-index all existing jobs chronologically from job-0 to job-N."""
+    from compute_pool.storage.local import reindex_jobs
+
+    jobs = reindex_jobs()
+    if not jobs:
+        console.print("[dim]No jobs in store to re-index.[/dim]\n")
+        return
+
+    console.print(f"\n[bold green]* Re-indexed {len(jobs)} job(s) sequentially starting from job-0:[/bold green]")
+    for j in jobs:
+        console.print(f"  - [bold cyan]{j.id}[/bold cyan] : {j.spec.name} ({j.state.value})")
+    console.print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # compute-pool job stop / cancel
 # ─────────────────────────────────────────────────────────────────────────────
 
 @job_app.command("stop")
 @job_app.command("cancel")
 def job_cancel(
-    job_id: Optional[str] = typer.Argument(None, help="Job ID (e.g. job-a1b2c3d4)"),
+    job_id: Optional[str] = typer.Argument(None, help="Job ID or index to cancel (e.g. 0, job-0)"),
     all_jobs: bool = typer.Option(False, "--all", "-a", help="Cancel all running/queued jobs"),
 ):
     """Cancel and terminate a running remote GPU job on Kaggle."""
     from compute_pool.jobs.runner import stop_remote_job
-    from compute_pool.storage.local import load_all_jobs
+    from compute_pool.storage.local import load_all_jobs, get_job
     from compute_pool.jobs.model import JobState
 
     if all_jobs:
@@ -371,38 +502,16 @@ def job_cancel(
         console.print("[red]Error:[/red] Please provide a job ID or use --all.")
         raise typer.Exit(1)
 
+    target = get_job(job_id)
+    if not target:
+        console.print(f"[red]Error:[/red] Job '{job_id}' not found.")
+        raise typer.Exit(1)
+
     try:
-        stop_remote_job(job_id)
+        stop_remote_job(target.id)
     except ValueError as exc:
         console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# compute-pool accounts stop
-# ─────────────────────────────────────────────────────────────────────────────
-
-@accounts_app.command("stop")
-def accounts_stop(
-    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Slot to stop (1, 2, or omitted for all)"),
-):
-    """Stop all active GPU sessions/kernels on account slot(s) and free quotas."""
-    from compute_pool.shell import stop_gpu_shell
-    from compute_pool.jobs.runner import stop_remote_job
-    from compute_pool.storage.local import load_all_jobs
-    from compute_pool.jobs.model import JobState
-
-    # Stop any active shell sessions
-    stop_gpu_shell(slot=slot)
-
-    # Cancel active jobs on that slot
-    jobs = load_all_jobs()
-    for j in jobs:
-        if j.state in (JobState.RUNNING, JobState.ASSIGNED, JobState.QUEUED, JobState.SCHEDULING):
-            if slot is None or j.assigned_slot == slot:
-                stop_remote_job(j.id)
-
-    console.print(f"[bold green]* Account slot(s) idle and compute released.[/bold green]\n")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -434,10 +543,18 @@ def distributed_run(
 @app.command("shell")
 def gpu_shell(
     slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Account slot to launch single-node GPU shell (1 or 2, omit for 4-GPU cluster)"),
-    duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default 120)"),
+    duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default: 120)"),
     web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminal in default browser"),
 ):
-    """Boot unified 4-GPU Master-Worker Interactive Cluster Terminal (or single node with --slot)."""
+    """
+    Boot unified 4-GPU Master-Worker Interactive Cluster Terminal (or single node with --slot).
+
+    Features:
+    - Master Node 0 + Worker Node 1 mesh
+    - Web File Manager (FTP / Drag & Drop file uploads & downloads)
+    - Real-time 4-GPU nvidia-smi telemetry
+    - Transparent cluster execution (run <script.py>)
+    """
     from compute_pool.shell import launch_gpu_shell, launch_cluster_shell
 
     try:

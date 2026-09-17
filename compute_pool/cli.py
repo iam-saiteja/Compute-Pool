@@ -26,8 +26,10 @@ app = typer.Typer(
 )
 accounts_app = typer.Typer(help="Account management commands.")
 job_app = typer.Typer(help="Job management commands.")
+dist_app = typer.Typer(help="Distributed multi-node cluster commands.")
 app.add_typer(accounts_app, name="accounts")
 app.add_typer(job_app, name="job")
+app.add_typer(dist_app, name="distributed")
 
 console = Console()
 
@@ -337,6 +339,28 @@ def job_status(
     if job.error:
         console.print(f"  [red]Error         : {job.error}[/red]")
     console.print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool distributed run
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dist_app.command("run")
+def distributed_run(
+    spec_file: Path = typer.Argument(..., help="Path to distributed job YAML spec"),
+):
+    """Run a distributed training job across both Kaggle accounts in parallel."""
+    from compute_pool.distributed.coordinator import run_distributed_job
+
+    if not spec_file.exists():
+        console.print(f"[red]Error:[/red] Spec file not found: {spec_file}")
+        raise typer.Exit(1)
+
+    try:
+        run_distributed_job(spec_file)
+    except Exception as e:
+        console.print(f"[red]Distributed run error:[/red] {e}")
+        raise typer.Exit(1)
 
 
 if __name__ == "__main__":

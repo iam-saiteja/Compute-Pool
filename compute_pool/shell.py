@@ -181,6 +181,7 @@ import re
 import urllib.request
 import json
 import threading
+import shutil
 
 SESSION_ID = "__SESSION_ID__"
 WORKER_SESSION_ID = "__WORKER_SESSION_ID__"
@@ -199,7 +200,24 @@ subprocess.run([
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
-# 2. Configure cluster mesh scripts synchronously into /usr/local/bin
+# 2. Discover and preserve the real system nvidia-smi binary
+real_smi = None
+for candidate in ["/usr/bin/nvidia-smi", "/usr/local/cuda/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"]:
+    if os.path.exists(candidate):
+        real_smi = candidate
+        break
+
+if not real_smi:
+    real_smi = shutil.which("nvidia-smi") or "/usr/bin/nvidia-smi"
+
+try:
+    if os.path.exists(real_smi) and real_smi != "/usr/local/bin/real-nvidia-smi":
+        subprocess.run(["cp", "-f", real_smi, "/usr/local/bin/real-nvidia-smi"], check=False)
+        subprocess.run(["chmod", "+x", "/usr/local/bin/real-nvidia-smi"], check=False)
+except Exception:
+    pass
+
+# 3. Configure cluster mesh scripts into /usr/local/bin
 smi_script = '''#!/usr/bin/env python3
 import subprocess, json, urllib.request, os
 
@@ -210,11 +228,7 @@ if os.path.exists("/kaggle/working/.cluster_worker_url"):
 
 local_gpus = []
 try:
-    smi_bin = "nvidia-smi"
-    for candidate in ["/usr/bin/nvidia-smi", "/usr/local/cuda/bin/nvidia-smi", "/usr/local/nvidia/bin/nvidia-smi"]:
-        if os.path.exists(candidate) and candidate != "/usr/local/bin/nvidia-smi":
-            smi_bin = candidate
-            break
+    smi_bin = "/usr/local/bin/real-nvidia-smi" if os.path.exists("/usr/local/bin/real-nvidia-smi") else "nvidia-smi"
     out = subprocess.check_output(
         [smi_bin, "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
         text=True
@@ -349,6 +363,7 @@ with open("/usr/local/bin/watch-gpu", "w") as f:
 os.chmod("/usr/local/bin/watch-gpu", 0o755)
 
 stop_script = '''#!/bin/bash
+echo "[*] Terminating 4-GPU Cluster and releasing resources..."
 if [ -f /kaggle/working/.cluster_worker_url ]; then
     WURL=$(cat /kaggle/working/.cluster_worker_url)
     if [ -n "$WURL" ]; then
@@ -363,17 +378,19 @@ os.chmod("/usr/local/bin/stop", 0o755)
 
 # Configure bash environment
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
-    f.write("\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@cluster-master\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
+    f.write("\\nexport PATH=/usr/local/bin:$PATH\\n")
+    f.write("export PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@cluster-master\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='/usr/local/bin/cluster-smi'\\n")
     f.write("alias watch-gpu='/usr/local/bin/watch-gpu'\\n")
+    f.write("alias real-smi='/usr/local/bin/real-nvidia-smi'\\n")
     f.write("alias halt='/usr/local/bin/stop'\\n")
-    f.write("trap '/usr/local/bin/stop' EXIT\\n")
+    f.write("alias exit='/usr/local/bin/stop'\\n")
 
-# 3. Start ttyd on port 7681 with interactive login bash
-ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash", "--login", "-i"])
+# 4. Start ttyd on port 7681
+ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
 time.sleep(1)
 
-# 4. Start cloudflared tunnel for Web Terminal
+# 5. Start cloudflared tunnel for Web Terminal
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -396,7 +413,7 @@ for line in cf_proc.stdout:
             pass
         break
 
-# 5. Background thread to discover Worker RPC endpoint
+# 6. Background thread to discover Worker RPC endpoint
 def setup_cluster_worker_discovery():
     worker_url = ""
     for _ in range(90):
@@ -460,13 +477,20 @@ subprocess.run([
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
+stop_script = '''#!/bin/bash
+kill -9 -1
+'''
+with open("/usr/local/bin/stop", "w") as f:
+    f.write(stop_script)
+os.chmod("/usr/local/bin/stop", 0o755)
+
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
-    f.write(f"\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@{NODE_LABEL}\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
+    f.write(f"\\nexport PATH=/usr/local/bin:$PATH\\n")
+    f.write(f"export PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@{NODE_LABEL}\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='nvidia-smi'\\n")
     f.write("alias watch-gpu='watch -n 1 nvidia-smi'\\n")
-    f.write("alias stop='kill -9 -1'\\n")
-    f.write("alias halt='kill -9 -1'\\n")
-    f.write("trap 'kill -9 -1' EXIT\\n")
+    f.write("alias halt='/usr/local/bin/stop'\\n")
+    f.write("alias exit='/usr/local/bin/stop'\\n")
 
 ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
 time.sleep(1)

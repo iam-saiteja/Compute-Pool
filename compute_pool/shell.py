@@ -390,7 +390,6 @@ target = sys.argv[1]
 args = " ".join(sys.argv[2:])
 
 if os.path.exists(target) and target.endswith(".py"):
-    # Sync python files to Node 1
     if worker_url:
         for py_file in glob.glob("*.py") + [target]:
             try:
@@ -404,11 +403,12 @@ if os.path.exists(target) and target.endswith(".py"):
                 urllib.request.urlopen(req, timeout=10)
             except Exception:
                 pass
-    cmd = f"python3 {target} {args}".strip()
+    cmd = ("python3 " + target + " " + args).strip()
 else:
     cmd = " ".join(sys.argv[1:])
 
-print(f"[*] Dispatching across 4 GPUs (Master + Worker): {cmd}\\n")
+print("[*] Dispatching across 4 GPUs (Master + Worker): " + cmd)
+print()
 
 def run_remote():
     if not worker_url:
@@ -422,9 +422,11 @@ def run_remote():
         with urllib.request.urlopen(req, timeout=600) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             if data.get("stdout"):
-                print("[Node 1 (GPUs 2,3)]\\n" + data["stdout"], end="")
+                print("[Node 1 (GPUs 2,3)]")
+                print(data["stdout"], end="")
             if data.get("stderr"):
-                print("[Node 1 ERR]\\n" + data["stderr"], end="")
+                print("[Node 1 ERR]")
+                print(data["stderr"], end="")
     except Exception as e:
         print("[Node 1 Error]", e)
 

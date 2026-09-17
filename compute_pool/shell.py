@@ -571,24 +571,29 @@ def _push_kernel_payload(slot: int, slug: str, script_body: str) -> dict:
         (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
         (tmp_path / "script.py").write_text(script_body)
 
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 resp = api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
-                if isinstance(resp, dict) and resp.get("error"):
-                    err_msg = resp.get("error")
-                    if "Maximum batch GPU session count" in str(err_msg):
-                        stop_gpu_shell(slot=slot)
-                        time.sleep(2)
+                err_msg = resp.get("error") if isinstance(resp, dict) else getattr(resp, "error", None)
+                if err_msg:
+                    err_str = str(err_msg).strip()
+                    if "Maximum batch GPU session count" in err_str or "429" in err_str or "Conflict" in err_str:
+                        time.sleep(5)
                         continue
-                    return {"slot": slot, "username": username, "status": "FAILED", "error": err_msg}
+                    return {"slot": slot, "username": username, "status": "FAILED", "error": err_str}
                 return {"slot": slot, "username": username, "status": "QUEUED", "kernel_ref": kernel_ref, "error": None}
             except Exception as exc:
-                if "409" in str(exc) or "Conflict" in str(exc):
-                    time.sleep(2)
+                if "409" in str(exc) or "Conflict" in str(exc) or "Maximum batch" in str(exc) or "429" in str(exc):
+                    time.sleep(5)
                     continue
                 return {"slot": slot, "username": username, "status": "FAILED", "error": str(exc)}
 
-        return {"slot": slot, "username": username, "status": "FAILED", "error": "Push failed after retries"}
+        return {
+            "slot": slot,
+            "username": username,
+            "status": "FAILED",
+            "error": "Kaggle GPU session limit reached (Maximum batch GPU sessions reached). Please ensure no interactive sessions are running at kaggle.com and wait 1-2 minutes.",
+        }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

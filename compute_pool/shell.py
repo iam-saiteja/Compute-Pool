@@ -10,10 +10,12 @@ import json
 import re
 import tempfile
 import time
+import uuid
 import webbrowser
 from pathlib import Path
 from typing import Optional
 
+import httpx
 from rich.console import Console
 from rich.panel import Panel
 
@@ -23,31 +25,34 @@ from compute_pool.probe import _get_authenticated_api
 console = Console()
 
 SHELL_KERNEL_SLUG = "interactive-gpu-terminal"
-SHELL_KERNEL_TITLE = "Compute Pool Interactive GPU Terminal"
 
 # Remote startup script executed inside the Kaggle GPU container
-SHELL_BOOTSTRAP_SCRIPT = """\
+SHELL_BOOTSTRAP_TEMPLATE = """\
 import os
 import subprocess
 import sys
 import time
 import re
+import urllib.request
+
+SESSION_ID = "__SESSION_ID__"
+DURATION_MINUTES = __DURATION_MINUTES__
 
 print("[*] Setting up Compute Pool Interactive GPU Web Terminal...", flush=True)
 
-# 1. Install ttyd
+# 1. Install ttyd (fast Web terminal server)
 subprocess.run([
     "bash", "-c",
-    "curl -sLo /usr/local/bin/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && chmod +x /usr/local/bin/ttyd"
+    "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
 ], check=True)
 
-# 2. Install bore tunnel
+# 2. Install cloudflared (HTTPS/WSS tunnel)
 subprocess.run([
     "bash", "-c",
-    "curl -sLo /tmp/bore.tar.gz https://github.com/ekzhang/bore/releases/download/v0.5.2/bore-v0.5.2-x86_64-unknown-linux-musl.tar.gz && tar -xzf /tmp/bore.tar.gz -C /usr/local/bin/ && chmod +x /usr/local/bin/bore"
+    "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
-# 3. Configure shell environment
+# 3. Configure shell environment with aliases
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@gpu-worker\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='nvidia-smi'\\n")
@@ -57,28 +62,37 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
 ttyd_proc = subprocess.Popen(["/usr/local/bin/ttyd", "-W", "-p", "7681", "bash"])
 time.sleep(1)
 
-# 5. Start bore tunnel
-bore_proc = subprocess.Popen(
-    ["/usr/local/bin/bore", "local", "7681", "--to", "bore.pub"],
+# 5. Start cloudflared tunnel
+cf_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
     stderr=subprocess.STDOUT,
     text=True
 )
 
-for line in bore_proc.stdout:
-    m = re.search(r"listening at bore\\.pub:(\\d+)", line)
+terminal_url = ""
+for line in cf_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\\.trycloudflare\\.com", clean)
     if m:
-        port = m.group(1)
+        terminal_url = m.group(0)
         print("========================================", flush=True)
-        print(f"WEB_TERMINAL: http://bore.pub:{port}", flush=True)
+        print(f"WEB_TERMINAL: {terminal_url}", flush=True)
         print("========================================", flush=True)
+        
+        # Publish URL to rendezvous point for instant client pickup
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+            print("[*] Tunnel URL published to client.", flush=True)
+        except Exception as exc:
+            print("[!] Rendezvous publish failed:", exc, flush=True)
         break
 
 sys.stdout.flush()
 
-# Keep session alive for the duration
-duration_minutes = int(os.environ.get("SESSION_MINUTES", "120"))
-for _ in range(duration_minutes * 12):
+# Keep container alive for the session duration
+for _ in range(DURATION_MINUTES * 12):
     time.sleep(5)
 """
 
@@ -105,6 +119,7 @@ def launch_gpu_shell(
     key = creds["key"]
     api = _get_authenticated_api(username, key)
     kernel_ref = f"{username}/{SHELL_KERNEL_SLUG}"
+    session_id = f"cp-shell-{uuid.uuid4().hex[:12]}"
 
     console.print(f"\n[bold cyan]Booting Interactive GPU Terminal (Slot {slot}: {username})...[/bold cyan]")
     console.print("  [dim]Provisioning 2x Tesla T4 GPU worker with live Web Terminal...[/dim]")
@@ -113,7 +128,7 @@ def launch_gpu_shell(
         tmp_path = Path(tmp_dir)
         meta = {
             "id": kernel_ref,
-            "title": SHELL_KERNEL_TITLE,
+            "title": SHELL_KERNEL_SLUG,
             "code_file": "script.py",
             "language": "python",
             "kernel_type": "script",
@@ -128,9 +143,10 @@ def launch_gpu_shell(
         }
         (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
         
-        script = SHELL_BOOTSTRAP_SCRIPT.replace(
-            'int(os.environ.get("SESSION_MINUTES", "120"))',
-            f"{int(duration_minutes)}"
+        script = (
+            SHELL_BOOTSTRAP_TEMPLATE
+            .replace("__SESSION_ID__", session_id)
+            .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
         )
         (tmp_path / "script.py").write_text(script)
 
@@ -146,26 +162,23 @@ def launch_gpu_shell(
     dots = 0
 
     while time.time() - start_time < timeout_seconds:
+        # Check instant rendezvous point
         try:
-            logs = api.kernels_logs(kernel_ref)
-            full_text = ""
-            for entry in logs:
-                data = getattr(entry, "data", "") if not isinstance(entry, dict) else entry.get("data", "")
-                if not data and isinstance(entry, str):
-                    data = entry
-                full_text += str(data)
-
-            if "WEB_TERMINAL:" in full_text or "bore.pub" in full_text:
-                web_m = re.search(r"http://bore\.pub:\d+", full_text)
-                if web_m:
-                    web_url = web_m.group(0).strip()
+            resp = httpx.get(f"https://ntfy.sh/{session_id}/raw?poll=1", timeout=5)
+            if resp.status_code == 200 and resp.text.strip():
+                for line in resp.text.splitlines():
+                    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", line)
+                    if m:
+                        web_url = m.group(0).strip()
+                        break
+                if web_url:
                     break
         except Exception:
             pass
 
         print(f"\r  Connecting to live GPU terminal {'.' * (dots % 4 + 1)}    ", end="", flush=True)
         dots += 1
-        time.sleep(4)
+        time.sleep(3)
 
     print()  # newline after status dots
 

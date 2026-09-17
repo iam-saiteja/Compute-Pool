@@ -19,19 +19,20 @@ class TestShellModule:
 
         mock_api = mock.MagicMock()
         mock_api.kernels_push.return_value = {"error": None}
-        mock_api.kernels_logs.return_value = [
-            {"data": "WEB_TERMINAL: https://random-subdomain.trycloudflare.com\n"}
-        ]
         monkeypatch.setattr("compute_pool.shell._get_authenticated_api", lambda u, k: mock_api)
         monkeypatch.setattr("webbrowser.open", mock.MagicMock())
 
+        mock_resp = mock.MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "https://test-node-shell.trycloudflare.com\n"
+        monkeypatch.setattr("httpx.get", lambda url, timeout: mock_resp)
+
         res = launch_gpu_shell(slot=1, duration_minutes=30, open_web=False, timeout_seconds=5)
-        assert res["web"] == "https://random-subdomain.trycloudflare.com"
+        assert res["web"] == "https://test-node-shell.trycloudflare.com"
         assert res["kernel_ref"] == "testuser/interactive-gpu-terminal"
         mock_api.kernels_push.assert_called_once()
 
     def test_display_panel_does_not_crash(self):
-        # Ensure display panel executes cleanly with mock data
         _display_shell_panel(
             slot=1,
             username="testuser",

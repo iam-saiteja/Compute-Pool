@@ -363,5 +363,30 @@ def distributed_run(
         raise typer.Exit(1)
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool shell
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.command("shell")
+def gpu_shell(
+    slot: int = typer.Option(1, "--slot", "-s", help="Account slot to launch GPU shell on (1 or 2)"),
+    duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default 120)"),
+    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminal in default browser"),
+):
+    """Boot an interactive remote terminal inside a live Tesla T4 GPU container with root bash, CUDA & SSH."""
+    if slot not in (1, 2):
+        console.print("[red]Error:[/red] --slot must be 1 or 2.")
+        raise typer.Exit(1)
+
+    from compute_pool.shell import launch_gpu_shell
+
+    try:
+        launch_gpu_shell(slot=slot, duration_minutes=duration, open_web=web)
+    except (ValueError, RuntimeError, TimeoutError) as exc:
+        console.print(f"[red]Shell error:[/red] {exc}")
+        raise typer.Exit(1)
+
+
 if __name__ == "__main__":
     app()
+

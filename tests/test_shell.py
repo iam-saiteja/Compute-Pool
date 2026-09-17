@@ -1,4 +1,4 @@
-﻿"""Unit tests for the interactive GPU shell module."""
+"""Unit tests for the interactive GPU shell module."""
 import json
 import pytest
 from unittest import mock
@@ -39,3 +39,17 @@ class TestShellModule:
             web_url="https://test.trycloudflare.com",
             duration_minutes=60,
         )
+
+    def test_stop_gpu_shell(self, monkeypatch):
+        from compute_pool.shell import stop_gpu_shell
+
+        monkeypatch.setattr(
+            "compute_pool.shell.load_credentials",
+            lambda slot: {"username": f"user{slot}", "key": "key"} if slot == 1 else None
+        )
+        mock_api = mock.MagicMock()
+        monkeypatch.setattr("compute_pool.shell._get_authenticated_api", lambda u, k: mock_api)
+
+        stop_gpu_shell(slot=1)
+        mock_api.kernels_push.assert_called_once()
+

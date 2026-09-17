@@ -1,4 +1,4 @@
-﻿"""
+"""
 Interactive Remote GPU Shell for Compute Pool.
 
 Boots an interactive terminal inside a live Kaggle Tesla T4 GPU container.
@@ -228,3 +228,42 @@ def _display_shell_panel(
             padding=(1, 2),
         )
     )
+
+
+def stop_gpu_shell(slot: int | None = None) -> None:
+    """Stop active interactive GPU shell sessions on slot 1, slot 2, or both."""
+    slots = [1, 2] if slot is None else [slot]
+    for s in slots:
+        creds = load_credentials(s)
+        if not creds:
+            continue
+        username = creds["username"]
+        key = creds["key"]
+        try:
+            api = _get_authenticated_api(username, key)
+            kernel_ref = f"{username}/{SHELL_KERNEL_SLUG}"
+            console.print(f"[dim]Stopping interactive GPU terminal on Slot {s} ({username})...[/dim]")
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                tmp_path = Path(tmp_dir)
+                meta = {
+                    "id": kernel_ref,
+                    "title": SHELL_KERNEL_SLUG,
+                    "code_file": "stop.py",
+                    "language": "python",
+                    "kernel_type": "script",
+                    "is_private": "true",
+                    "enable_gpu": "false",
+                    "enable_tpu": "false",
+                    "enable_internet": "false",
+                    "dataset_sources": [],
+                    "competition_sources": [],
+                    "kernel_sources": [],
+                    "model_sources": [],
+                }
+                (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
+                (tmp_path / "stop.py").write_text("import sys\nprint('Shell session stopped by user.')\nsys.exit(0)\n")
+                api.kernels_push(str(tmp_path))
+                console.print(f"[green]* Slot {s} ({username}) GPU terminal stopped and GPU released.[/green]")
+        except Exception as exc:
+            console.print(f"[yellow]Notice for Slot {s}: {exc}[/yellow]")
+

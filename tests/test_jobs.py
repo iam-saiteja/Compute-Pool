@@ -92,3 +92,24 @@ class TestLocalStorage:
         jobs = storage.load_all_jobs()
         assert len(jobs) == 1
         assert jobs[0].state == JobState.COMPLETED
+
+    def test_stop_remote_job(self, tmp_path, monkeypatch):
+        import compute_pool.storage.local as storage
+        from compute_pool.jobs.runner import stop_remote_job
+        monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
+
+        job = Job(spec=JobSpec(name="running-job", script="pass"))
+        job.transition(JobState.RUNNING)
+        job.assigned_slot = 1
+        job.kaggle_kernel_slug = "test-slug"
+        storage.upsert_job(job)
+
+        mock_api = mock.MagicMock()
+        monkeypatch.setattr("compute_pool.jobs.runner._get_api_for_slot", lambda s: (mock_api, "testuser"))
+
+        cancelled_job = stop_remote_job(job.id)
+        assert cancelled_job.state == JobState.FAILED
+        assert cancelled_job.error == "Cancelled by user"
+        mock_api.kernels_push.assert_called_once()
+

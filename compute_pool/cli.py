@@ -67,7 +67,7 @@ def accounts_status():
     from compute_pool.accounts.manager import get_all_statuses
     from compute_pool.probe import load_cached_gpu_info
 
-    console.print("\n[bold cyan]Compute Pool — Account Status[/bold cyan]\n")
+    console.print("\n[bold cyan]Compute Pool -- Account Status[/bold cyan]\n")
     statuses = get_all_statuses()
 
     panels = []
@@ -342,6 +342,69 @@ def job_status(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# compute-pool job stop / cancel
+# ─────────────────────────────────────────────────────────────────────────────
+
+@job_app.command("stop")
+@job_app.command("cancel")
+def job_cancel(
+    job_id: Optional[str] = typer.Argument(None, help="Job ID (e.g. job-a1b2c3d4)"),
+    all_jobs: bool = typer.Option(False, "--all", "-a", help="Cancel all running/queued jobs"),
+):
+    """Cancel and terminate a running remote GPU job on Kaggle."""
+    from compute_pool.jobs.runner import stop_remote_job
+    from compute_pool.storage.local import load_all_jobs
+    from compute_pool.jobs.model import JobState
+
+    if all_jobs:
+        jobs = load_all_jobs()
+        active = [j for j in jobs if j.state in (JobState.RUNNING, JobState.ASSIGNED, JobState.QUEUED, JobState.SCHEDULING)]
+        if not active:
+            console.print("[dim]No active jobs found to cancel.[/dim]")
+            return
+        for j in active:
+            stop_remote_job(j.id)
+        return
+
+    if not job_id:
+        console.print("[red]Error:[/red] Please provide a job ID or use --all.")
+        raise typer.Exit(1)
+
+    try:
+        stop_remote_job(job_id)
+    except ValueError as exc:
+        console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# compute-pool accounts stop
+# ─────────────────────────────────────────────────────────────────────────────
+
+@accounts_app.command("stop")
+def accounts_stop(
+    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Slot to stop (1, 2, or omitted for all)"),
+):
+    """Stop all active GPU sessions/kernels on account slot(s) and free quotas."""
+    from compute_pool.shell import stop_gpu_shell
+    from compute_pool.jobs.runner import stop_remote_job
+    from compute_pool.storage.local import load_all_jobs
+    from compute_pool.jobs.model import JobState
+
+    # Stop any active shell sessions
+    stop_gpu_shell(slot=slot)
+
+    # Cancel active jobs on that slot
+    jobs = load_all_jobs()
+    for j in jobs:
+        if j.state in (JobState.RUNNING, JobState.ASSIGNED, JobState.QUEUED, JobState.SCHEDULING):
+            if slot is None or j.assigned_slot == slot:
+                stop_remote_job(j.id)
+
+    console.print(f"[bold green]* Account slot(s) idle and compute released.[/bold green]\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # compute-pool distributed run
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -364,7 +427,7 @@ def distributed_run(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# compute-pool shell
+# compute-pool shell & shell-stop
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.command("shell")
@@ -387,6 +450,16 @@ def gpu_shell(
         raise typer.Exit(1)
 
 
+@app.command("shell-stop")
+def gpu_shell_stop(
+    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Slot to stop (1, 2, or omitted for both)"),
+):
+    """Stop running interactive GPU shell sessions and immediately free GPUs."""
+    from compute_pool.shell import stop_gpu_shell
+    stop_gpu_shell(slot=slot)
+
+
 if __name__ == "__main__":
     app()
+
 

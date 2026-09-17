@@ -161,3 +161,49 @@ def run_job_remote(job_id: str) -> Job:
 
     upsert_job(job)
     return job
+
+
+def stop_remote_job(job_id: str) -> Job:
+    """Cancel and terminate a running remote GPU job on Kaggle."""
+    job = get_job(job_id)
+    if job is None:
+        raise ValueError(f"Job {job_id} not found in state store.")
+
+    if job.state not in (JobState.RUNNING, JobState.ASSIGNED, JobState.QUEUED, JobState.SCHEDULING):
+        console.print(f"[yellow]Job {job_id} is already in state: {job.state.value}[/yellow]")
+        return job
+
+    if job.assigned_slot and job.kaggle_kernel_slug:
+        api, username = _get_api_for_slot(job.assigned_slot)
+        kernel_ref = f"{username}/{job.kaggle_kernel_slug}"
+        console.print(f"[dim]Terminating remote Kaggle GPU kernel for {job.id} ({kernel_ref})...[/dim]")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            meta = {
+                "id": kernel_ref,
+                "title": job.kaggle_kernel_slug,
+                "code_file": "stop.py",
+                "language": "python",
+                "kernel_type": "script",
+                "is_private": "true",
+                "enable_gpu": "false",
+                "enable_tpu": "false",
+                "enable_internet": "false",
+                "dataset_sources": [],
+                "competition_sources": [],
+                "kernel_sources": [],
+                "model_sources": [],
+            }
+            (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
+            (tmp_path / "stop.py").write_text("import sys\nprint('Job cancelled by user.')\nsys.exit(0)\n")
+            try:
+                api.kernels_push(str(tmp_path))
+            except Exception as e:
+                console.print(f"[yellow]Notice during remote termination: {e}[/yellow]")
+
+    job.transition(JobState.FAILED, error="Cancelled by user")
+    upsert_job(job)
+    console.print(f"[bold green]* Job {job.id} cancelled successfully.[/bold green]\n")
+    return job
+

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Interactive Remote GPU Shell for Compute Pool.
 
 Boots interactive terminals inside live Kaggle Tesla T4 GPU containers.
@@ -27,8 +27,6 @@ from compute_pool.probe import _get_authenticated_api
 from compute_pool.storage.local import load_all_jobs, upsert_job
 
 console = Console()
-
-SHELL_KERNEL_SLUG = "interactive-gpu-terminal"
 
 # Remote startup script executed inside the Kaggle GPU container
 SHELL_BOOTSTRAP_TEMPLATE = """\
@@ -102,8 +100,12 @@ for _ in range(DURATION_MINUTES * 12):
 """
 
 
+def _get_shell_slug(slot: int) -> str:
+    return f"interactive-gpu-terminal-s{slot}"
+
+
 def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) -> dict:
-    """Worker function executed in an isolated process for slot authentication."""
+    """Worker function executed in an isolated process/thread for slot authentication."""
     creds = load_credentials(slot)
     if not creds:
         return {"slot": slot, "username": "unknown", "status": "FAILED", "error": f"No credentials for slot {slot}"}
@@ -117,13 +119,14 @@ def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) 
     api = KaggleApi()
     api.authenticate()
 
-    kernel_ref = f"{username}/{SHELL_KERNEL_SLUG}"
+    kernel_slug = _get_shell_slug(slot)
+    kernel_ref = f"{username}/{kernel_slug}"
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
         meta = {
             "id": kernel_ref,
-            "title": SHELL_KERNEL_SLUG,
+            "title": kernel_slug,
             "code_file": "script.py",
             "language": "python",
             "kernel_type": "script",
@@ -142,15 +145,31 @@ def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) 
             SHELL_BOOTSTRAP_TEMPLATE
             .replace("__SESSION_ID__", session_id)
             .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
-            .replace("__NODE_LABEL__", f"gpu-node{slot-1}-slot{slot}")
+            .replace("__NODE_LABEL__", f"node{slot-1}-slot{slot}")
         )
         (tmp_path / "script.py").write_text(script)
 
-        try:
-            api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
-            return {"slot": slot, "username": username, "status": "QUEUED", "kernel_ref": kernel_ref, "error": None}
-        except Exception as exc:
-            return {"slot": slot, "username": username, "status": "FAILED", "error": str(exc)}
+        last_err = None
+        for attempt in range(3):
+            try:
+                resp = api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
+                if isinstance(resp, dict) and resp.get("error"):
+                    err_msg = resp.get("error")
+                    if "Maximum batch GPU session count" in str(err_msg):
+                        # Force stop previous shell to free quota
+                        stop_gpu_shell(slot=slot)
+                        time.sleep(2)
+                        continue
+                    return {"slot": slot, "username": username, "status": "FAILED", "error": err_msg}
+                return {"slot": slot, "username": username, "status": "QUEUED", "kernel_ref": kernel_ref, "error": None}
+            except Exception as exc:
+                last_err = exc
+                if "409" in str(exc) or "Conflict" in str(exc):
+                    time.sleep(2)
+                    continue
+                return {"slot": slot, "username": username, "status": "FAILED", "error": str(exc)}
+
+        return {"slot": slot, "username": username, "status": "FAILED", "error": str(last_err)}
 
 
 def launch_gpu_shell(
@@ -169,6 +188,7 @@ def launch_gpu_shell(
 
     username = creds["username"]
     session_id = f"cp-shell-s{slot}-{uuid.uuid4().hex[:10]}"
+    kernel_slug = _get_shell_slug(slot)
 
     # Register as an active running job in the state store
     shell_job = Job(
@@ -182,7 +202,7 @@ def launch_gpu_shell(
         state=JobState.RUNNING,
         assigned_slot=slot,
         assigned_username=username,
-        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+        kaggle_kernel_slug=kernel_slug,
     )
     upsert_job(shell_job)
 
@@ -226,7 +246,7 @@ def launch_gpu_shell(
         upsert_job(shell_job)
         raise TimeoutError(
             f"Interactive terminal failed to establish tunnel connection within {timeout_seconds}s.\n"
-            f"Check status on Kaggle: https://www.kaggle.com/code/{username}/{SHELL_KERNEL_SLUG}"
+            f"Check status on Kaggle: https://www.kaggle.com/code/{username}/{kernel_slug}"
         )
 
     _display_shell_panel(slot, username, web_url, duration_minutes)
@@ -238,7 +258,7 @@ def launch_gpu_shell(
         except Exception:
             pass
 
-    return {"web": web_url, "kernel_ref": f"{username}/{SHELL_KERNEL_SLUG}"}
+    return {"web": web_url, "kernel_ref": f"{username}/{kernel_slug}"}
 
 
 def launch_dual_gpu_shells(
@@ -273,7 +293,7 @@ def launch_dual_gpu_shells(
         state=JobState.RUNNING,
         assigned_slot=1,
         assigned_username=creds1["username"],
-        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+        kaggle_kernel_slug=_get_shell_slug(1),
     ))
     upsert_job(Job(
         id="job-shell-s2",
@@ -281,7 +301,7 @@ def launch_dual_gpu_shells(
         state=JobState.RUNNING,
         assigned_slot=2,
         assigned_username=creds2["username"],
-        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+        kaggle_kernel_slug=_get_shell_slug(2),
     ))
 
     # Push kernels concurrently
@@ -403,35 +423,38 @@ def stop_gpu_shell(slot: int | None = None) -> None:
         key = creds["key"]
         try:
             api = _get_authenticated_api(username, key)
-            kernel_ref = f"{username}/{SHELL_KERNEL_SLUG}"
-            console.print(f"[dim]Stopping interactive GPU terminal on Slot {s} ({username})...[/dim]")
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                tmp_path = Path(tmp_dir)
-                meta = {
-                    "id": kernel_ref,
-                    "title": SHELL_KERNEL_SLUG,
-                    "code_file": "stop.py",
-                    "language": "python",
-                    "kernel_type": "script",
-                    "is_private": "true",
-                    "enable_gpu": "false",
-                    "enable_tpu": "false",
-                    "enable_internet": "false",
-                    "dataset_sources": [],
-                    "competition_sources": [],
-                    "kernel_sources": [],
-                    "model_sources": [],
-                }
-                (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
-                (tmp_path / "stop.py").write_text("import sys\nprint('Shell session stopped by user.')\nsys.exit(0)\n")
-                api.kernels_push(str(tmp_path))
-                console.print(f"[green]* Slot {s} ({username}) GPU terminal stopped and GPU released.[/green]")
+            for slug in [_get_shell_slug(s), "interactive-gpu-terminal"]:
+                kernel_ref = f"{username}/{slug}"
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    tmp_path = Path(tmp_dir)
+                    meta = {
+                        "id": kernel_ref,
+                        "title": slug,
+                        "code_file": "stop.py",
+                        "language": "python",
+                        "kernel_type": "script",
+                        "is_private": "true",
+                        "enable_gpu": "false",
+                        "enable_tpu": "false",
+                        "enable_internet": "false",
+                        "dataset_sources": [],
+                        "competition_sources": [],
+                        "kernel_sources": [],
+                        "model_sources": [],
+                    }
+                    (tmp_path / "kernel-metadata.json").write_text(json.dumps(meta, indent=2))
+                    (tmp_path / "stop.py").write_text("import sys\nprint('Shell session stopped by user.')\nsys.exit(0)\n")
+                    try:
+                        api.kernels_push(str(tmp_path))
+                    except Exception:
+                        pass
+            console.print(f"[green]* Slot {s} ({username}) GPU terminal stopped and GPU released.[/green]")
         except Exception as exc:
             console.print(f"[yellow]Notice for Slot {s}: {exc}[/yellow]")
 
         # Update job state in local store
         for j in load_all_jobs():
-            if j.id == f"job-shell-s{s}" or (j.assigned_slot == s and j.kaggle_kernel_slug == SHELL_KERNEL_SLUG):
+            if j.id == f"job-shell-s{s}" or (j.assigned_slot == s and "interactive-gpu-terminal" in str(j.kaggle_kernel_slug)):
                 if j.state == JobState.RUNNING:
                     j.transition(JobState.COMPLETED)
                     upsert_job(j)

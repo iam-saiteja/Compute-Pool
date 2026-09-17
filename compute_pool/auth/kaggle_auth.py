@@ -62,8 +62,8 @@ def interactive_login(slot: int) -> dict[str, str]:
     Prompt the user for Kaggle credentials interactively.
     Directs them to https://www.kaggle.com/settings to get an API token.
     """
-    console.print(f"\n[bold cyan]Compute Pool — Login (Slot {slot})[/bold cyan]")
-    console.print("[dim]Get your API key from: https://www.kaggle.com/settings → API → Create New Token[/dim]\n")
+    console.print(f"\n[bold cyan]Compute Pool -- Login (Slot {slot})[/bold cyan]")
+    console.print("[dim]Get your API key from: https://www.kaggle.com/settings -> API -> Create New Token[/dim]\n")
 
     username = Prompt.ask(f"  Kaggle username for slot {slot}").strip()
     key      = Prompt.ask(f"  Kaggle API key for slot {slot}").strip()   # shown as plain text
@@ -75,7 +75,7 @@ def interactive_login(slot: int) -> dict[str, str]:
     _validate_credentials(username, key, slot)
 
     path = store_credentials(slot, username, key)
-    console.print(f"\n[green]✓ Slot {slot} authenticated as '{username}'[/green]")
+    console.print(f"\n[green]* Slot {slot} authenticated as '{username}'[/green]")
     console.print(f"  Credentials stored at: {path}\n")
     return {"username": username, "key": key}
 

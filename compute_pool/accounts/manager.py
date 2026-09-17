@@ -31,23 +31,38 @@ class AccountStatus:
     slot: int
     username: str
     connected: bool
-    kernels_run_this_week: int = 0
-    estimated_gpu_hours_used: float = 0.0
-    estimated_gpu_hours_remaining: float = KAGGLE_GPU_WEEKLY_QUOTA_HOURS
+    gpu_seconds_used: int = 0
+    gpu_seconds_total: int = 108000
+    tpu_seconds_used: int = 0
+    tpu_seconds_total: int = 72000
+    quota_refresh_time: str = ""
     error: Optional[str] = None
 
     @property
+    def gpu_hours_used(self) -> float:
+        return round(self.gpu_seconds_used / 3600.0, 2)
+
+    @property
+    def gpu_hours_total(self) -> float:
+        return round(self.gpu_seconds_total / 3600.0, 1)
+
+    @property
+    def gpu_hours_remaining(self) -> float:
+        return max(0.0, round((self.gpu_seconds_total - self.gpu_seconds_used) / 3600.0, 2))
+
+    @property
     def has_capacity(self) -> bool:
-        return self.connected and self.estimated_gpu_hours_remaining > 0.5
+        return self.connected and self.gpu_hours_remaining > 0.05
 
     def to_dict(self) -> dict:
         return {
             "slot": self.slot,
             "username": self.username,
             "connected": self.connected,
-            "kernels_run_this_week": self.kernels_run_this_week,
-            "estimated_gpu_hours_used": round(self.estimated_gpu_hours_used, 2),
-            "estimated_gpu_hours_remaining": round(self.estimated_gpu_hours_remaining, 2),
+            "gpu_hours_used": self.gpu_hours_used,
+            "gpu_hours_remaining": self.gpu_hours_remaining,
+            "gpu_hours_total": self.gpu_hours_total,
+            "quota_refresh_time": self.quota_refresh_time,
             "error": self.error,
         }
 
@@ -59,43 +74,8 @@ def _make_auth(username: str, key: str):
     return {}, (username, key)
 
 
-def _fetch_kernel_count(username: str, key: str) -> int:
-    """
-    Fetch number of kernels run this week for quota estimation.
-    Uses the Kaggle API kernels list endpoint filtered by the owner.
-    """
-    headers, auth = _make_auth(username, key)
-    try:
-        resp = httpx.get(
-            "https://www.kaggle.com/api/v1/kernels",
-            headers=headers,
-            auth=auth,
-            params={"ownerSlug": username, "pageSize": 100},
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            kernels = resp.json()
-            # Count kernels that have a lastRunTime in the past 7 days
-            now = datetime.utcnow()
-            recent = 0
-            for k in kernels:
-                last_run = k.get("lastRunTime", "")
-                if last_run:
-                    try:
-                        dt = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
-                        age_days = (now - dt.replace(tzinfo=None)).days
-                        if age_days < 7:
-                            recent += 1
-                    except ValueError:
-                        pass
-            return recent
-        return 0
-    except Exception:
-        return 0
-
-
 def get_account_status(slot: int) -> AccountStatus:
-    """Return live status for one account slot."""
+    """Return live status and exact quota for one account slot."""
     creds = load_credentials(slot)
     if creds is None:
         return AccountStatus(
@@ -108,11 +88,10 @@ def get_account_status(slot: int) -> AccountStatus:
     username = creds["username"]
     key = creds["key"]
 
-    # Verify connectivity
     headers, auth = _make_auth(username, key)
     try:
         resp = httpx.get(
-            "https://www.kaggle.com/api/v1/competitions/list",
+            "https://www.kaggle.com/api/v1/kernels/quota",
             headers=headers,
             auth=auth,
             timeout=10,
@@ -124,7 +103,30 @@ def get_account_status(slot: int) -> AccountStatus:
                 connected=False,
                 error="Authentication failed (401). Re-run: compute-pool login --slot {}".format(slot),
             )
-        connected = resp.status_code in (200, 204)
+        if resp.status_code in (200, 204):
+            data = resp.json()
+            gpu_q = data.get("gpuQuota", {})
+            tpu_q = data.get("tpuQuota", {})
+
+            def _get_sec(q_obj, name):
+                return int(q_obj.get(name, {}).get("seconds", 0))
+
+            gpu_used = _get_sec(gpu_q, "timeUsed")
+            gpu_total = _get_sec(gpu_q, "totalTimeAllowed") or 108000
+            tpu_used = _get_sec(tpu_q, "timeUsed")
+            tpu_total = _get_sec(tpu_q, "totalTimeAllowed") or 72000
+            refresh_time = data.get("quotaRefreshTime", "")
+
+            return AccountStatus(
+                slot=slot,
+                username=username,
+                connected=True,
+                gpu_seconds_used=gpu_used,
+                gpu_seconds_total=gpu_total,
+                tpu_seconds_used=tpu_used,
+                tpu_seconds_total=tpu_total,
+                quota_refresh_time=refresh_time,
+            )
     except httpx.ConnectError:
         return AccountStatus(
             slot=slot,
@@ -132,19 +134,19 @@ def get_account_status(slot: int) -> AccountStatus:
             connected=False,
             error="Cannot reach kaggle.com",
         )
-
-    kernels_run = _fetch_kernel_count(username, key)
-    # Rough heuristic: each GPU kernel run ≈ 2 h average GPU usage
-    gpu_hours_used = kernels_run * 2.0
-    gpu_hours_remaining = max(0.0, KAGGLE_GPU_WEEKLY_QUOTA_HOURS - gpu_hours_used)
+    except Exception as e:
+        return AccountStatus(
+            slot=slot,
+            username=username,
+            connected=False,
+            error=str(e),
+        )
 
     return AccountStatus(
         slot=slot,
         username=username,
-        connected=connected,
-        kernels_run_this_week=kernels_run,
-        estimated_gpu_hours_used=gpu_hours_used,
-        estimated_gpu_hours_remaining=gpu_hours_remaining,
+        connected=False,
+        error="Unknown response from Kaggle",
     )
 
 
@@ -157,4 +159,5 @@ def best_available_slot(statuses: list[AccountStatus]) -> Optional[AccountStatus
     available = [s for s in statuses if s.has_capacity]
     if not available:
         return None
-    return max(available, key=lambda s: s.estimated_gpu_hours_remaining)
+    return max(available, key=lambda s: s.gpu_hours_remaining)
+

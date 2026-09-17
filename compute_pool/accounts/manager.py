@@ -19,7 +19,7 @@ from typing import Optional
 import httpx
 from rich.console import Console
 
-from compute_pool.auth.kaggle_auth import load_credentials
+from compute_pool.auth.kaggle_auth import load_credentials, _is_bearer_token
 
 console = Console()
 
@@ -52,15 +52,24 @@ class AccountStatus:
         }
 
 
+def _make_auth(username: str, key: str):
+    """Return (headers, auth) tuple depending on token type."""
+    if _is_bearer_token(key):
+        return {"Authorization": f"Bearer {key}"}, None
+    return {}, (username, key)
+
+
 def _fetch_kernel_count(username: str, key: str) -> int:
     """
     Fetch number of kernels run this week for quota estimation.
     Uses the Kaggle API kernels list endpoint filtered by the owner.
     """
+    headers, auth = _make_auth(username, key)
     try:
         resp = httpx.get(
             "https://www.kaggle.com/api/v1/kernels",
-            auth=(username, key),
+            headers=headers,
+            auth=auth,
             params={"ownerSlug": username, "pageSize": 100},
             timeout=15,
         )
@@ -100,10 +109,12 @@ def get_account_status(slot: int) -> AccountStatus:
     key = creds["key"]
 
     # Verify connectivity
+    headers, auth = _make_auth(username, key)
     try:
         resp = httpx.get(
             "https://www.kaggle.com/api/v1/competitions/list",
-            auth=(username, key),
+            headers=headers,
+            auth=auth,
             timeout=10,
         )
         if resp.status_code == 401:

@@ -5,13 +5,13 @@ Each "slot" (1 or 2) maps to a separate Kaggle account.
 Credentials are stored at:
     ~/.compute-pool/accounts/slot{N}/kaggle.json
 
-Format follows the standard Kaggle API token format:
-    {"username": "...", "key": "..."}
+Supports both credential formats:
+  - Old format: {"username": "...", "key": "<hex-string>"}  → HTTP Basic auth
+  - New format: {"username": "...", "key": "KGAT_..."}      → Bearer token auth
 """
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 from rich.console import Console
@@ -26,11 +26,15 @@ def _creds_path(slot: int) -> Path:
     return CREDS_ROOT / f"slot{slot}" / "kaggle.json"
 
 
+def _is_bearer_token(key: str) -> bool:
+    """New Kaggle API tokens start with KGAT_ and use Bearer auth."""
+    return key.startswith("KGAT_")
+
+
 def store_credentials(slot: int, username: str, key: str) -> Path:
     """Persist Kaggle credentials for a slot."""
     path = _creds_path(slot)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Restrict file permissions on POSIX systems
     path.write_text(json.dumps({"username": username, "key": key}, indent=2))
     try:
         path.chmod(0o600)
@@ -62,7 +66,7 @@ def interactive_login(slot: int) -> dict[str, str]:
     console.print("[dim]Get your API key from: https://www.kaggle.com/settings → API → Create New Token[/dim]\n")
 
     username = Prompt.ask(f"  Kaggle username for slot {slot}").strip()
-    key = Prompt.ask(f"  Kaggle API key for slot {slot}", password=True).strip()
+    key      = Prompt.ask(f"  Kaggle API key for slot {slot}").strip()   # shown as plain text
 
     if not username or not key:
         raise ValueError("Username and API key must not be empty.")
@@ -78,28 +82,49 @@ def interactive_login(slot: int) -> dict[str, str]:
 
 def _validate_credentials(username: str, key: str, slot: int) -> None:
     """
-    Validate Kaggle credentials by hitting the competitions list endpoint.
-    Raises RuntimeError on failure.
+    Validate Kaggle credentials.
+
+    Kaggle has two token formats:
+      - Legacy hex key  → HTTP Basic auth (username, key)
+      - New KGAT_ token → Bearer token auth
     """
     import httpx
 
-    console.print(f"  [dim]Verifying credentials for slot {slot}...[/dim]")
+    bearer = _is_bearer_token(key)
+    auth_desc = "Bearer token" if bearer else "Basic auth"
+    console.print(f"  [dim]Verifying slot {slot} via {auth_desc}...[/dim]")
+
+    headers = {}
+    auth = None
+    if bearer:
+        headers["Authorization"] = f"Bearer {key}"
+    else:
+        auth = (username, key)
+
     try:
         resp = httpx.get(
             "https://www.kaggle.com/api/v1/competitions/list",
-            auth=(username, key),
+            headers=headers,
+            auth=auth,
             timeout=15,
         )
         if resp.status_code == 401:
             raise RuntimeError(
                 f"Invalid credentials for slot {slot}: 401 Unauthorized.\n"
-                "Check your username and API key at https://www.kaggle.com/settings"
+                "Double-check your username and API key at https://www.kaggle.com/settings"
             )
         if resp.status_code not in (200, 204):
-            console.print(f"  [yellow]Warning: unexpected status {resp.status_code} — credentials saved anyway.[/yellow]")
+            console.print(
+                f"  [yellow]Warning: unexpected status {resp.status_code} "
+                f"— credentials saved anyway.[/yellow]"
+            )
     except httpx.ConnectError:
-        console.print("  [yellow]Warning: could not reach kaggle.com — credentials saved but not verified.[/yellow]")
+        console.print(
+            "  [yellow]Warning: could not reach kaggle.com "
+            "— credentials saved but not verified.[/yellow]"
+        )
 
 
 def credentials_configured(slot: int) -> bool:
     return load_credentials(slot) is not None
+

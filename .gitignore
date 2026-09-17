@@ -1,5 +1,6 @@
 # --- Documentation (private, not tracked) ------------------------------------
 docs/
+Compute Pool*.md
 
 # --- Runtime data (state store, credentials cache) ---------------------------
 data/

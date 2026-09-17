@@ -420,7 +420,8 @@ def stop_gpu_shell(slot: int | None = None) -> None:
         key = creds["key"]
         try:
             api = _get_authenticated_api(username, key)
-            for slug in [_get_shell_slug(s), "interactive-gpu-terminal"]:
+            shell_slugs = [_get_shell_slug(s), "interactive-gpu-terminal", "test-cf-terminal", "test-pinggy-terminal", "interactive-gpu-session"]
+            for slug in shell_slugs:
                 kernel_ref = f"{username}/{slug}"
                 with tempfile.TemporaryDirectory() as tmp_dir:
                     tmp_path = Path(tmp_dir)
@@ -451,7 +452,7 @@ def stop_gpu_shell(slot: int | None = None) -> None:
 
         # Update job state in local store
         for j in load_all_jobs():
-            if j.id == f"job-shell-s{s}" or (j.assigned_slot == s and "interactive-gpu-terminal" in str(j.kaggle_kernel_slug)):
+            if j.id in [f"job-shell-s{s}", f"job-shell-s1", f"job-shell-s2"] or (j.assigned_slot == s and "shell" in j.spec.name):
                 if j.state == JobState.RUNNING:
-                    j.transition(JobState.COMPLETED)
+                    j.transition(JobState.CANCELLED)
                     upsert_job(j)

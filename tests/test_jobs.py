@@ -1,0 +1,94 @@
+"""Unit tests for the job model and local storage."""
+import json
+import tempfile
+from pathlib import Path
+from unittest import mock
+
+import pytest
+
+from compute_pool.jobs.model import Job, JobSpec, JobState
+
+
+class TestJobModel:
+    def test_default_id_format(self):
+        job = Job()
+        assert job.id.startswith("job-")
+        assert len(job.id) == 12  # "job-" + 8 hex chars
+
+    def test_default_state_is_queued(self):
+        job = Job()
+        assert job.state == JobState.QUEUED
+
+    def test_transition_changes_state(self):
+        job = Job()
+        job.transition(JobState.SCHEDULING)
+        assert job.state == JobState.SCHEDULING
+
+    def test_transition_stores_error(self):
+        job = Job()
+        job.transition(JobState.FAILED, error="no quota")
+        assert job.state == JobState.FAILED
+        assert job.error == "no quota"
+
+    def test_to_dict_roundtrip(self):
+        spec = JobSpec(name="test-job", script="print('hi')", gpu=True, gpu_memory_gb=16)
+        job = Job(spec=spec)
+        job.transition(JobState.ASSIGNED)
+        job.assigned_slot = 1
+        job.assigned_username = "alice"
+
+        d = job.to_dict()
+        restored = Job.from_dict(d)
+
+        assert restored.id == job.id
+        assert restored.state == JobState.ASSIGNED
+        assert restored.assigned_slot == 1
+        assert restored.assigned_username == "alice"
+        assert restored.spec.name == "test-job"
+        assert restored.spec.gpu is True
+
+    def test_from_dict_handles_missing_fields(self):
+        """from_dict should not crash on minimal dict."""
+        d = {"id": "job-abc12345"}
+        job = Job.from_dict(d)
+        assert job.id == "job-abc12345"
+        assert job.state == JobState.QUEUED
+
+
+class TestLocalStorage:
+    def test_upsert_and_load(self, tmp_path, monkeypatch):
+        # Redirect DATA_DIR to tmp_path
+        import compute_pool.storage.local as storage
+        monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
+
+        job = Job(spec=JobSpec(name="store-test", script="pass"))
+        storage.upsert_job(job)
+
+        loaded = storage.load_all_jobs()
+        assert len(loaded) == 1
+        assert loaded[0].id == job.id
+        assert loaded[0].spec.name == "store-test"
+
+    def test_get_job_returns_none_for_missing(self, tmp_path, monkeypatch):
+        import compute_pool.storage.local as storage
+        monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
+
+        result = storage.get_job("job-doesnotexist")
+        assert result is None
+
+    def test_upsert_updates_existing(self, tmp_path, monkeypatch):
+        import compute_pool.storage.local as storage
+        monkeypatch.setattr(storage, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(storage, "JOBS_FILE", tmp_path / "jobs.json")
+
+        job = Job(spec=JobSpec(name="update-test", script="pass"))
+        storage.upsert_job(job)
+
+        job.transition(JobState.COMPLETED)
+        storage.upsert_job(job)
+
+        jobs = storage.load_all_jobs()
+        assert len(jobs) == 1
+        assert jobs[0].state == JobState.COMPLETED

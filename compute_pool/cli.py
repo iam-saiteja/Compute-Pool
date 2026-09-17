@@ -59,37 +59,60 @@ def login(
 @accounts_app.command("status")
 def accounts_status():
     """Show live status and estimated GPU quota for both accounts."""
+    from rich.panel import Panel
+    from rich.columns import Columns
+    from rich.text import Text
     from compute_pool.accounts.manager import get_all_statuses
 
     console.print("\n[bold cyan]Compute Pool — Account Status[/bold cyan]\n")
     statuses = get_all_statuses()
 
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Slot", style="bold", width=6)
-    table.add_column("Username", width=22)
-    table.add_column("Connected", width=10)
-    table.add_column("Kernels (7d)", width=14)
-    table.add_column("GPU-h Used", width=12)
-    table.add_column("GPU-h Left", width=12)
-    table.add_column("Note", width=40)
+    panels = []
+    total_left = 0.0
 
     for s in statuses:
-        connected_str = "[green]Yes[/green]" if s.connected else "[red]No[/red]"
-        table.add_row(
-            str(s.slot),
-            s.username,
-            connected_str,
-            str(s.kernels_run_this_week),
-            f"~{s.estimated_gpu_hours_used:.1f}h",
-            f"~{s.estimated_gpu_hours_remaining:.1f}h",
-            s.error or "",
-        )
+        if s.connected:
+            status_line = "[bold green]* Connected[/bold green]"
+            total_left += s.estimated_gpu_hours_remaining
+        else:
+            status_line = "[bold red]x Disconnected[/bold red]"
 
-    console.print(table)
+        bar_filled = int((s.estimated_gpu_hours_remaining / 30.0) * 20)
+        bar = "[green]" + "#" * bar_filled + "[/green]" + "[dim]" + "-" * (20 - bar_filled) + "[/dim]"
+
+        lines = [
+            f"[bold]{s.username}[/bold]   (slot {s.slot})",
+            "",
+            f"  Status      : {status_line}",
+            f"  Kernels 7d  : {s.kernels_run_this_week}",
+            f"  GPU-h used  : ~{s.estimated_gpu_hours_used:.1f}h",
+            f"  GPU-h left  : [bold]~{s.estimated_gpu_hours_remaining:.1f}h[/bold] / 30h",
+            f"  Quota       : {bar}",
+        ]
+        if s.error:
+            lines.append(f"\n  [red]{s.error}[/red]")
+
+        color = "green" if s.connected else "red"
+        panels.append(Panel(
+            "\n".join(lines),
+            border_style=color,
+            expand=True,
+        ))
+
+    console.print(Columns(panels, equal=True, expand=True))
+
+    # Summary bar
+    pool_bar_filled = int((min(total_left, 60.0) / 60.0) * 40)
+    pool_bar = "[cyan]" + "#" * pool_bar_filled + "[/cyan]" + "[dim]" + "-" * (40 - pool_bar_filled) + "[/dim]"
     console.print(
-        "\n[dim]Note: GPU quota is estimated from recent kernel history "
-        "(Kaggle does not expose exact remaining hours via API).[/dim]\n"
+        f"\n  [bold]Total pooled quota[/bold] : [bold cyan]~{total_left:.1f}h[/bold cyan] GPU-hours available"
     )
+    console.print(f"  {pool_bar}")
+    console.print(
+        "\n  [dim]Quota estimated from kernel run history "
+        "(Kaggle doesn't expose exact remaining hours via API).[/dim]\n"
+    )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

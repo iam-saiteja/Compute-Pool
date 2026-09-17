@@ -92,11 +92,32 @@ for line in cf_proc.stdout:
             print("[!] Rendezvous publish failed:", exc, flush=True)
         break
 
-sys.stdout.flush()
+# 6. Monitor bash shell and stop signals
+# If user types 'exit' in terminal or stops session from CLI, terminate immediately
+stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
+for _ in range(int(DURATION_MINUTES * 60 / 3)):
+    # Check if ttyd/bash exited
+    if ttyd_proc.poll() is not None:
+        print("[*] User exited shell session. Shutting down container...", flush=True)
+        break
+    
+    # Check if stop was requested via ntfy signal
+    try:
+        req = urllib.request.Request(stop_url)
+        with urllib.request.urlopen(req, timeout=2) as r:
+            body = r.read().decode("utf-8").strip()
+            if body == "STOP":
+                print("[*] Received stop signal. Terminating container...", flush=True)
+                break
+    except Exception:
+        pass
 
-# Keep container alive for the session duration
-for _ in range(DURATION_MINUTES * 12):
-    time.sleep(5)
+    time.sleep(3)
+
+# Force cleanup
+subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
+subprocess.run(["pkill", "-9", "-f", "ttyd"], check=False)
+sys.exit(0)
 """
 
 

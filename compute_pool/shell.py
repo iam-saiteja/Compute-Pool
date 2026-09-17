@@ -1,12 +1,14 @@
-﻿"""
+"""
 Interactive Remote GPU Shell for Compute Pool.
 
-Boots an interactive terminal inside a live Kaggle Tesla T4 GPU container.
-Provides direct Web Terminal access with full root bash, CUDA tools, and live GPU inspection.
+Boots interactive terminals inside live Kaggle Tesla T4 GPU containers.
+Supports single-slot and dual-node cluster shells with full root bash, CUDA tools & live GPU inspection.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import os
 import re
 import tempfile
 import time
@@ -39,8 +41,9 @@ import urllib.request
 
 SESSION_ID = "__SESSION_ID__"
 DURATION_MINUTES = __DURATION_MINUTES__
+NODE_LABEL = "__NODE_LABEL__"
 
-print("[*] Setting up Compute Pool Interactive GPU Web Terminal...", flush=True)
+print(f"[*] Setting up Compute Pool Interactive GPU Web Terminal ({NODE_LABEL})...", flush=True)
 
 # 1. Install ttyd (fast Web terminal server)
 subprocess.run([
@@ -56,7 +59,7 @@ subprocess.run([
 
 # 3. Configure shell environment with aliases
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
-    f.write("\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@gpu-worker\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
+    f.write(f"\\nexport PS1='\\\\[\\\\033[01;32m\\\\]compute-pool@{NODE_LABEL}\\\\[\\\\033[00m\\\\]:\\\\[\\\\033[01;34m\\\\]\\\\w\\\\[\\\\033[00m\\\\]\\\\$ '\\n")
     f.write("alias gpus='nvidia-smi'\\n")
     f.write("alias watch-gpu='watch -n 1 nvidia-smi'\\n")
 
@@ -99,48 +102,22 @@ for _ in range(DURATION_MINUTES * 12):
 """
 
 
-def launch_gpu_shell(
-    slot: int,
-    duration_minutes: int = 120,
-    open_web: bool = False,
-    timeout_seconds: int = 240,
-) -> dict[str, str]:
-    """
-    Launch an interactive GPU terminal session on the specified Kaggle slot.
-
-    Returns dict with {"web": str, "kernel_ref": str}.
-    """
+def _launch_single_slot_proc(slot: int, duration_minutes: int, session_id: str) -> dict:
+    """Worker function executed in an isolated process for slot authentication."""
     creds = load_credentials(slot)
-    if creds is None:
-        raise ValueError(
-            f"No credentials configured for slot {slot}.\n"
-            f"Run: compute-pool login --slot {slot}"
-        )
+    if not creds:
+        return {"slot": slot, "username": "unknown", "status": "FAILED", "error": f"No credentials for slot {slot}"}
 
     username = creds["username"]
-    key = creds["key"]
-    api = _get_authenticated_api(username, key)
+    os.environ["KAGGLE_API_TOKEN"] = creds["key"]
+    os.environ["KAGGLE_USERNAME"] = username
+    os.environ["KAGGLE_KEY"] = creds["key"]
+
+    from kaggle.api.kaggle_api_extended import KaggleApi
+    api = KaggleApi()
+    api.authenticate()
+
     kernel_ref = f"{username}/{SHELL_KERNEL_SLUG}"
-    session_id = f"cp-shell-{uuid.uuid4().hex[:12]}"
-
-    # Register as an active running job in the state store
-    shell_job = Job(
-        id=f"job-shell-s{slot}",
-        spec=JobSpec(
-            name=f"interactive-shell-slot{slot}",
-            script="ttyd + cloudflared web terminal",
-            gpu=True,
-            gpu_memory_gb=15,
-        ),
-        state=JobState.RUNNING,
-        assigned_slot=slot,
-        assigned_username=username,
-        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
-    )
-    upsert_job(shell_job)
-
-    console.print(f"\n[bold cyan]Booting Interactive GPU Terminal (Slot {slot}: {username})...[/bold cyan]")
-    console.print("  [dim]Provisioning 2x Tesla T4 GPU worker with live Web Terminal...[/dim]")
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         tmp_path = Path(tmp_dir)
@@ -165,15 +142,58 @@ def launch_gpu_shell(
             SHELL_BOOTSTRAP_TEMPLATE
             .replace("__SESSION_ID__", session_id)
             .replace("__DURATION_MINUTES__", str(int(duration_minutes)))
+            .replace("__NODE_LABEL__", f"gpu-node{slot-1}-slot{slot}")
         )
         (tmp_path / "script.py").write_text(script)
 
         try:
             api.kernels_push(str(tmp_path), acc="nvidia-tesla-t4")
+            return {"slot": slot, "username": username, "status": "QUEUED", "kernel_ref": kernel_ref, "error": None}
         except Exception as exc:
-            shell_job.transition(JobState.FAILED, error=str(exc))
-            upsert_job(shell_job)
-            raise RuntimeError(f"Failed to push shell kernel to Kaggle: {exc}") from exc
+            return {"slot": slot, "username": username, "status": "FAILED", "error": str(exc)}
+
+
+def launch_gpu_shell(
+    slot: int,
+    duration_minutes: int = 120,
+    open_web: bool = False,
+    timeout_seconds: int = 240,
+) -> dict[str, str]:
+    """Launch an interactive GPU terminal session on a specific slot (1 or 2)."""
+    creds = load_credentials(slot)
+    if creds is None:
+        raise ValueError(
+            f"No credentials configured for slot {slot}.\n"
+            f"Run: compute-pool login --slot {slot}"
+        )
+
+    username = creds["username"]
+    session_id = f"cp-shell-s{slot}-{uuid.uuid4().hex[:10]}"
+
+    # Register as an active running job in the state store
+    shell_job = Job(
+        id=f"job-shell-s{slot}",
+        spec=JobSpec(
+            name=f"interactive-shell-slot{slot}",
+            script="ttyd + cloudflared web terminal",
+            gpu=True,
+            gpu_memory_gb=15,
+        ),
+        state=JobState.RUNNING,
+        assigned_slot=slot,
+        assigned_username=username,
+        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+    )
+    upsert_job(shell_job)
+
+    console.print(f"\n[bold cyan]Booting Interactive GPU Terminal (Slot {slot}: {username})...[/bold cyan]")
+    console.print("  [dim]Provisioning 2x Tesla T4 GPU worker with live Web Terminal...[/dim]")
+
+    res = _launch_single_slot_proc(slot, duration_minutes, session_id)
+    if res.get("status") == "FAILED":
+        shell_job.transition(JobState.FAILED, error=res.get("error"))
+        upsert_job(shell_job)
+        raise RuntimeError(f"Failed to push shell kernel: {res.get('error')}")
 
     console.print("  [dim]Worker queued on Kaggle GPU cluster. Waiting for tunnel connection...[/dim]\n")
 
@@ -182,7 +202,6 @@ def launch_gpu_shell(
     dots = 0
 
     while time.time() - start_time < timeout_seconds:
-        # Check instant rendezvous point
         try:
             resp = httpx.get(f"https://ntfy.sh/{session_id}/raw?poll=1", timeout=5)
             if resp.status_code == 200 and resp.text.strip():
@@ -200,17 +219,16 @@ def launch_gpu_shell(
         dots += 1
         time.sleep(3)
 
-    print()  # newline after status dots
+    print()
 
     if not web_url:
         shell_job.transition(JobState.FAILED, error="Connection timeout")
         upsert_job(shell_job)
         raise TimeoutError(
             f"Interactive terminal failed to establish tunnel connection within {timeout_seconds}s.\n"
-            f"Check status on Kaggle: https://www.kaggle.com/code/{kernel_ref}"
+            f"Check status on Kaggle: https://www.kaggle.com/code/{username}/{SHELL_KERNEL_SLUG}"
         )
 
-    # Display Rich interactive connection panel
     _display_shell_panel(slot, username, web_url, duration_minutes)
 
     if open_web:
@@ -220,18 +238,121 @@ def launch_gpu_shell(
         except Exception:
             pass
 
+    return {"web": web_url, "kernel_ref": f"{username}/{SHELL_KERNEL_SLUG}"}
+
+
+def launch_dual_gpu_shells(
+    duration_minutes: int = 120,
+    open_web: bool = False,
+    timeout_seconds: int = 240,
+) -> dict[str, dict]:
+    """
+    Launch interactive GPU terminals across BOTH accounts simultaneously.
+    Provides 4x Tesla T4 GPUs across two independent live terminal tabs.
+    """
+    creds1 = load_credentials(1)
+    creds2 = load_credentials(2)
+    if not creds1 or not creds2:
+        raise ValueError(
+            "Both Slot 1 and Slot 2 must be configured for dual shell.\n"
+            "Run: compute-pool login --slot 1 and compute-pool login --slot 2"
+        )
+
+    session1_id = f"cp-shell-s1-{uuid.uuid4().hex[:10]}"
+    session2_id = f"cp-shell-s2-{uuid.uuid4().hex[:10]}"
+
+    console.print("\n[bold cyan]Booting Dual-Node Interactive GPU Terminals (4x Tesla T4 GPUs)...[/bold cyan]")
+    console.print(f"  Node 0 : Slot 1 ({creds1['username']}) - 2x Tesla T4 (15 GB each)")
+    console.print(f"  Node 1 : Slot 2 ({creds2['username']}) - 2x Tesla T4 (15 GB each)")
+    console.print("  [dim]Dispatching both terminal workers in parallel...[/dim]\n")
+
+    # Register jobs
+    upsert_job(Job(
+        id="job-shell-s1",
+        spec=JobSpec(name="interactive-shell-slot1", script="ttyd web terminal", gpu=True, gpu_memory_gb=15),
+        state=JobState.RUNNING,
+        assigned_slot=1,
+        assigned_username=creds1["username"],
+        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+    ))
+    upsert_job(Job(
+        id="job-shell-s2",
+        spec=JobSpec(name="interactive-shell-slot2", script="ttyd web terminal", gpu=True, gpu_memory_gb=15),
+        state=JobState.RUNNING,
+        assigned_slot=2,
+        assigned_username=creds2["username"],
+        kaggle_kernel_slug=SHELL_KERNEL_SLUG,
+    ))
+
+    # Push kernels concurrently
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        f1 = executor.submit(_launch_single_slot_proc, 1, duration_minutes, session1_id)
+        f2 = executor.submit(_launch_single_slot_proc, 2, duration_minutes, session2_id)
+        res1 = f1.result()
+        res2 = f2.result()
+
+    if res1.get("status") == "FAILED" or res2.get("status") == "FAILED":
+        err = f"Slot 1: {res1.get('error')} | Slot 2: {res2.get('error')}"
+        raise RuntimeError(f"Failed to launch dual shells: {err}")
+
+    console.print("  [dim]Both workers queued on GPU cluster. Waiting for tunnel connections...[/dim]\n")
+
+    start_time = time.time()
+    url1, url2 = "", ""
+    dots = 0
+
+    while time.time() - start_time < timeout_seconds:
+        if not url1:
+            try:
+                r1 = httpx.get(f"https://ntfy.sh/{session1_id}/raw?poll=1", timeout=4)
+                if r1.status_code == 200 and r1.text.strip():
+                    m1 = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r1.text)
+                    if m1:
+                        url1 = m1.group(0).strip()
+            except Exception:
+                pass
+
+        if not url2:
+            try:
+                r2 = httpx.get(f"https://ntfy.sh/{session2_id}/raw?poll=1", timeout=4)
+                if r2.status_code == 200 and r2.text.strip():
+                    m2 = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", r2.text)
+                    if m2:
+                        url2 = m2.group(0).strip()
+            except Exception:
+                pass
+
+        if url1 and url2:
+            break
+
+        print(f"\r  Connecting to dual GPU workers {'.' * (dots % 4 + 1)}    ", end="", flush=True)
+        dots += 1
+        time.sleep(3)
+
+    print()
+
+    if not url1 or not url2:
+        raise TimeoutError("One or both GPU terminals timed out establishing tunnels.")
+
+    # Display Dual Cluster Panel
+    _display_dual_shell_panel(creds1["username"], creds2["username"], url1, url2, duration_minutes)
+
+    if open_web:
+        console.print("\n[green]* Opening both Web Terminals in your default browser...[/green]")
+        try:
+            webbrowser.open(url1)
+            time.sleep(0.5)
+            webbrowser.open(url2)
+        except Exception:
+            pass
+
     return {
-        "web": web_url,
-        "kernel_ref": kernel_ref,
+        "node0": {"slot": 1, "username": creds1["username"], "web": url1},
+        "node1": {"slot": 2, "username": creds2["username"], "web": url2},
     }
 
 
-def _display_shell_panel(
-    slot: int,
-    username: str,
-    web_url: str,
-    duration_minutes: int,
-) -> None:
+def _display_shell_panel(slot: int, username: str, web_url: str, duration_minutes: int) -> None:
     body = (
         f"[bold green]* GPU Worker Active & Connected[/bold green]\n\n"
         f"  [bold white]Account Slot:[/bold white]   Slot {slot} ({username})\n"
@@ -241,11 +362,30 @@ def _display_shell_panel(
         f"  [bold underline cyan]{web_url}[/bold underline cyan]\n\n"
         f"  [dim]Click the URL above to access full root bash, CUDA drivers & nvidia-smi live.[/dim]"
     )
-
     console.print(
         Panel(
             body,
             title="[bold green]Compute Pool -- Live Interactive GPU Terminal[/bold green]",
+            border_style="green",
+            padding=(1, 2),
+        )
+    )
+
+
+def _display_dual_shell_panel(user1: str, user2: str, url1: str, url2: str, duration_minutes: int) -> None:
+    body = (
+        f"[bold green]* Dual GPU Nodes Active & Connected (4x Tesla T4 GPUs / ~60 GB VRAM)[/bold green]\n\n"
+        f"  [bold white]Max Duration:[/bold white]   {duration_minutes} minutes\n\n"
+        f"+-- [bold yellow]Node 0: Slot 1 ({user1}) - 2x Tesla T4[/bold yellow] -------------------------+\n"
+        f"  Web Terminal: [bold underline cyan]{url1}[/bold underline cyan]\n\n"
+        f"+-- [bold yellow]Node 1: Slot 2 ({user2}) - 2x Tesla T4[/bold yellow] -------------------------+\n"
+        f"  Web Terminal: [bold underline cyan]{url2}[/bold underline cyan]\n\n"
+        f"  [dim]Both nodes have independent root bash environments with PyTorch & CUDA 13.0.[/dim]"
+    )
+    console.print(
+        Panel(
+            body,
+            title="[bold green]Compute Pool -- Dual-Node Interactive Cluster Shells[/bold green]",
             border_style="green",
             padding=(1, 2),
         )

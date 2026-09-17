@@ -16,10 +16,10 @@ class TestShellModule:
             "compute_pool.shell.load_credentials",
             lambda slot: {"username": "testuser", "key": "testkey"}
         )
-
-        mock_api = mock.MagicMock()
-        mock_api.kernels_push.return_value = {"error": None}
-        monkeypatch.setattr("compute_pool.shell._get_authenticated_api", lambda u, k: mock_api)
+        monkeypatch.setattr(
+            "compute_pool.shell._launch_single_slot_proc",
+            lambda slot, dur, s_id: {"slot": slot, "username": "testuser", "status": "QUEUED"}
+        )
         monkeypatch.setattr("webbrowser.open", mock.MagicMock())
 
         mock_resp = mock.MagicMock()
@@ -30,7 +30,6 @@ class TestShellModule:
         res = launch_gpu_shell(slot=1, duration_minutes=30, open_web=False, timeout_seconds=5)
         assert res["web"] == "https://test-node-shell.trycloudflare.com"
         assert res["kernel_ref"] == "testuser/interactive-gpu-terminal"
-        mock_api.kernels_push.assert_called_once()
 
     def test_display_panel_does_not_crash(self):
         _display_shell_panel(
@@ -52,4 +51,27 @@ class TestShellModule:
 
         stop_gpu_shell(slot=1)
         mock_api.kernels_push.assert_called_once()
+
+    def test_launch_dual_gpu_shells(self, monkeypatch):
+        from compute_pool.shell import launch_dual_gpu_shells
+
+        monkeypatch.setattr(
+            "compute_pool.shell.load_credentials",
+            lambda slot: {"username": f"user{slot}", "key": "key"}
+        )
+        monkeypatch.setattr(
+            "compute_pool.shell._launch_single_slot_proc",
+            lambda slot, dur, s_id: {"slot": slot, "username": f"user{slot}", "status": "QUEUED"}
+        )
+        mock_resp = mock.MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "https://dual-test.trycloudflare.com\n"
+        monkeypatch.setattr("httpx.get", lambda url, timeout: mock_resp)
+        monkeypatch.setattr("webbrowser.open", mock.MagicMock())
+
+        res = launch_dual_gpu_shells(duration_minutes=30, open_web=False, timeout_seconds=5)
+        assert "node0" in res
+        assert "node1" in res
+        assert res["node0"]["web"] == "https://dual-test.trycloudflare.com"
+
 

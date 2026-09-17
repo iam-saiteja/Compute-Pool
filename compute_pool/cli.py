@@ -433,19 +433,36 @@ def distributed_run(
 
 @app.command("shell")
 def gpu_shell(
-    slot: int = typer.Option(1, "--slot", "-s", help="Account slot to launch GPU shell on (1 or 2)"),
+    slot: Optional[int] = typer.Option(None, "--slot", "-s", help="Account slot to launch GPU shell on (1 or 2, omit for both)"),
+    all_slots: bool = typer.Option(False, "--all", "-a", help="Launch interactive terminals on BOTH accounts (4x Tesla T4 GPUs)"),
     duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default 120)"),
-    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminal in default browser"),
+    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminal(s) in default browser"),
 ):
-    """Boot an interactive remote terminal inside a live Tesla T4 GPU container with root bash, CUDA & SSH."""
-    if slot not in (1, 2):
-        console.print("[red]Error:[/red] --slot must be 1 or 2.")
-        raise typer.Exit(1)
-
-    from compute_pool.shell import launch_gpu_shell
+    """Boot interactive remote terminal(s) inside live Tesla T4 GPU container(s) with root bash & CUDA."""
+    from compute_pool.shell import launch_gpu_shell, launch_dual_gpu_shells
 
     try:
-        launch_gpu_shell(slot=slot, duration_minutes=duration, open_web=web)
+        if all_slots or slot is None:
+            launch_dual_gpu_shells(duration_minutes=duration, open_web=web)
+        else:
+            if slot not in (1, 2):
+                console.print("[red]Error:[/red] --slot must be 1 or 2.")
+                raise typer.Exit(1)
+            launch_gpu_shell(slot=slot, duration_minutes=duration, open_web=web)
+    except (ValueError, RuntimeError, TimeoutError) as exc:
+        console.print(f"[red]Shell error:[/red] {exc}")
+        raise typer.Exit(1)
+
+
+@app.command("shell-all")
+def gpu_shell_all(
+    duration: int = typer.Option(120, "--duration", "-d", help="Max session duration in minutes (default 120)"),
+    web: bool = typer.Option(False, "--web", "-w", help="Automatically open Web Terminals in default browser"),
+):
+    """Boot dual interactive remote terminals across BOTH accounts (4x Tesla T4 GPUs)."""
+    from compute_pool.shell import launch_dual_gpu_shells
+    try:
+        launch_dual_gpu_shells(duration_minutes=duration, open_web=web)
     except (ValueError, RuntimeError, TimeoutError) as exc:
         console.print(f"[red]Shell error:[/red] {exc}")
         raise typer.Exit(1)
@@ -462,5 +479,6 @@ def gpu_shell_stop(
 
 if __name__ == "__main__":
     app()
+
 
 

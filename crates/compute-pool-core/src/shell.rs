@@ -532,11 +532,14 @@ os.chmod("/usr/local/bin/cluster-status", 0o755)
 ray_script = '''#!/bin/bash
 echo "[*] Initializing Ray Cluster across all 4 GPUs..."
 which ray >/dev/null 2>&1 || (pip install -q "ray[default]" && ssh node1 "pip install -q 'ray[default]'")
-ray stop --force >/dev/null 2>&1 || true
-ssh node1 "ray stop --force >/dev/null 2>&1 || true"
+pkill -9 -f ray 2>/dev/null || true
+ssh node1 "pkill -9 -f ray 2>/dev/null || true"
+pkill -9 -f "ssh -f -N -R 6379" 2>/dev/null || true
+
 export RAY_NODE_IP_ADDRESS=127.0.0.1
 ray start --head --node-ip-address=127.0.0.1 --port=6379 --ray-client-server-port=10001 --dashboard-port=8265 --disable-usage-stats --num-gpus=2
-ssh -f -N -R 6379:127.0.0.1:6379 -R 10001:127.0.0.1:10001 node1
+ssh -f -N -o ServerAliveInterval=10 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes -R 6379:127.0.0.1:6379 -R 10001:127.0.0.1:10001 node1
+sleep 1
 ssh node1 "export RAY_NODE_IP_ADDRESS=127.0.0.1; ray start --address=127.0.0.1:6379 --node-ip-address=127.0.0.1 --disable-usage-stats --num-gpus=2"
 echo ""
 echo "[✓] Ray Cluster Active! 4x Tesla T4 GPUs (60 GB Total VRAM) pooled."

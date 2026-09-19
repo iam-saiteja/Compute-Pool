@@ -44,6 +44,9 @@ try:
     subprocess.run(["bash", "-c", "mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh"], check=False)
     subprocess.run(["bash", "-c", "ssh-keygen -A"], check=False)
     
+    subprocess.run(["bash", "-c", "echo 'PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> /etc/environment"], check=False)
+    subprocess.run(["bash", "-c", "echo 'export PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH' >> /root/.bashrc"], check=False)
+    
     key_path = "/root/.ssh/cluster_key"
     if not os.path.exists(key_path):
         subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", "compute-pool-cluster"], check=True)

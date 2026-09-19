@@ -513,12 +513,13 @@ echo "[*] Initializing Ray Cluster across all 4 GPUs..."
 which ray >/dev/null 2>&1 || (pip install -q "ray[default]" && ssh node1 "pip install -q 'ray[default]'")
 ray stop --force >/dev/null 2>&1 || true
 ssh node1 "ray stop --force >/dev/null 2>&1 || true"
-ray start --head --port=6379 --dashboard-port=8265 --num-gpus=2
+ray start --head --node-ip-address=127.0.0.1 --port=6379 --ray-client-server-port=10001 --dashboard-port=8265 --disable-usage-stats --num-gpus=2
 ssh -f -N -R 6379:127.0.0.1:6379 -R 10001:127.0.0.1:10001 node1
-ssh node1 "ray start --address=127.0.0.1:6379 --num-gpus=2"
+ssh node1 "ray start --address=127.0.0.1:6379 --node-ip-address=127.0.0.2 --disable-usage-stats --num-gpus=2"
 echo ""
 echo "[✓] Ray Cluster Active! 4x Tesla T4 GPUs (60 GB Total VRAM) pooled."
 echo "    In Python: import ray; ray.init(address='auto')"
+echo "    Check cluster: ray status"
 '''
 with open("/usr/local/bin/enable-ray", "w") as f:
     f.write(ray_script)

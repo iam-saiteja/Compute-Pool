@@ -93,7 +93,7 @@ impl KaggleClient {
     }
 
     pub fn is_bearer_token(key: &str) -> bool {
-        key.starts_with("kgat_")
+        key.to_ascii_lowercase().starts_with("kgat_")
     }
 
     fn auth_headers(&self) -> HeaderMap {
@@ -287,6 +287,7 @@ mod tests {
     #[test]
     fn test_is_bearer_token() {
         assert!(KaggleClient::is_bearer_token("kgat_12345abcdef"));
+        assert!(KaggleClient::is_bearer_token("KGAT_12345ABCDEF"));
         assert!(!KaggleClient::is_bearer_token("0123456789abcdef0123456789abcdef"));
     }
 

@@ -26,7 +26,7 @@ NODE_LABEL = "node1-slot2"
 
 print(f"[*] Initializing Compute Pool GPU Cluster Worker ({NODE_LABEL})...", flush=True)
 
-# 1. Download Cloudflared and Chisel
+# 1. Download Cloudflared, Chisel, and Filebrowser
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
@@ -36,6 +36,37 @@ subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz | gzip -d > /usr/local/bin/chisel && chmod +x /usr/local/bin/chisel"
 ], check=False)
+
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/filebrowser/filebrowser/releases/download/v2.32.0/linux-amd64-filebrowser.tar.gz | tar -xz -C /usr/local/bin filebrowser && chmod +x /usr/local/bin/filebrowser"
+], check=False)
+
+# Start File Browser on Worker port 8081
+fb_proc = subprocess.Popen([
+    "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8081", "--noauth"
+])
+time.sleep(1)
+
+cf_fb_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8081", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+worker_files_url = ""
+for line in cf_fb_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
+    if m:
+        worker_files_url = m.group(0)
+        try:
+            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-worker-files", data=worker_files_url.encode("utf-8"))
+            urllib.request.urlopen(req, timeout=10)
+        except Exception:
+            pass
+        break
 
 # 2. Setup SSH Daemon and cluster keys
 cluster_priv_key = ""
@@ -164,6 +195,7 @@ payload = json.dumps({
     "node": NODE_LABEL,
     "chisel_url": chisel_tunnel_url,
     "http_url": http_tunnel_url,
+    "files_url": worker_files_url,
     "ssh_key": cluster_priv_key
 })
 
@@ -175,7 +207,7 @@ for _ in range(5):
     except Exception:
         time.sleep(2)
 
-print(f"[*] Worker registered. Chisel: {chisel_tunnel_url}, HTTP: {http_tunnel_url}", flush=True)
+print(f"[*] Worker registered. Chisel: {chisel_tunnel_url}, Files: {worker_files_url}", flush=True)
 
 # 8. Keep worker alive until STOP signal
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
@@ -448,7 +480,7 @@ try:
     if res.returncode == 0 and res.stdout.strip():
         gpus_node1 = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
         print(f"[*] Node 1 (Worker, Slot 2): Online ({len(gpus_node1)} GPUs: {', '.join(gpus_node1)})")
-        print(f"[*] Inter-Node Fabric: Active (SSH & Bidirectional TCP Bridge)")
+        print(f"[*] Inter-Node Fabric: Active (SSH & Bidirectional Network Bridge)")
     else:
         # Check HTTP fallback
         res_http = subprocess.run(["/usr/local/bin/worker-exec", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"], capture_output=True, text=True, timeout=5)
@@ -462,18 +494,67 @@ except Exception as e:
     print(f"[!] Node 1 (Worker, Slot 2): Connecting ({e})")
 
 print("+----------------------------------------------------------------------+")
-print("Cluster Commands:")
+print("Cluster Tools & Commands:")
 print("  • nvidia-smi        -> Real local GPU telemetry (Node 0)")
 print("  • ssh node1         -> Direct SSH shell into Worker (Node 1)")
 print("  • crun <command>    -> Parallel execution across all 4 GPUs")
-print("  • crun nvidia-smi   -> Real GPU telemetry across all 4 GPUs")
+print("  • enable-ray        -> Initialize unified Ray Cluster across all 4 GPUs")
+print("  • enable-pytorch    -> Setup PyTorch multi-node rendezvous")
+print("  • enable-deepspeed  -> Configure DeepSpeed multi-node hostfile")
 print("+----------------------------------------------------------------------+")
 '''
 with open("/usr/local/bin/cluster-status", "w") as f:
     f.write(status_script)
 os.chmod("/usr/local/bin/cluster-status", 0o755)
 
-# 5. Setup stop script
+# 5. Setup helper scripts: enable-ray, enable-pytorch, enable-deepspeed
+ray_script = '''#!/bin/bash
+echo "[*] Initializing Ray Cluster across all 4 GPUs..."
+which ray >/dev/null 2>&1 || (pip install -q "ray[default]" && ssh node1 "pip install -q 'ray[default]'")
+ray stop --force >/dev/null 2>&1 || true
+ssh node1 "ray stop --force >/dev/null 2>&1 || true"
+ray start --head --port=6379 --dashboard-port=8265 --num-gpus=2
+ssh -f -N -R 6379:127.0.0.1:6379 -R 10001:127.0.0.1:10001 node1
+ssh node1 "ray start --address=127.0.0.1:6379 --num-gpus=2"
+echo ""
+echo "[✓] Ray Cluster Active! 4x Tesla T4 GPUs (60 GB Total VRAM) pooled."
+echo "    In Python: import ray; ray.init(address='auto')"
+'''
+with open("/usr/local/bin/enable-ray", "w") as f:
+    f.write(ray_script)
+os.chmod("/usr/local/bin/enable-ray", 0o755)
+
+pytorch_script = '''#!/bin/bash
+echo "[*] Initializing PyTorch Distributed Environment..."
+ssh -f -N -R 29500:127.0.0.1:29500 node1
+export MASTER_ADDR=127.0.0.1
+export MASTER_PORT=29500
+export WORLD_SIZE=2
+echo "[✓] PyTorch Distributed rendezvous ready on port 29500."
+'''
+with open("/usr/local/bin/enable-pytorch", "w") as f:
+    f.write(pytorch_script)
+os.chmod("/usr/local/bin/enable-pytorch", 0o755)
+
+deepspeed_script = '''#!/bin/bash
+echo "[*] Setting up DeepSpeed multi-node hostfile..."
+mkdir -p /root/.ssh
+cat << 'EOF' > /root/.ssh/hostfile
+localhost slots=2
+node1 slots=2
+EOF
+cat << 'EOF' > /kaggle/working/hostfile
+localhost slots=2
+node1 slots=2
+EOF
+echo "[✓] DeepSpeed hostfile configured (4 GPU slots across 2 nodes)."
+echo "    Run: deepspeed --hostfile /root/.ssh/hostfile <script.py>"
+'''
+with open("/usr/local/bin/enable-deepspeed", "w") as f:
+    f.write(deepspeed_script)
+os.chmod("/usr/local/bin/enable-deepspeed", 0o755)
+
+# 6. Setup stop script
 stop_script = '''#!/bin/bash
 if [ -f /kaggle/working/.cluster_worker_url ]; then
     WURL=$(cat /kaggle/working/.cluster_worker_url)
@@ -487,7 +568,7 @@ with open("/usr/local/bin/stop", "w") as f:
     f.write(stop_script)
 os.chmod("/usr/local/bin/stop", 0o755)
 
-# 6. Configure shell environment (.bashrc) - NEVER ALIAS nvidia-smi
+# 7. Configure shell environment (.bashrc) - NEVER ALIAS nvidia-smi
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("\nexport PATH=/usr/local/bin:$PATH\n")
     f.write("export MASTER_ADDR=127.0.0.1\n")
@@ -500,7 +581,7 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias halt='/usr/local/bin/stop'\n")
     f.write("alias exit='/usr/local/bin/stop'\n")
 
-# 7. Start ttyd Web Terminal and File Browser
+# 8. Start ttyd Web Terminal and File Browser
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
     "-t", "enableClipboard=true",
@@ -513,7 +594,7 @@ fb_proc = subprocess.Popen([
 ])
 time.sleep(1)
 
-# 8. Start Cloudflare Tunnel for Web Terminal
+# 9. Start Cloudflare Tunnel for Web Terminal
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -533,7 +614,7 @@ for line in cf_proc.stdout:
             pass
         break
 
-# 9. Start Cloudflare Tunnel for File Browser
+# 10. Start Cloudflare Tunnel for File Browser
 cf_fb_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8080", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -553,7 +634,7 @@ for line in cf_fb_proc.stdout:
             pass
         break
 
-# 10. Inter-Node Discovery & Peering Thread
+# 11. Inter-Node Discovery & Peering Thread
 def setup_cluster_peering():
     worker_data = None
     for _ in range(120):
@@ -595,15 +676,12 @@ def setup_cluster_peering():
             f.write("    UserKnownHostsFile /dev/null\n")
             f.write("    LogLevel ERROR\n")
 
-    # Connect Chisel Client (bridges port 2222 for SSH and reverse-bridges 29500-29502 for PyTorch)
+    # Connect Chisel Client (bridges port 2222 for SSH - zero port collisions)
     chisel_url = worker_data.get("chisel_url", "")
     if chisel_url:
         subprocess.Popen([
             "/usr/local/bin/chisel", "client", chisel_url,
-            "2222:127.0.0.1:2222",
-            "R:29500:127.0.0.1:29500",
-            "R:29501:127.0.0.1:29501",
-            "R:29502:127.0.0.1:29502"
+            "2222:127.0.0.1:2222"
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     # Notify CLI that peering is established
@@ -652,6 +730,7 @@ pub struct ClusterShellInfo {
     pub worker_username: String,
     pub web_url: String,
     pub files_url: String,
+    pub worker_files_url: String,
     pub master_ref: String,
     pub worker_ref: String,
     pub duration_minutes: u32,
@@ -921,11 +1000,28 @@ pub async fn launch_cluster_shell(
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
+    let mut worker_files_url = String::new();
+    for _ in 0..5 {
+        let ntfy_wfiles_url = format!("https://ntfy.sh/{}-worker-files/raw?poll=1", session_worker_id);
+        if let Ok(resp) = http_client.get(&ntfy_wfiles_url).send().await {
+            if resp.status().is_success() {
+                if let Ok(text) = resp.text().await {
+                    if let Some(m) = re.find(&text) {
+                        worker_files_url = m.as_str().to_string();
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+
     Ok(ClusterShellInfo {
         master_username: creds1.username.clone(),
         worker_username: creds2.username.clone(),
         web_url,
         files_url,
+        worker_files_url,
         master_ref: format!("{}/{}", creds1.username, shell_slug_for_slot(1)),
         worker_ref: format!("{}/{}", creds2.username, shell_slug_for_slot(2)),
         duration_minutes,

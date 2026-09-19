@@ -961,14 +961,18 @@ async fn handle_shell(
 
         let info = launch_cluster_shell(duration, timeout).await?;
         println!("\n{}", "Compute Pool -- Unified 4-GPU Cluster".bold().green());
-        println!("  Cluster Fabric:      2 Nodes (4x Tesla T4 GPUs) Connected & Peered");
-        println!("  Master Web Terminal: {}", info.web_url.bold().cyan());
+        println!("  Cluster Fabric:        2 Nodes (4x Tesla T4 GPUs) Connected & Peered");
+        println!("  Master Web Terminal:   {}", info.web_url.bold().cyan());
         if !info.files_url.is_empty() {
-            println!("  Cluster File Manager: {}", info.files_url.bold().cyan());
+            println!("  Node 0 File Manager:   {}", info.files_url.bold().cyan());
         }
-        println!("  Inter-Node SSH:      ssh node1 (from Master terminal)");
-        println!("  Cluster Runner:      crun <command> (e.g. crun nvidia-smi)");
-        println!("  Duration:            {} mins", info.duration_minutes);
+        if !info.worker_files_url.is_empty() {
+            println!("  Node 1 File Manager:   {}", info.worker_files_url.bold().cyan());
+        }
+        println!("  Inter-Node SSH:        ssh node1 (from Master terminal)");
+        println!("  Cluster Runner:        crun <command> (e.g. crun nvidia-smi)");
+        println!("  Cluster Helpers:       enable-ray, enable-pytorch, enable-deepspeed");
+        println!("  Duration:              {} mins", info.duration_minutes);
         if open {
             let _ = open::that(&info.web_url);
         }

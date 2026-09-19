@@ -11,9 +11,15 @@
 
 ---
 
-## ⚡ Pure Infrastructure-as-a-Service (IaaS)
+---
 
-Compute Pool aggregates isolated cloud GPU nodes into a raw, high-throughput compute cluster. You have full root access to build, run, and scale any ML workload using industry-standard tools:
+## ⚡ Pure Infrastructure-as-a-Service (IaaS) — Zero User Setup Required
+
+> [!IMPORTANT]
+> **No Cluster or Network Setup Needed by Users.**
+> You do **NOT** have to configure IP routing, SSH key exchange, firewall rules, GCS endpoints, or port forwards. Compute Pool handles 100% of the distributed clustering under the hood. You only focus on your machine learning code.
+
+Compute Pool aggregates isolated cloud GPU nodes into a raw, high-throughput compute cluster:
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -25,9 +31,9 @@ Compute Pool aggregates isolated cloud GPU nodes into a raw, high-throughput com
 │   • Root Web Terminal (ttyd)         │    • OpenSSH Server (Port 2222)       │
 │   • Node 0 Web File Manager (8080)   │    • Node 1 Web File Manager (8081)   │
 ├──────────────────────────────────────┴───────────────────────────────────────┤
-│  ⚡ Inter-Node Fabric: Bidirectional SSH & TCP Bridge (`ssh node1`, Ed25519) │
+│  ⚡ Inter-Node Fabric: Pre-configured Bidirectional SSH & TCP Bridge (Ed25519)│
 │  ⚡ Zero Port Collisions: Default ML ports (6379, 29500) kept clean & free    │
-│  ⚡ Opt-In Tooling: Ray Cluster • PyTorch DDP • DeepSpeed • Parallel `crun`  │
+│  ⚡ Plug-and-Play Tools: Ray Cluster • PyTorch DDP • DeepSpeed • Parallel crun│
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -35,8 +41,9 @@ Compute Pool aggregates isolated cloud GPU nodes into a raw, high-throughput com
 
 ## 🚀 Key Highlights & Capabilities
 
+- **100% Pre-Configured 4-GPU Cluster**: Automatic node discovery, SSH key exchange, and inter-node peering. Zero network setup required.
 - **4x Tesla T4 GPUs (60 GB Total VRAM)**: Aggregates dual accounts into a unified 4-GPU cluster with 8 vCPUs and ~42 GB RAM.
-- **Ray Multi-Node Cluster (`enable-ray`)**: Auto-provisions a unified Ray cluster across all 4 GPUs with auto-scaling, GCS coordination, and zero-copy Plasma object store.
+- **One-Command Ray Cluster (`enable-ray`)**: Auto-provisions a unified Ray cluster across all 4 GPUs with auto-scaling, GCS coordination, and zero-copy Plasma object store. Simply write `import ray; ray.init()` in Python.
 - **DeepSpeed Ready (`enable-deepspeed`)**: Pre-configures passwordless SSH and hostfile (`localhost slots=2`, `node1 slots=2`) for multi-node ZeRO stages.
 - **PyTorch DDP (`enable-pytorch`)**: Seamless rendezvous bridge on port `29500` for standard `torchrun` and `torch.distributed`.
 - **Parallel Cluster Runner (`crun <cmd>`)**: Automatically syncs code files and executes commands simultaneously across both nodes.

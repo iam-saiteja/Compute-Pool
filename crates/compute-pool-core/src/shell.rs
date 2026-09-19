@@ -404,19 +404,31 @@ def run_local():
     env = os.environ.copy()
     env["NODE_RANK"] = "0"
     res = subprocess.run(shell_cmd, shell=True, executable="/bin/bash", capture_output=True, text=True, env=env)
-    out = res.stdout if res.stdout else res.stderr
-    return f"[Node 0: Master (Slot 1 - GPUs 0, 1)]\\n{out.strip()}"
+    out = (res.stdout or res.stderr or "").strip()
+    if not out and res.returncode == 0:
+        out = "[✓ Completed successfully (Exit Code 0)]"
+    elif not out:
+        out = f"[! Exited with code {res.returncode}]"
+    return f"[Node 0: Master (Slot 1 - GPUs 0, 1)]\\n{out}"
 
 def run_remote():
     remote_exec = f"export NODE_RANK=1; {shell_cmd}"
     res = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "node1", f"bash -c {shlex.quote(remote_exec)}"], capture_output=True, text=True)
     if res.returncode == 0 or (res.stdout and "Connection refused" not in res.stderr):
-        out = res.stdout if res.stdout else res.stderr
-        return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out.strip()}"
+        out = (res.stdout or res.stderr or "").strip()
+        if not out and res.returncode == 0:
+            out = "[✓ Completed successfully (Exit Code 0)]"
+        elif not out:
+            out = f"[! Exited with code {res.returncode}]"
+        return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out}"
     # Fallback to worker-exec HTTP daemon
     res = subprocess.run(["/usr/local/bin/worker-exec", remote_exec], capture_output=True, text=True)
-    out = res.stdout if res.stdout else res.stderr
-    return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out.strip()}"
+    out = (res.stdout or res.stderr or "").strip()
+    if not out and res.returncode == 0:
+        out = "[✓ Completed successfully (Exit Code 0)]"
+    elif not out:
+        out = f"[! Exited with code {res.returncode}]"
+    return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out}"
 
 with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
     f0 = ex.submit(run_local)

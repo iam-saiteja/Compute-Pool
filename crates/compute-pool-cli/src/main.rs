@@ -4,8 +4,10 @@ use colored::*;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
 use compute_pool_core::{
     auth::{load_credentials, save_credentials, Credentials},
+    distributed::run_distributed_workload,
     job::{Job, JobSpec, JobState},
     kaggle::KaggleClient,
+    probe::run_probe,
     scheduler::{get_all_statuses, schedule_job},
     shell::{launch_cluster_shell, launch_gpu_shell, stop_gpu_shell},
     storage::{
@@ -53,6 +55,13 @@ enum Commands {
     Jobs {
         #[command(subcommand)]
         sub: JobsSubcommand,
+    },
+
+    /// Probe live GPU hardware details on an account slot
+    Probe {
+        /// Account slot number (1 or 2)
+        #[arg(short, long, default_value = "1")]
+        slot: usize,
     },
 
     /// Launch live interactive GPU web terminal (Single node or Unified 4-GPU Cluster)
@@ -190,6 +199,9 @@ async fn main() -> Result<()> {
             JobsSubcommand::Clear { force } => handle_jobs_clear(force)?,
             JobsSubcommand::Reindex => handle_jobs_reindex()?,
         },
+        Commands::Probe { slot } => {
+            handle_probe(slot).await?;
+        }
         Commands::Shell {
             slot,
             duration,
@@ -316,6 +328,24 @@ async fn handle_accounts_status() -> Result<()> {
     }
 
     println!("{table}\n");
+    Ok(())
+}
+
+async fn handle_probe(slot: usize) -> Result<()> {
+    println!("\n{}", format!("Probing GPU hardware for Slot {}...", slot).bold().cyan());
+    println!("{}", "Submitting remote probe kernel to Kaggle cluster...".dimmed());
+
+    let info = run_probe(slot).await?;
+    println!("\n{}", format!("GPU Hardware Report -- Slot {} ({})", slot, info.username).bold());
+    println!("  GPU Model:      {}", info.gpu_name.green().bold());
+    println!("  GPU Count:      {}", info.gpu_count);
+    println!("  Total VRAM:     {} GB ({} MiB)", info.vram_gb(), info.vram_mb);
+    println!("  Driver Version: {}", info.driver_version);
+    println!("  CUDA Version:   {}", info.cuda_version);
+    if let Some(err) = info.error {
+        println!("  Notice:         {}", err.yellow());
+    }
+    println!();
     Ok(())
 }
 
@@ -660,12 +690,30 @@ async fn handle_distributed_run(script: PathBuf, name: String) -> Result<()> {
     let code = std::fs::read_to_string(&script)
         .with_context(|| format!("Failed to read script file: {}", script.display()))?;
 
-    let args = SubmitArgs {
-        script: None,
-        code: Some(code),
-        name,
-        gpu: true,
-        runtime_hours: 2.0,
-    };
-    handle_jobs_submit(args).await
+    println!("\n{}", "Compute Pool -- Multi-Node Distributed Training".bold().cyan());
+    println!("  Script: {}", script.display());
+    println!("  Cluster: 2 Nodes (4x Tesla T4 GPUs total)");
+    println!("{}", "  Dispatching parallel execution across both GPU slots...".dimmed());
+
+    let res = run_distributed_workload(&name, &code, true, 2.0).await?;
+
+    for node in res.node_results {
+        let status_colored = if node.status == "COMPLETE" {
+            node.status.green().bold()
+        } else {
+            node.status.red().bold()
+        };
+        println!("\n{}", format!("--- Node {} (Slot {}: {}) [{}] ---", node.rank, node.slot, node.username, status_colored).bold());
+        for line in node.log.lines().take(40) {
+            println!("  {}", line);
+        }
+    }
+
+    if res.success {
+        println!("\n{} Distributed Job {} finished successfully in {:.1}s!\n", "*".green().bold(), res.job_id, res.elapsed_seconds);
+    } else {
+        println!("\n{} Distributed Job {} failed on one or more nodes.\n", "x".red().bold(), res.job_id);
+    }
+
+    Ok(())
 }

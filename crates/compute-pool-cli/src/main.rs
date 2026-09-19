@@ -187,7 +187,10 @@ async fn main() -> Result<()> {
     if args.len() > 1 {
         let cli = Cli::parse();
         if let Some(cmd) = cli.command {
-            execute_command(cmd).await?;
+            if let Err(e) = execute_command(cmd).await {
+                eprintln!("{} Error: {:#}", "x".red().bold(), e);
+                std::process::exit(1);
+            }
         }
         return Ok(());
     }
@@ -283,7 +286,7 @@ async fn run_interactive_terminal() -> Result<()> {
                     Ok(cli) => {
                         if let Some(cmd) = cli.command {
                             if let Err(e) = execute_command(cmd).await {
-                                println!("{} Error: {}", "x".red().bold(), e);
+                                println!("{} Error: {:#}", "x".red().bold(), e);
                             }
                         }
                     }

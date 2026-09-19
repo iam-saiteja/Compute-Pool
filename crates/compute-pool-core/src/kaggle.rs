@@ -1,34 +1,10 @@
 use anyhow::{Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use serde::{Deserialize, Serialize};
-use std::io::{Cursor, Write};
+use std::io::Cursor;
 use std::path::Path;
-use zip::write::FileOptions;
-use zip::ZipWriter;
 
 const KAGGLE_API_BASE: &str = "https://www.kaggle.com/api/v1";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KernelPushPayload {
-    pub id: String,
-    pub title: String,
-    pub code_file: String,
-    pub language: String,
-    pub kernel_type: String,
-    pub is_private: String,
-    pub enable_gpu: String,
-    pub enable_tpu: String,
-    pub enable_internet: String,
-    #[serde(default)]
-    pub dataset_sources: Vec<String>,
-    #[serde(default)]
-    pub competition_sources: Vec<String>,
-    #[serde(default)]
-    pub kernel_sources: Vec<String>,
-    #[serde(default)]
-    pub model_sources: Vec<String>,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KernelPushResponse {
@@ -137,59 +113,44 @@ impl KaggleClient {
         slug: &str,
         script_code: &str,
         enable_gpu: bool,
-        accelerator: Option<&str>,
+        _accelerator: Option<&str>,
     ) -> Result<KernelPushResponse> {
         let url = format!("{}/kernels/push", KAGGLE_API_BASE);
         let kernel_ref = format!("{}/{}", self.username, slug);
 
-        // Construct zip payload containing script.py and kernel-metadata.json
-        let mut buffer = Vec::new();
-        {
-            let mut zip = ZipWriter::new(Cursor::new(&mut buffer));
-            let options = FileOptions::<()>::default()
-                .compression_method(zip::CompressionMethod::Deflated)
-                .unix_permissions(0o755);
-
-            let metadata = KernelPushPayload {
-                id: kernel_ref.clone(),
-                title: slug.to_string(),
-                code_file: "script.py".to_string(),
-                language: "python".to_string(),
-                kernel_type: "script".to_string(),
-                is_private: "true".to_string(),
-                enable_gpu: if enable_gpu { "true".to_string() } else { "false".to_string() },
-                enable_tpu: "false".to_string(),
-                enable_internet: "true".to_string(),
-                dataset_sources: vec![],
-                competition_sources: vec![],
-                kernel_sources: vec![],
-                model_sources: vec![],
-            };
-
-            let meta_bytes = serde_json::to_vec_pretty(&metadata)?;
-            zip.start_file("kernel-metadata.json", options)?;
-            zip.write_all(&meta_bytes)?;
-
-            zip.start_file("script.py", options)?;
-            zip.write_all(script_code.as_bytes())?;
-
-            zip.finish()?;
+        #[derive(Debug, Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PushRequest {
+            slug: String,
+            new_title: String,
+            text: String,
+            language: String,
+            kernel_type: String,
+            is_private: bool,
+            enable_gpu: bool,
+            enable_internet: bool,
+            dataset_data_sources: Vec<String>,
+            competition_data_sources: Vec<String>,
+            kernel_data_sources: Vec<String>,
+            category_ids: Vec<String>,
         }
 
-        // Build multipart form
-        let mut form = reqwest::multipart::Form::new()
-            .part(
-                "blob",
-                reqwest::multipart::Part::bytes(buffer)
-                    .file_name("kernel.zip")
-                    .mime_str("application/zip")?,
-            );
+        let payload = PushRequest {
+            slug: kernel_ref.clone(),
+            new_title: slug.to_string(),
+            text: script_code.to_string(),
+            language: "python".to_string(),
+            kernel_type: "script".to_string(),
+            is_private: true,
+            enable_gpu,
+            enable_internet: true,
+            dataset_data_sources: vec![],
+            competition_data_sources: vec![],
+            kernel_data_sources: vec![],
+            category_ids: vec![],
+        };
 
-        if let Some(acc) = accelerator {
-            form = form.text("acc", acc.to_string());
-        }
-
-        let req = self.client.post(&url).multipart(form);
+        let req = self.client.post(&url).json(&payload);
         let resp = self.apply_auth(req).send().await
             .context("Failed to send push request to Kaggle")?;
 
@@ -254,25 +215,56 @@ impl KaggleClient {
             anyhow::bail!("Output download failed: HTTP {}", resp.status());
         }
 
-        let bytes = resp.bytes().await.context("Failed to read output zip bytes")?;
+        let bytes = resp.bytes().await.context("Failed to read output response bytes")?;
         std::fs::create_dir_all(output_dir)?;
 
-        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            let outpath = match file.enclosed_name() {
-                Some(path) => output_dir.join(path),
-                None => continue,
-            };
+        // Case 1: Check if response is a ZIP file (starts with PK\x03\x04)
+        if bytes.starts_with(b"PK\x03\x04") {
+            let mut archive = zip::ZipArchive::new(Cursor::new(bytes))?;
+            for i in 0..archive.len() {
+                let mut file = archive.by_index(i)?;
+                let outpath = match file.enclosed_name() {
+                    Some(path) => output_dir.join(path),
+                    None => continue,
+                };
 
-            if file.name().ends_with('/') {
-                std::fs::create_dir_all(&outpath)?;
-            } else {
-                if let Some(p) = outpath.parent() {
-                    std::fs::create_dir_all(p)?;
+                if file.name().ends_with('/') {
+                    std::fs::create_dir_all(&outpath)?;
+                } else {
+                    if let Some(p) = outpath.parent() {
+                        std::fs::create_dir_all(p)?;
+                    }
+                    let mut outfile = std::fs::File::create(&outpath)?;
+                    std::io::copy(&mut file, &mut outfile)?;
                 }
-                let mut outfile = std::fs::File::create(&outpath)?;
-                std::io::copy(&mut file, &mut outfile)?;
+            }
+            return Ok(());
+        }
+
+        // Case 2: Response is Kaggle JSON output format
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            let mut full_log = String::new();
+
+            // Extract log string from "log" or "logNullable"
+            let log_str = val.get("log")
+                .and_then(|v| v.as_str())
+                .or_else(|| val.get("logNullable").and_then(|v| v.as_str()));
+
+            if let Some(raw_log) = log_str {
+                if let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(raw_log) {
+                    for entry in entries {
+                        if let Some(data) = entry.get("data").and_then(|v| v.as_str()) {
+                            full_log.push_str(data);
+                        }
+                    }
+                } else {
+                    full_log.push_str(raw_log);
+                }
+            }
+
+            if !full_log.is_empty() {
+                let log_file = output_dir.join("stdout.log");
+                std::fs::write(&log_file, full_log)?;
             }
         }
 
@@ -292,7 +284,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zip_payload_structure() {
+    fn test_client_init() {
         let client = KaggleClient::new("testuser", "testkey");
         assert_eq!(client.username, "testuser");
     }

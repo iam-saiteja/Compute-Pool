@@ -1,0 +1,6 @@
+﻿[workspace]
+members = [
+    "crates/compute-pool-core",
+    "crates/compute-pool-cli",
+]
+resolver = "2"

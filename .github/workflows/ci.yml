@@ -1,4 +1,4 @@
-﻿name: CI
+name: CI
 
 on:
   push:
@@ -34,3 +34,27 @@ jobs:
       - name: Run Test Suite
         run: |
           pytest -v
+
+  rust-test:
+    name: Rust Core & CLI Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Cargo Tests
+        run: cargo test --workspace --verbose
+
+      - name: Build Standalone Release Binary
+        run: cargo build --release --workspace

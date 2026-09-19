@@ -1,0 +1,24 @@
+[package]
+name = "compute-pool-core"
+version = "0.1.0"
+edition = "2021"
+description = "Core engine for Compute Pool distributed orchestration"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
+tokio = { version = "1.38", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5.0"
+thiserror = "1.0"
+anyhow = "1.0"
+regex = "1.10"
+tempfile = "3.10"
+futures-util = "0.3"
+zip = { version = "2.1", default-features = false, features = ["deflate"] }
+fastrand = "2.1"
+
+[dev-dependencies]
+tempfile = "3.10"

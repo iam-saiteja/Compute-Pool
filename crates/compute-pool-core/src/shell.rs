@@ -508,7 +508,7 @@ pub async fn launch_gpu_shell(
         format!("job-shell-s{}", slot),
         JobSpec {
             name: format!("interactive-shell-slot{}", slot),
-            script: "single node web terminal".to_string(),
+            script: format!("session_id:{}", session_id),
             gpu: true,
             gpu_memory_gb: 15.0,
             max_runtime_hours: (duration_minutes as f64) / 60.0,
@@ -610,7 +610,7 @@ pub async fn launch_cluster_shell(
         "job-cluster-master".to_string(),
         JobSpec {
             name: "cluster-master-node0".to_string(),
-            script: "master web terminal".to_string(),
+            script: format!("session_id:{}", session_master_id),
             gpu: true,
             gpu_memory_gb: 30.0,
             max_runtime_hours: (duration_minutes as f64) / 60.0,
@@ -628,7 +628,7 @@ pub async fn launch_cluster_shell(
         "job-cluster-worker".to_string(),
         JobSpec {
             name: "cluster-worker-node1".to_string(),
-            script: "attached compute worker".to_string(),
+            script: format!("session_id:{}", session_worker_id),
             gpu: true,
             gpu_memory_gb: 30.0,
             max_runtime_hours: (duration_minutes as f64) / 60.0,
@@ -723,8 +723,29 @@ pub async fn stop_gpu_shell(slot: Option<usize>) -> Result<()> {
     };
 
     let stop_script = "import sys\nprint('Shell terminated by user.')\nsys.exit(0)\n";
+    let http_client = reqwest::Client::new();
+    let all_jobs = load_all_jobs().unwrap_or_default();
 
     for s in slots_to_stop {
+        // Send ntfy STOP signals to any active sessions for this slot
+        for mut j in all_jobs.clone() {
+            let is_slot_match = j.get_slot_number() == Some(s)
+                || j.id.contains(&format!("s{}", s))
+                || (s == 1 && j.id == "job-cluster-master")
+                || (s == 2 && j.id == "job-cluster-worker");
+
+            if is_slot_match && (j.spec.name.contains("shell") || j.spec.name.contains("cluster")) {
+                if let Some(session_id) = j.spec.script.strip_prefix("session_id:") {
+                    let stop_url = format!("https://ntfy.sh/{}-stop", session_id.trim());
+                    let _ = http_client.post(&stop_url).body("STOP").send().await;
+                }
+                if j.state.is_active() {
+                    j.transition(JobState::Cancelled, Some("Terminated via shell-stop".to_string()));
+                    let _ = upsert_job(&j);
+                }
+            }
+        }
+
         if let Ok(Some(creds)) = load_credentials(s) {
             let client = KaggleClient::new(&creds.username, &creds.key);
             let slugs = vec![
@@ -734,20 +755,6 @@ pub async fn stop_gpu_shell(slot: Option<usize>) -> Result<()> {
             ];
             for slug in slugs {
                 let _ = client.push_kernel(&slug, stop_script, false, None).await;
-            }
-        }
-
-        // Cancel running shell jobs in store
-        let all_jobs = load_all_jobs().unwrap_or_default();
-        for mut j in all_jobs {
-            if (j.id == format!("job-shell-s{}", s)
-                || j.id == "job-cluster-master"
-                || j.id == "job-cluster-worker"
-                || (j.assigned_slot == Some(serde_json::json!(s)) && j.spec.name.contains("shell")))
-                && j.state == JobState::Running
-            {
-                j.transition(JobState::Cancelled, Some("Terminated via shell-stop".to_string()));
-                let _ = upsert_job(&j);
             }
         }
     }

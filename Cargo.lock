@@ -253,6 +253,7 @@ dependencies = [
  "dirs",
  "indicatif",
  "open",
+ "reqwest",
  "rustyline",
  "serde_json",
  "serde_yaml",

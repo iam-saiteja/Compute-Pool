@@ -346,9 +346,9 @@ async fn execute_command(command: Commands) -> Result<()> {
             AccountsSubcommand::Status => handle_accounts_status().await?,
         },
         Commands::Jobs { sub } => match sub {
-            JobsSubcommand::List => handle_jobs_list()?,
+            JobsSubcommand::List => handle_jobs_list().await?,
             JobsSubcommand::Submit(args) => handle_jobs_submit(args).await?,
-            JobsSubcommand::Status { job_id } => handle_jobs_status(&job_id)?,
+            JobsSubcommand::Status { job_id } => handle_jobs_status(&job_id).await?,
             JobsSubcommand::Logs { job_id } => handle_jobs_logs(&job_id).await?,
             JobsSubcommand::Stop { job_id } => handle_jobs_stop(&job_id).await?,
             JobsSubcommand::Delete { job_id } => handle_jobs_delete(&job_id)?,
@@ -539,13 +539,42 @@ async fn handle_probe(slot: usize) -> Result<()> {
     Ok(())
 }
 
-fn handle_jobs_list() -> Result<()> {
-    let jobs = load_all_jobs()?;
+async fn handle_jobs_list() -> Result<()> {
+    let mut jobs = load_all_jobs()?;
     println!("\n{}", "Compute Pool -- Jobs".bold());
 
     if jobs.is_empty() {
         println!("{}", "No jobs submitted yet.".dimmed());
         return Ok(());
+    }
+
+    // Auto-refresh active jobs against Kaggle
+    for job in jobs.iter_mut() {
+        if job.state.is_active() {
+            if let (Some(slot_num), Some(slug)) = (job.get_slot_number(), &job.kaggle_kernel_slug) {
+                if let Ok(Some(creds)) = load_credentials(slot_num) {
+                    let client = KaggleClient::new(&creds.username, &creds.key);
+                    let kernel_ref = format!("{}/{}", creds.username, slug);
+                    if let Ok(st) = client.get_kernel_status(&kernel_ref).await {
+                        if st.contains("COMPLETE") {
+                            let out_dir = PathBuf::from("data").join("jobs").join(&job.id);
+                            let _ = client.download_kernel_output(&kernel_ref, &out_dir).await;
+                            job.transition(JobState::Completed, None);
+                            let _ = upsert_job(job);
+                        } else if st.contains("ERROR") || st.contains("FAILED") {
+                            job.transition(JobState::Failed, Some(st));
+                            let _ = upsert_job(job);
+                        } else if st.contains("CANCEL") {
+                            job.transition(JobState::Cancelled, None);
+                            let _ = upsert_job(job);
+                        } else if st.contains("RUNNING") && job.state != JobState::Running {
+                            job.transition(JobState::Running, None);
+                            let _ = upsert_job(job);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     let mut table = Table::new();
@@ -560,7 +589,7 @@ fn handle_jobs_list() -> Result<()> {
         "Submitted",
     ]);
 
-    for job in jobs {
+    for job in &jobs {
         let state_cell = match job.state {
             JobState::Completed => Cell::new(job.state.as_str()).fg(Color::Green),
             JobState::Running => Cell::new(job.state.as_str()).fg(Color::Cyan),
@@ -574,11 +603,11 @@ fn handle_jobs_list() -> Result<()> {
             .as_ref()
             .map(|s| s.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let user_str = job.assigned_username.unwrap_or_else(|| "-".to_string());
+        let user_str = job.assigned_username.clone().unwrap_or_else(|| "-".to_string());
         let sub_str = if job.created_at.len() >= 19 {
             job.created_at[..19].replace('T', " ")
         } else {
-            job.created_at
+            job.created_at.clone()
         };
 
         table.add_row(vec![
@@ -708,8 +737,39 @@ async fn handle_jobs_submit(args: SubmitArgs) -> Result<()> {
     Ok(())
 }
 
-fn handle_jobs_status(job_id: &str) -> Result<()> {
-    match get_job(job_id)? {
+async fn handle_jobs_status(job_id: &str) -> Result<()> {
+    let mut job_opt = get_job(job_id)?;
+
+    // Auto-refresh against Kaggle if active
+    if let Some(ref mut job) = job_opt {
+        if job.state.is_active() {
+            if let (Some(slot_num), Some(slug)) = (job.get_slot_number(), &job.kaggle_kernel_slug) {
+                if let Ok(Some(creds)) = load_credentials(slot_num) {
+                    let client = KaggleClient::new(&creds.username, &creds.key);
+                    let kernel_ref = format!("{}/{}", creds.username, slug);
+                    if let Ok(st) = client.get_kernel_status(&kernel_ref).await {
+                        if st.contains("COMPLETE") {
+                            let out_dir = PathBuf::from("data").join("jobs").join(&job.id);
+                            let _ = client.download_kernel_output(&kernel_ref, &out_dir).await;
+                            job.transition(JobState::Completed, None);
+                            let _ = upsert_job(job);
+                        } else if st.contains("ERROR") || st.contains("FAILED") {
+                            job.transition(JobState::Failed, Some(st));
+                            let _ = upsert_job(job);
+                        } else if st.contains("CANCEL") {
+                            job.transition(JobState::Cancelled, None);
+                            let _ = upsert_job(job);
+                        } else if st.contains("RUNNING") && job.state != JobState::Running {
+                            job.transition(JobState::Running, None);
+                            let _ = upsert_job(job);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    match job_opt {
         Some(job) => {
             println!("\n{}", format!("Job Details: {}", job.id).bold());
             println!("  Name:         {}", job.spec.name);
@@ -778,19 +838,33 @@ async fn handle_jobs_stop(job_id: &str) -> Result<()> {
     let mut job = get_job(job_id)?
         .ok_or_else(|| anyhow::anyhow!("Job {} not found", job_id))?;
 
-    if let (Some(slot_val), Some(slug)) = (job.assigned_slot.as_ref().and_then(|v| v.as_u64()), &job.kaggle_kernel_slug) {
-        let slot = slot_val as usize;
-        if let Ok(Some(creds)) = load_credentials(slot) {
+    let slot = job.get_slot_number();
+    let slug = job.kaggle_kernel_slug.clone();
+
+    // If it's an interactive shell or cluster, kill the tunnels & processes immediately
+    if job.spec.name.contains("shell") || job.spec.name.contains("cluster") {
+        let _ = compute_pool_core::shell::stop_gpu_shell(slot).await;
+    }
+
+    // If a session_id is saved in the script field, send instant ntfy STOP
+    if let Some(session_id) = job.spec.script.strip_prefix("session_id:") {
+        let http_client = reqwest::Client::new();
+        let _ = http_client.post(&format!("https://ntfy.sh/{}-stop", session_id.trim())).body("STOP").send().await;
+    }
+
+    // Push exit script to remote Kaggle kernel to terminate worker
+    if let (Some(slot_num), Some(ref s)) = (slot, &slug) {
+        if let Ok(Some(creds)) = load_credentials(slot_num) {
             let client = KaggleClient::new(&creds.username, &creds.key);
             let _ = client
-                .push_kernel(slug, "import sys\nsys.exit(0)\n", false, None)
+                .push_kernel(s, "import sys\nprint('Terminated by user.')\nsys.exit(0)\n", false, None)
                 .await;
         }
     }
 
-    job.transition(JobState::Failed, Some("Cancelled by user".to_string()));
+    job.transition(JobState::Cancelled, Some("Cancelled by user".to_string()));
     upsert_job(&job)?;
-    println!("{} Job {} cancelled.", "*".green().bold(), job.id);
+    println!("{} Job {} stopped and remote GPU worker terminated.", "*".green().bold(), job.id);
     Ok(())
 }
 

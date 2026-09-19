@@ -1,4 +1,4 @@
-﻿use chrono::Utc;
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +114,14 @@ impl Job {
         self.updated_at = Utc::now().to_rfc3339();
         if let Some(err) = error {
             self.error = Some(err);
+        }
+    }
+
+    pub fn get_slot_number(&self) -> Option<usize> {
+        match &self.assigned_slot {
+            Some(serde_json::Value::Number(n)) => n.as_u64().map(|v| v as usize),
+            Some(serde_json::Value::String(s)) => s.parse::<usize>().ok(),
+            _ => None,
         }
     }
 }

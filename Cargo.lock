@@ -248,6 +248,7 @@ dependencies = [
  "colored",
  "comfy-table",
  "compute-pool-core",
+ "console",
  "dialoguer",
  "dirs",
  "indicatif",

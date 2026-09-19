@@ -375,6 +375,38 @@ async fn execute_command(command: Commands) -> Result<()> {
     Ok(())
 }
 
+fn prompt_masked_password(prompt: &str) -> Result<String> {
+    let term = console::Term::stderr();
+    term.write_str(&format!("{}: ", prompt))?;
+    let mut input = String::new();
+    loop {
+        let key = term.read_key()?;
+        match key {
+            console::Key::Enter => {
+                term.write_line("")?;
+                break;
+            }
+            console::Key::Backspace => {
+                if !input.is_empty() {
+                    input.pop();
+                    term.clear_chars(1)?;
+                }
+            }
+            console::Key::Char(c) => {
+                if !c.is_control() {
+                    input.push(c);
+                    term.write_str("*")?;
+                }
+            }
+            _ => {}
+        }
+    }
+    if input.trim().is_empty() {
+        anyhow::bail!("API key / token cannot be empty");
+    }
+    Ok(input.trim().to_string())
+}
+
 async fn handle_login(slot: usize, username: Option<String>, key: Option<String>) -> Result<()> {
     if slot != 1 && slot != 2 {
         anyhow::bail!("Only Slot 1 and Slot 2 are supported.");
@@ -389,18 +421,21 @@ async fn handle_login(slot: usize, username: Option<String>, key: Option<String>
 
     let k = match key {
         Some(val) => val,
-        None => dialoguer::Password::new()
-            .with_prompt(format!("Kaggle API key / token for Slot {}", slot))
-            .interact()?,
+        None => prompt_masked_password(&format!("Kaggle API key / token for Slot {}", slot))?,
     };
 
     save_credentials(slot, &Credentials { username: u.clone(), key: k })?;
+    let cred_path = compute_pool_core::auth::get_credentials_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.compute_pool/credentials.json".to_string());
+
     println!(
         "{} Saved credentials for Slot {} ({})",
         "*".green().bold(),
         slot,
         u.bold()
     );
+    println!("   {} Stored at: {}", "->".cyan(), cred_path.cyan());
     Ok(())
 }
 

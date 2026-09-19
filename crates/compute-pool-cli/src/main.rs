@@ -14,6 +14,8 @@ use compute_pool_core::{
         clear_jobs, delete_job, get_job, load_all_jobs, next_job_id, reindex_jobs, upsert_job,
     },
 };
+use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -25,7 +27,7 @@ use std::time::{Duration, Instant};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -179,9 +181,160 @@ enum DistributedSubcommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let args: Vec<String> = std::env::args().collect();
 
-    match cli.command {
+    // If invoked with subcommands, run directly in batch mode
+    if args.len() > 1 {
+        let cli = Cli::parse();
+        if let Some(cmd) = cli.command {
+            execute_command(cmd).await?;
+        }
+        return Ok(());
+    }
+
+    // Otherwise, launch the Interactive Terminal (REPL)
+    run_interactive_terminal().await?;
+    Ok(())
+}
+
+fn print_welcome_banner() {
+    println!();
+    println!("{}", "╭────────────────────────────────────────────────────────────────────────╮".cyan());
+    println!("{}", "│                     ⚡ Compute Pool GPU Terminal ⚡                     │".bold().cyan());
+    println!("{}", "│      Native Multi-GPU Cluster & Distributed Orchestration Console      │".dimmed().cyan());
+    println!("{}", "╰────────────────────────────────────────────────────────────────────────╯".cyan());
+    println!();
+    println!("{}", "Welcome to Compute Pool Interactive Terminal!".bold());
+    println!("Type commands directly without any prefix:");
+    println!("  • {}           - Check live GPU & TPU quotas", "accounts status".bold().green());
+    println!("  • {}             - Launch 4-GPU unified master-worker cluster", "shell --open".bold().green());
+    println!("  • {}                - Inspect all 0-indexed job records", "jobs list".bold().green());
+    println!("  • {}          - Submit PyTorch script for GPU execution", "jobs submit".bold().green());
+    println!("  • {}             - Probe real-time GPU hardware details", "probe --slot 1".bold().green());
+    println!("  • {}              - Release all GPU sessions immediately", "shell-stop".bold().green());
+    println!("  • {} / {}             - Show help or clear screen", "help".bold().yellow(), "cls".bold().yellow());
+    println!("  • {} / {}             - Exit the terminal", "exit".bold().red(), "quit".bold().red());
+    println!();
+}
+
+async fn run_interactive_terminal() -> Result<()> {
+    print_welcome_banner();
+
+    let mut rl = DefaultEditor::new()?;
+    let history_path = dirs::home_dir().map(|h| h.join(".compute_pool_history"));
+
+    if let Some(ref path) = history_path {
+        let _ = rl.load_history(path);
+    }
+
+    loop {
+        let readline = rl.readline("compute-pool > ");
+        match readline {
+            Ok(line) => {
+                let input = line.trim();
+                if input.is_empty() {
+                    continue;
+                }
+
+                let _ = rl.add_history_entry(input);
+
+                // Handle internal terminal commands
+                if input.eq_ignore_ascii_case("exit")
+                    || input.eq_ignore_ascii_case("quit")
+                    || input.eq_ignore_ascii_case("q")
+                {
+                    println!("{}", "Goodbye!".green());
+                    break;
+                }
+
+                if input.eq_ignore_ascii_case("cls") || input.eq_ignore_ascii_case("clear") {
+                    print!("{esc}[2J{esc}[1;1H", esc = 27 as char);
+                    print_welcome_banner();
+                    continue;
+                }
+
+                if input.eq_ignore_ascii_case("help") || input == "?" {
+                    print_help();
+                    continue;
+                }
+
+                // Strip leading 'compute-pool' if typed by habit
+                let clean_input = if input.starts_with("compute-pool ") {
+                    input["compute-pool ".len()..].trim()
+                } else if input.starts_with("compute-pool.exe ") {
+                    input["compute-pool.exe ".len()..].trim()
+                } else {
+                    input
+                };
+
+                // Parse command arguments using shell_words
+                let tokens = match shell_words::split(clean_input) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        println!("{} Invalid command line syntax: {}", "x".red().bold(), e);
+                        continue;
+                    }
+                };
+
+                let mut cmd_args = vec!["compute-pool".to_string()];
+                cmd_args.extend(tokens);
+
+                match Cli::try_parse_from(&cmd_args) {
+                    Ok(cli) => {
+                        if let Some(cmd) = cli.command {
+                            if let Err(e) = execute_command(cmd).await {
+                                println!("{} Error: {}", "x".red().bold(), e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("{}", e);
+                    }
+                }
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => {
+                println!("\n{}", "Exiting Compute Pool Terminal...".dimmed());
+                break;
+            }
+            Err(err) => {
+                println!("{} Terminal error: {:?}", "x".red().bold(), err);
+                break;
+            }
+        }
+    }
+
+    if let Some(ref path) = history_path {
+        let _ = rl.save_history(path);
+    }
+
+    Ok(())
+}
+
+fn print_help() {
+    println!("\n{}", "Compute Pool Interactive Commands:".bold());
+    println!("  {}     - Check live remaining GPU & TPU quotas across all accounts", "accounts status".cyan());
+    println!("  {}       - List configured account slots", "accounts list".cyan());
+    println!("  {}         - Configure credentials for slot 1 or 2", "login --slot <1|2>".cyan());
+    println!("  {}       - Launch unified 4-GPU master-worker web terminal in browser", "shell --open".cyan());
+    println!("  {} - Launch single GPU terminal session", "shell --slot <1|2> --open".cyan());
+    println!("  {}          - Terminate running shell sessions and release GPU quota", "shell-stop".cyan());
+    println!("  {}            - Probe real-time GPU hardware details via nvidia-smi", "probe --slot <1|2>".cyan());
+    println!("  {}             - List all batch jobs in sequential 0-indexed order", "jobs list".cyan());
+    println!("  {} - Submit a Python script for GPU execution", "jobs submit --script <path> --gpu".cyan());
+    println!("  {}       - Inspect status and metadata of job <ID>", "jobs status <ID>".cyan());
+    println!("  {}         - View output logs of job <ID>", "jobs logs <ID>".cyan());
+    println!("  {}         - Terminate a running job remotely", "jobs stop <ID>".cyan());
+    println!("  {}       - Delete a specific job record", "jobs delete <ID>".cyan());
+    println!("  {}          - Re-index all existing jobs sequentially from 0", "jobs reindex".cyan());
+    println!("  {}   - Delete all historical job records", "jobs clear --force".cyan());
+    println!("  {} - Run distributed PyTorch script across 4 GPUs", "distributed run <path>".cyan());
+    println!("  {}                  - Clear the console screen", "cls / clear".cyan());
+    println!("  {}                 - Exit the interactive terminal", "exit / quit".cyan());
+    println!();
+}
+
+async fn execute_command(command: Commands) -> Result<()> {
+    match command {
         Commands::Login { slot, username, key } => {
             handle_login(slot, username, key).await?;
         }
@@ -219,7 +372,6 @@ async fn main() -> Result<()> {
             }
         },
     }
-
     Ok(())
 }
 

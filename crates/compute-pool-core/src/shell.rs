@@ -490,7 +490,7 @@ fn shell_slug_for_slot(slot: usize) -> String {
 pub async fn launch_gpu_shell(
     slot: usize,
     duration_minutes: u32,
-    timeout_seconds: u64,
+    timeout_seconds: Option<u64>,
 ) -> Result<ShellInfo> {
     let creds = load_credentials(slot)?
         .ok_or_else(|| anyhow::anyhow!("No credentials for slot {}. Run `compute-pool login --slot {}`", slot, slot))?;
@@ -533,11 +533,13 @@ pub async fn launch_gpu_shell(
 
     let http_client = reqwest::Client::new();
     let start = Instant::now();
-    let timeout = Duration::from_secs(timeout_seconds);
     let re = Regex::new(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")?;
     let mut web_url = String::new();
 
-    while start.elapsed() < timeout {
+    while match timeout_seconds {
+        Some(t) => start.elapsed() < Duration::from_secs(t),
+        None => true,
+    } {
         let ntfy_url = format!("https://ntfy.sh/{}/raw?poll=1", session_id);
         if let Ok(resp) = http_client.get(&ntfy_url).send().await {
             if resp.status().is_success() {
@@ -590,7 +592,7 @@ pub async fn launch_gpu_shell(
 
 pub async fn launch_cluster_shell(
     duration_minutes: u32,
-    timeout_seconds: u64,
+    timeout_seconds: Option<u64>,
 ) -> Result<ClusterShellInfo> {
     let creds1 = load_credentials(1)?
         .ok_or_else(|| anyhow::anyhow!("Slot 1 not configured. Run `compute-pool login --slot 1`"))?;
@@ -666,11 +668,13 @@ pub async fn launch_cluster_shell(
 
     let http_client = reqwest::Client::new();
     let start = Instant::now();
-    let timeout = Duration::from_secs(timeout_seconds);
     let re = Regex::new(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")?;
     let mut web_url = String::new();
 
-    while start.elapsed() < timeout {
+    while match timeout_seconds {
+        Some(t) => start.elapsed() < Duration::from_secs(t),
+        None => true,
+    } {
         let ntfy_url = format!("https://ntfy.sh/{}/raw?poll=1", session_master_id);
         if let Ok(resp) = http_client.get(&ntfy_url).send().await {
             if resp.status().is_success() {

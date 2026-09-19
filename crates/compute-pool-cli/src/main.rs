@@ -80,9 +80,9 @@ enum Commands {
         #[arg(long)]
         open: bool,
 
-        /// Connection timeout in seconds
-        #[arg(long, default_value = "240")]
-        timeout: u64,
+        /// Connection timeout in seconds (optional; waits indefinitely until online if omitted)
+        #[arg(long)]
+        timeout: Option<u64>,
     },
 
     /// Stop active interactive GPU terminals and release GPU resources immediately
@@ -490,7 +490,7 @@ async fn handle_accounts_status() -> Result<()> {
         "GPU Total",
     ]);
 
-    for s in statuses {
+    for s in &statuses {
         let (status_cell, used_cell, rem_cell, tot_cell) = if s.connected {
             (
                 Cell::new("Connected").fg(Color::Green),
@@ -500,7 +500,7 @@ async fn handle_accounts_status() -> Result<()> {
             )
         } else {
             (
-                Cell::new(s.error.unwrap_or_else(|| "Error".to_string())).fg(Color::Red),
+                Cell::new(s.error.clone().unwrap_or_else(|| "Error".to_string())).fg(Color::Red),
                 Cell::new("-"),
                 Cell::new("-"),
                 Cell::new("-"),
@@ -509,12 +509,55 @@ async fn handle_accounts_status() -> Result<()> {
 
         table.add_row(vec![
             Cell::new(s.slot.to_string()),
-            Cell::new(s.username),
+            Cell::new(&s.username),
             status_cell,
             used_cell,
             rem_cell,
             tot_cell,
         ]);
+    }
+
+    let connected_slots: Vec<_> = statuses.iter().filter(|s| s.connected).collect();
+    if !statuses.is_empty() {
+        if connected_slots.len() == statuses.len() {
+            let total_used: f64 = statuses.iter().map(|s| s.gpu_hours_used()).sum();
+            let total_allowed: f64 = statuses.iter().map(|s| s.gpu_hours_total()).sum();
+            let min_rem: f64 = statuses
+                .iter()
+                .map(|s| s.gpu_hours_remaining())
+                .fold(f64::INFINITY, f64::min);
+            let cluster_gpu_rem = min_rem * 2.0;
+
+            table.add_row(vec![
+                Cell::new("Cluster").fg(Color::Yellow),
+                Cell::new("2 Nodes (4x GPU)"),
+                Cell::new("Connected").fg(Color::Green),
+                Cell::new(format!("{:.2}h", total_used)),
+                Cell::new(format!("{:.2}h (x2 = {:.2}h GPU)", min_rem, cluster_gpu_rem))
+                    .fg(Color::Cyan),
+                Cell::new(format!("{:.1}h", total_allowed)),
+            ]);
+        } else if !connected_slots.is_empty() {
+            let total_used: f64 = connected_slots.iter().map(|s| s.gpu_hours_used()).sum();
+            let total_allowed: f64 = connected_slots.iter().map(|s| s.gpu_hours_total()).sum();
+            table.add_row(vec![
+                Cell::new("Cluster").fg(Color::Yellow),
+                Cell::new(format!("{} Node(s)", connected_slots.len())),
+                Cell::new("Degraded").fg(Color::Yellow),
+                Cell::new(format!("{:.2}h", total_used)),
+                Cell::new("0.00h (Bottleneck)").fg(Color::Yellow),
+                Cell::new(format!("{:.1}h", total_allowed)),
+            ]);
+        } else {
+            table.add_row(vec![
+                Cell::new("Cluster").fg(Color::Yellow),
+                Cell::new("-"),
+                Cell::new("Disconnected").fg(Color::Red),
+                Cell::new("-"),
+                Cell::new("-"),
+                Cell::new("-"),
+            ]);
+        }
     }
 
     println!("{table}\n");
@@ -908,7 +951,7 @@ async fn handle_shell(
     slot_arg: &str,
     duration: u32,
     open: bool,
-    timeout: u64,
+    timeout: Option<u64>,
 ) -> Result<()> {
     if slot_arg.eq_ignore_ascii_case("cluster") || slot_arg == "0" {
         let info = launch_cluster_shell(duration, timeout).await?;

@@ -342,27 +342,38 @@ subprocess.run([
 
 # 2. Setup crun (cluster runner) script - parallel multi-node command executor
 crun_script = '''#!/usr/bin/env python3
-import sys, subprocess, concurrent.futures
+import sys, os, subprocess, concurrent.futures, shlex
 
-cmd = " ".join(sys.argv[1:])
-if not cmd:
-    print("Usage: crun <command>")
+if len(sys.argv) < 2:
+    print("Usage: crun <command> [args...]")
     print("Example: crun nvidia-smi")
+    print("Example: crun python3 train.py")
     sys.exit(1)
 
+cmd_list = sys.argv[1:]
+shell_cmd = shlex.join(cmd_list)
+
+# Auto-sync any referenced local files to Node 1
+for arg in cmd_list:
+    if os.path.isfile(arg) and not arg.startswith("-"):
+        fname = os.path.basename(arg)
+        subprocess.run(["scp", "-o", "ConnectTimeout=3", arg, f"node1:/kaggle/working/{fname}"], capture_output=True)
+
 def run_local():
-    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    env = os.environ.copy()
+    env["NODE_RANK"] = "0"
+    res = subprocess.run(cmd_list, capture_output=True, text=True, env=env)
     out = res.stdout if res.stdout else res.stderr
     return f"[Node 0: Master (Slot 1 - GPUs 0, 1)]\\n{out.strip()}"
 
 def run_remote():
-    # Attempt SSH first
-    res = subprocess.run(["ssh", "-o", "ConnectTimeout=4", "node1", cmd], capture_output=True, text=True)
+    remote_exec = f"export NODE_RANK=1; {shell_cmd}"
+    res = subprocess.run(["ssh", "-o", "ConnectTimeout=4", "node1", remote_exec], capture_output=True, text=True)
     if res.returncode == 0 or (res.stdout and "Connection refused" not in res.stderr):
         out = res.stdout if res.stdout else res.stderr
         return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out.strip()}"
     # Fallback to worker-exec HTTP daemon
-    res = subprocess.run(["/usr/local/bin/worker-exec", cmd], capture_output=True, text=True)
+    res = subprocess.run(["/usr/local/bin/worker-exec", remote_exec], capture_output=True, text=True)
     out = res.stdout if res.stdout else res.stderr
     return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out.strip()}"
 

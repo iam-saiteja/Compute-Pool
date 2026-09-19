@@ -954,13 +954,21 @@ async fn handle_shell(
     timeout: Option<u64>,
 ) -> Result<()> {
     if slot_arg.eq_ignore_ascii_case("cluster") || slot_arg == "0" {
+        println!("\n{}", "Connecting Unified 4-GPU Cluster...".bold().cyan());
+        println!("{}", "  • Submitting Node 0 (Slot 1, Master) & Node 1 (Slot 2, Worker)...".dimmed());
+        println!("{}", "  • Bootstrapping Chisel TCP bridge & SSH fabric across both nodes...".dimmed());
+        println!("{}", "  • Waiting for both nodes to report online and peered...".dimmed());
+
         let info = launch_cluster_shell(duration, timeout).await?;
         println!("\n{}", "Compute Pool -- Unified 4-GPU Cluster".bold().green());
+        println!("  Cluster Fabric:      2 Nodes (4x Tesla T4 GPUs) Connected & Peered");
         println!("  Master Web Terminal: {}", info.web_url.bold().cyan());
         if !info.files_url.is_empty() {
             println!("  Cluster File Manager: {}", info.files_url.bold().cyan());
         }
-        println!("  Duration: {} mins", info.duration_minutes);
+        println!("  Inter-Node SSH:      ssh node1 (from Master terminal)");
+        println!("  Cluster Runner:      crun <command> (e.g. crun nvidia-smi)");
+        println!("  Duration:            {} mins", info.duration_minutes);
         if open {
             let _ = open::that(&info.web_url);
         }

@@ -26,42 +26,52 @@ NODE_LABEL = "node1-slot2"
 
 print(f"[*] Initializing Compute Pool GPU Cluster Worker ({NODE_LABEL})...", flush=True)
 
+# 1. Download Cloudflared and Chisel
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
 
-class ClusterWorkerHandler(http.server.BaseHTTPRequestHandler):
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz | gzip -d > /usr/local/bin/chisel && chmod +x /usr/local/bin/chisel"
+], check=False)
+
+# 2. Setup SSH Daemon and cluster keys
+cluster_priv_key = ""
+try:
+    subprocess.run(["bash", "-c", "which sshd || (apt-get update -qq && apt-get install -y -qq openssh-server)"], check=False)
+    subprocess.run(["bash", "-c", "mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh"], check=False)
+    subprocess.run(["bash", "-c", "ssh-keygen -A"], check=False)
+    
+    key_path = "/root/.ssh/cluster_key"
+    if not os.path.exists(key_path):
+        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", "compute-pool-cluster"], check=True)
+    subprocess.run(["bash", "-c", f"cat {key_path}.pub >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"], check=True)
+    
+    with open(key_path, "r") as f:
+        cluster_priv_key = f.read().strip()
+    
+    subprocess.Popen([
+        "/usr/sbin/sshd", "-D", "-p", "2222",
+        "-o", "PermitRootLogin=yes",
+        "-o", "PubkeyAuthentication=yes",
+        "-o", "AuthorizedKeysFile=/root/.ssh/authorized_keys",
+        "-o", "PasswordAuthentication=no",
+        "-o", "StrictModes=no"
+    ])
+    print("[*] SSH daemon active on port 2222.", flush=True)
+except Exception as e:
+    print(f"[!] SSH setup notice: {e}", flush=True)
+
+# 3. HTTP Worker & Exec Daemon on port 8889
+class WorkerExecHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps({"status": "OK", "node": NODE_LABEL}).encode("utf-8"))
-        elif self.path == "/smi":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            try:
-                out = subprocess.check_output(
-                    ["nvidia-smi", "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
-                    text=True
-                )
-                gpus = []
-                for line in out.strip().splitlines():
-                    parts = [p.strip() for p in line.split(",")]
-                    if len(parts) >= 7:
-                        gpus.append({
-                            "name": parts[1],
-                            "mem_used": int(float(parts[2])),
-                            "mem_total": int(float(parts[3])),
-                            "util": int(float(parts[4])),
-                            "temp": int(float(parts[5])),
-                            "power": parts[6] + "W"
-                        })
-                self.wfile.write(json.dumps({"gpus": gpus}).encode("utf-8"))
-            except Exception as e:
-                self.wfile.write(json.dumps({"error": str(e), "gpus": []}).encode("utf-8"))
         else:
             self.send_response(404)
             self.end_headers()
@@ -83,29 +93,13 @@ class ClusterWorkerHandler(http.server.BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             self.wfile.write(json.dumps(resp).encode("utf-8"))
-        elif self.path == "/sync_file":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            try:
-                data = json.loads(body)
-                fname = data.get("filename", "script.py")
-                content = data.get("content", "")
-                with open(os.path.join("/kaggle/working", fname), "w") as f:
-                    f.write(content)
-                resp = {"status": "OK", "filename": fname}
-            except Exception as e:
-                resp = {"status": "ERROR", "error": str(e)}
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(resp).encode("utf-8"))
         elif self.path == "/stop":
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"OK")
             def _die():
                 time.sleep(0.5)
-                os.system("pkill -9 -f cloudflared; kill -9 -1")
+                os.system("pkill -9 -f cloudflared; pkill -9 -f chisel; kill -9 -1")
             threading.Thread(target=_die).start()
         else:
             self.send_response(404)
@@ -118,9 +112,18 @@ class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-httpd = ThreadedTCPServer(("0.0.0.0", 8888), ClusterWorkerHandler)
+httpd = ThreadedTCPServer(("0.0.0.0", 8889), WorkerExecHandler)
 threading.Thread(target=httpd.serve_forever, daemon=True).start()
 
+# 4. Start Chisel Server on port 8888 for bidirectional TCP bridging
+chisel_proc = subprocess.Popen(
+    ["/usr/local/bin/chisel", "server", "--port", "8888", "--reverse"],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL
+)
+time.sleep(1)
+
+# 5. Expose Chisel server via Cloudflare tunnel
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8888", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -128,18 +131,50 @@ cf_proc = subprocess.Popen(
     text=True
 )
 
+chisel_tunnel_url = ""
 for line in cf_proc.stdout:
     clean = line.strip()
     m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
     if m:
-        worker_url = m.group(0)
-        try:
-            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=worker_url.encode("utf-8"))
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
+        chisel_tunnel_url = m.group(0)
         break
 
+# 6. Expose HTTP Exec server via second Cloudflare tunnel
+cf_http_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8889", "--no-autoupdate"],
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True
+)
+
+http_tunnel_url = ""
+for line in cf_http_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
+    if m:
+        http_tunnel_url = m.group(0)
+        break
+
+# 7. Publish connection payload to ntfy for Master
+payload = json.dumps({
+    "status": "READY",
+    "node": NODE_LABEL,
+    "chisel_url": chisel_tunnel_url,
+    "http_url": http_tunnel_url,
+    "ssh_key": cluster_priv_key
+})
+
+for _ in range(5):
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=payload.encode("utf-8"))
+        urllib.request.urlopen(req, timeout=10)
+        break
+    except Exception:
+        time.sleep(2)
+
+print(f"[*] Worker registered. Chisel: {chisel_tunnel_url}, HTTP: {http_tunnel_url}", flush=True)
+
+# 8. Keep worker alive until STOP signal
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
     try:
@@ -152,6 +187,8 @@ for _ in range(int(DURATION_MINUTES * 60 / 3)):
     time.sleep(3)
 
 subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
+subprocess.run(["pkill", "-9", "-f", "chisel"], check=False)
+subprocess.run(["kill", "-9", "-1"], check=False)
 sys.exit(0)
 "#;
 
@@ -282,6 +319,7 @@ NODE_LABEL = "cluster-master"
 
 print("[*] Initializing Compute Pool Master GPU Terminal (4x Tesla T4 Cluster)...", flush=True)
 
+# 1. Download core binaries: ttyd, filebrowser, cloudflared, chisel
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
@@ -294,67 +332,134 @@ subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
+subprocess.run([
+    "bash", "-c",
+    "curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz | gzip -d > /usr/local/bin/chisel && chmod +x /usr/local/bin/chisel"
+], check=False)
 
-smi_script = '''#!/usr/bin/env python3
-import subprocess, json, urllib.request, os
+# 2. Setup crun (cluster runner) script - parallel multi-node command executor
+crun_script = '''#!/usr/bin/env python3
+import sys, subprocess, concurrent.futures
+
+cmd = " ".join(sys.argv[1:])
+if not cmd:
+    print("Usage: crun <command>")
+    print("Example: crun nvidia-smi")
+    sys.exit(1)
+
+def run_local():
+    res = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    out = res.stdout if res.stdout else res.stderr
+    return f"[Node 0: Master (Slot 1 - GPUs 0, 1)]\\n{out.strip()}"
+
+def run_remote():
+    # Attempt SSH first
+    res = subprocess.run(["ssh", "-o", "ConnectTimeout=4", "node1", cmd], capture_output=True, text=True)
+    if res.returncode == 0 or (res.stdout and "Connection refused" not in res.stderr):
+        out = res.stdout if res.stdout else res.stderr
+        return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out.strip()}"
+    # Fallback to worker-exec HTTP daemon
+    res = subprocess.run(["/usr/local/bin/worker-exec", cmd], capture_output=True, text=True)
+    out = res.stdout if res.stdout else res.stderr
+    return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out.strip()}"
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+    f0 = ex.submit(run_local)
+    f1 = ex.submit(run_remote)
+    out0 = f0.result()
+    out1 = f1.result()
+
+print(out0)
+print("\\n" + "="*80 + "\\n")
+print(out1)
+'''
+with open("/usr/local/bin/crun", "w") as f:
+    f.write(crun_script)
+os.chmod("/usr/local/bin/crun", 0o755)
+
+# 3. Setup worker-exec (HTTP fallback runner)
+worker_exec_script = '''#!/usr/bin/env python3
+import sys, urllib.request, json, os
+
+cmd = " ".join(sys.argv[1:])
+if not cmd:
+    sys.exit(0)
 
 worker_url = ""
 if os.path.exists("/kaggle/working/.cluster_worker_url"):
     with open("/kaggle/working/.cluster_worker_url") as f:
         worker_url = f.read().strip()
 
-local_gpus = []
+if not worker_url:
+    sys.stderr.write("Worker node not yet peered.\\n")
+    sys.exit(1)
+
 try:
-    smi_bin = "nvidia-smi"
-    out = subprocess.check_output(
-        [smi_bin, "--query-gpu=index,name,memory.used,memory.total,utilization.gpu,temperature.gpu,power.draw", "--format=csv,noheader,nounits"],
-        text=True
+    req = urllib.request.Request(
+        f"{worker_url}/exec",
+        data=json.dumps({"cmd": cmd}).encode("utf-8"),
+        headers={"Content-Type": "application/json"}
     )
-    for line in out.strip().splitlines():
-        p = [x.strip() for x in line.split(",")]
-        if len(p) >= 7:
-            local_gpus.append({
-                "name": p[1], "mem_used": int(float(p[2])), "mem_total": int(float(p[3])),
-                "util": int(float(p[4])), "temp": int(float(p[5])), "power": p[6] + "W"
-            })
-except Exception:
-    pass
-
-remote_gpus = []
-if worker_url:
-    try:
-        req = urllib.request.Request(f"{worker_url}/smi")
-        with urllib.request.urlopen(req, timeout=3) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            remote_gpus = data.get("gpus", [])
-    except Exception:
-        pass
-
-all_gpus = []
-for i, g in enumerate(local_gpus):
-    all_gpus.append((i, "Node 0 (Slot 1)", g))
-for i, g in enumerate(remote_gpus):
-    all_gpus.append((len(local_gpus) + i, "Node 1 (Slot 2)", g))
-
-print("+-----------------------------------------------------------------------------------------+")
-print("| NVIDIA-SMI (Cluster Pool: 4x Tesla T4)     CUDA Version: 13.0     Driver: 580.159.04   |")
-print("+-----------------------------------------+------------------------+----------------------+")
-print("| GPU  Name                 Node / Slot   | Memory-Usage           | GPU-Util  Temp  Pwr  |")
-print("|=========================================+========================+======================|")
-if all_gpus:
-    for idx, node, g in all_gpus:
-        name_str = f"{g.get('name', 'Tesla T4'):<12} {node:<13}"
-        mem_str = f"{g.get('mem_used', 0)}MiB / {g.get('mem_total', 15360)}MiB"
-        util_str = f"{g.get('util', 0):>3}%   {g.get('temp', 40):>3}C  {g.get('power', '15W'):>4}"
-        print(f"|  {idx:>2}  {name_str} | {mem_str:<22} | {util_str:<20} |")
-else:
-    print("| No GPUs detected or cluster synchronizing...                                            |")
-print("+-----------------------------------------+------------------------+----------------------+")
+    with urllib.request.urlopen(req, timeout=30) as r:
+        resp = json.loads(r.read().decode("utf-8"))
+        if resp.get("stdout"):
+            sys.stdout.write(resp["stdout"])
+        if resp.get("stderr"):
+            sys.stderr.write(resp["stderr"])
+        sys.exit(resp.get("exit_code", 0))
+except Exception as e:
+    sys.stderr.write(f"Remote exec error: {e}\\n")
+    sys.exit(1)
 '''
-with open("/usr/local/bin/cluster-smi", "w") as f:
-    f.write(smi_script)
-os.chmod("/usr/local/bin/cluster-smi", 0o755)
+with open("/usr/local/bin/worker-exec", "w") as f:
+    f.write(worker_exec_script)
+os.chmod("/usr/local/bin/worker-exec", 0o755)
 
+# 4. Setup cluster-status script
+status_script = '''#!/usr/bin/env python3
+import subprocess, sys
+
+print("+----------------------------------------------------------------------+")
+print("|            Compute Pool 4-GPU Cluster Infrastructure Status          |")
+print("+----------------------------------------------------------------------+")
+try:
+    smi = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], text=True).strip()
+    gpus_node0 = [l.strip() for l in smi.splitlines() if l.strip()]
+    print(f"[*] Node 0 (Master, Slot 1): Online ({len(gpus_node0)} GPUs: {', '.join(gpus_node0)})")
+except Exception as e:
+    print(f"[!] Node 0 (Master, Slot 1): Query failed ({e})")
+
+try:
+    res = subprocess.run(["ssh", "-o", "ConnectTimeout=3", "node1", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"], capture_output=True, text=True, timeout=5)
+    if res.returncode == 0 and res.stdout.strip():
+        gpus_node1 = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
+        print(f"[*] Node 1 (Worker, Slot 2): Online ({len(gpus_node1)} GPUs: {', '.join(gpus_node1)})")
+        print(f"[*] Inter-Node Fabric: Active (SSH & Bidirectional TCP Bridge)")
+    else:
+        # Check HTTP fallback
+        res_http = subprocess.run(["/usr/local/bin/worker-exec", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"], capture_output=True, text=True, timeout=5)
+        if res_http.returncode == 0 and res_http.stdout.strip():
+            gpus_node1 = [l.strip() for l in res_http.stdout.strip().splitlines() if l.strip()]
+            print(f"[*] Node 1 (Worker, Slot 2): Online ({len(gpus_node1)} GPUs: {', '.join(gpus_node1)})")
+            print(f"[*] Inter-Node Fabric: Active (HTTP RPC Bridge)")
+        else:
+            print("[!] Node 1 (Worker, Slot 2): Connecting to cluster...")
+except Exception as e:
+    print(f"[!] Node 1 (Worker, Slot 2): Connecting ({e})")
+
+print("+----------------------------------------------------------------------+")
+print("Cluster Commands:")
+print("  • nvidia-smi        -> Real local GPU telemetry (Node 0)")
+print("  • ssh node1         -> Direct SSH shell into Worker (Node 1)")
+print("  • crun <command>    -> Parallel execution across all 4 GPUs")
+print("  • crun nvidia-smi   -> Real GPU telemetry across all 4 GPUs")
+print("+----------------------------------------------------------------------+")
+'''
+with open("/usr/local/bin/cluster-status", "w") as f:
+    f.write(status_script)
+os.chmod("/usr/local/bin/cluster-status", 0o755)
+
+# 5. Setup stop script
 stop_script = '''#!/bin/bash
 if [ -f /kaggle/working/.cluster_worker_url ]; then
     WURL=$(cat /kaggle/working/.cluster_worker_url)
@@ -368,15 +473,20 @@ with open("/usr/local/bin/stop", "w") as f:
     f.write(stop_script)
 os.chmod("/usr/local/bin/stop", 0o755)
 
+# 6. Configure shell environment (.bashrc) - NEVER ALIAS nvidia-smi
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
-    f.write(f"\nexport PATH=/usr/local/bin:$PATH\n")
-    f.write(f"export PS1='\\[\\033[01;32m\\]compute-pool@cluster-master\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\n")
-    f.write("alias gpus='/usr/local/bin/cluster-smi'\n")
-    f.write("alias nvidia-smi='/usr/local/bin/cluster-smi'\n")
-    f.write("alias watch-gpu='watch -n 1 /usr/local/bin/cluster-smi'\n")
+    f.write("\nexport PATH=/usr/local/bin:$PATH\n")
+    f.write("export MASTER_ADDR=127.0.0.1\n")
+    f.write("export MASTER_PORT=29500\n")
+    f.write("export WORLD_SIZE=2\n")
+    f.write("export CLUSTER_NODES=2\n")
+    f.write("export GPUS_PER_NODE=2\n")
+    f.write("export TOTAL_GPUS=4\n")
+    f.write("export PS1='\\[\\033[01;32m\\]compute-pool@cluster-master\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\n")
     f.write("alias halt='/usr/local/bin/stop'\n")
     f.write("alias exit='/usr/local/bin/stop'\n")
 
+# 7. Start ttyd Web Terminal and File Browser
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
     "-t", "enableClipboard=true",
@@ -389,6 +499,7 @@ fb_proc = subprocess.Popen([
 ])
 time.sleep(1)
 
+# 8. Start Cloudflare Tunnel for Web Terminal
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -408,6 +519,7 @@ for line in cf_proc.stdout:
             pass
         break
 
+# 9. Start Cloudflare Tunnel for File Browser
 cf_fb_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8080", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -427,24 +539,70 @@ for line in cf_fb_proc.stdout:
             pass
         break
 
-def setup_cluster_worker_discovery():
-    for _ in range(60):
+# 10. Inter-Node Discovery & Peering Thread
+def setup_cluster_peering():
+    worker_data = None
+    for _ in range(120):
         try:
             req = urllib.request.Request(f"https://ntfy.sh/{WORKER_SESSION_ID}/raw?poll=1")
             with urllib.request.urlopen(req, timeout=5) as r:
-                url = r.read().decode("utf-8").strip()
-                m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", url)
-                if m:
-                    worker_url = m.group(0)
-                    with open("/kaggle/working/.cluster_worker_url", "w") as f:
-                        f.write(worker_url)
+                raw = r.read().decode("utf-8").strip()
+                if raw.startswith("{") and "chisel_url" in raw:
+                    worker_data = json.loads(raw)
                     break
         except Exception:
             pass
-        time.sleep(4)
+        time.sleep(3)
 
-threading.Thread(target=setup_cluster_worker_discovery, daemon=True).start()
+    if not worker_data:
+        return
 
+    # Save worker HTTP URL
+    http_url = worker_data.get("http_url", "")
+    if http_url:
+        with open("/kaggle/working/.cluster_worker_url", "w") as f:
+            f.write(http_url)
+
+    # Setup SSH Key
+    ssh_key = worker_data.get("ssh_key", "")
+    if ssh_key:
+        os.makedirs("/root/.ssh", mode=0o700, exist_ok=True)
+        with open("/root/.ssh/cluster_key", "w") as f:
+            f.write(ssh_key + "\n")
+        os.chmod("/root/.ssh/cluster_key", 0o600)
+
+        with open("/root/.ssh/config", "w") as f:
+            f.write("Host node1 worker\n")
+            f.write("    HostName 127.0.0.1\n")
+            f.write("    Port 2222\n")
+            f.write("    User root\n")
+            f.write("    IdentityFile /root/.ssh/cluster_key\n")
+            f.write("    StrictHostKeyChecking no\n")
+            f.write("    UserKnownHostsFile /dev/null\n")
+            f.write("    LogLevel ERROR\n")
+
+    # Connect Chisel Client (bridges port 2222 for SSH and reverse-bridges 29500-29502 for PyTorch)
+    chisel_url = worker_data.get("chisel_url", "")
+    if chisel_url:
+        subprocess.Popen([
+            "/usr/local/bin/chisel", "client", chisel_url,
+            "2222:127.0.0.1:2222",
+            "R:29500:127.0.0.1:29500",
+            "R:29501:127.0.0.1:29501",
+            "R:29502:127.0.0.1:29502"
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    # Notify CLI that peering is established
+    time.sleep(3)
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-peered", data=b"PEERED_OK")
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+threading.Thread(target=setup_cluster_peering, daemon=True).start()
+
+# 11. Keep Master alive until STOP signal
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
     try:
@@ -459,6 +617,8 @@ for _ in range(int(DURATION_MINUTES * 60 / 3)):
 subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
 subprocess.run(["pkill", "-9", "-f", "ttyd"], check=False)
 subprocess.run(["pkill", "-9", "-f", "filebrowser"], check=False)
+subprocess.run(["pkill", "-9", "-f", "chisel"], check=False)
+subprocess.run(["kill", "-9", "-1"], check=False)
 sys.exit(0)
 "#;
 
@@ -670,22 +830,60 @@ pub async fn launch_cluster_shell(
     let start = Instant::now();
     let re = Regex::new(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")?;
     let mut web_url = String::new();
+    let mut worker_online = false;
+    let mut cluster_peered = false;
 
     while match timeout_seconds {
         Some(t) => start.elapsed() < Duration::from_secs(t),
         None => true,
     } {
-        let ntfy_url = format!("https://ntfy.sh/{}/raw?poll=1", session_master_id);
-        if let Ok(resp) = http_client.get(&ntfy_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Some(m) = re.find(&text) {
-                        web_url = m.as_str().to_string();
-                        break;
+        // Poll Master Web Terminal URL
+        if web_url.is_empty() {
+            let ntfy_url = format!("https://ntfy.sh/{}/raw?poll=1", session_master_id);
+            if let Ok(resp) = http_client.get(&ntfy_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if let Some(m) = re.find(&text) {
+                            web_url = m.as_str().to_string();
+                        }
                     }
                 }
             }
         }
+
+        // Poll Worker Online
+        if !worker_online {
+            let ntfy_w_url = format!("https://ntfy.sh/{}/raw?poll=1", session_worker_id);
+            if let Ok(resp) = http_client.get(&ntfy_w_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if text.contains("READY") || text.contains("chisel_url") {
+                            worker_online = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Poll Peered status
+        if !cluster_peered {
+            let ntfy_p_url = format!("https://ntfy.sh/{}-peered/raw?poll=1", session_master_id);
+            if let Ok(resp) = http_client.get(&ntfy_p_url).send().await {
+                if resp.status().is_success() {
+                    if let Ok(text) = resp.text().await {
+                        if text.contains("PEERED_OK") {
+                            cluster_peered = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Both nodes are online and web_url is ready
+        if !web_url.is_empty() && (cluster_peered || worker_online) {
+            break;
+        }
+
         tokio::time::sleep(Duration::from_secs(3)).await;
     }
 

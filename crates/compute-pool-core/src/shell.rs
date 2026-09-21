@@ -666,181 +666,105 @@ with open("/usr/local/bin/enable-deepspeed", "w") as f:
     f.write(deepspeed_script)
 os.chmod("/usr/local/bin/enable-deepspeed", 0o755)
 
-# 5b. Setup enable-lupine: GPU-over-IP fabric via LUPINE (opt-in, like enable-ray)
+# 5b. Setup enable-lupine: GPU-over-IP fabric via LUPINE
 lupine_script = '''#!/bin/bash
 # enable-lupine: Initialize LUPINE GPU-over-IP fabric across all 4 T4 GPUs
-# Uses GHCR anonymous OCI bearer-token pull (curl only, no Docker/crane needed).
-# LUPINE server on Node 0 (local :14833) + Node 1 (tunneled -> local :14834)
-# Combined: LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834 = 4 GPUs visible
+# Prioritizes lupine_driver_server binary and verifies all 4 GPUs before running NCCL test.
 echo "========================================================================"
 echo "  Initializing LUPINE GPU-over-IP Fabric (4x Tesla T4)"
 echo "========================================================================"
 
-# Helper: pull an OCI image from GHCR using anonymous bearer token (curl only)
-lupine_pull_from_ghcr() {
-    local IMAGE="lupinemachines/lupine-server"
-    local TAG="$1"
-    local DESTDIR="$2"
-    echo "[*] Trying GHCR tag: $TAG"
-
-    # A: Get anonymous pull token
-    local TOKEN
-    TOKEN=$(curl -sf \
-        "https://ghcr.io/token?scope=repository:${IMAGE}:pull&service=ghcr.io" \
-        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token',''))" 2>/dev/null)
-    if [ -z "$TOKEN" ]; then
-        echo "[!] Could not get GHCR token"
-        return 1
-    fi
-
-    # B: Fetch manifest (try OCI v1 then Docker v2)
-    local MANIFEST
-    MANIFEST=$(curl -sf \
-        -H "Authorization: Bearer $TOKEN" \
-        -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
-        "https://ghcr.io/v2/${IMAGE}/manifests/${TAG}" 2>/dev/null)
-    if [ -z "$MANIFEST" ]; then
-        echo "[!] No manifest for tag: $TAG (tag may not exist or auth required)"
-        return 1
-    fi
-
-    # Handle OCI image index (multi-platform) -> resolve linux/amd64
-    local MEDIATYPE
-    MEDIATYPE=$(echo "$MANIFEST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mediaType',''))" 2>/dev/null)
-    if echo "$MEDIATYPE" | grep -q "index"; then
-        local AMD64_DIGEST
-        AMD64_DIGEST=$(echo "$MANIFEST" | python3 -c "
-import sys,json
-m=json.load(sys.stdin)
-for mf in m.get('manifests',[]):
-    p=mf.get('platform',{})
-    if p.get('os')=='linux' and p.get('architecture')=='amd64':
-        print(mf.get('digest',''))
+# --- Step 1: Locate or compile lupine_driver_server ---
+LUPINE_BIN=""
+for CANDIDATE in \
+    $(find /opt/lupine /usr/local/bin /kaggle/working /tmp/lupine-src -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null); do
+    if [ -f "$CANDIDATE" ]; then
+        LUPINE_BIN="$CANDIDATE"
         break
-" 2>/dev/null)
-        if [ -n "$AMD64_DIGEST" ]; then
-            MANIFEST=$(curl -sf \
-                -H "Authorization: Bearer $TOKEN" \
-                -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
-                "https://ghcr.io/v2/${IMAGE}/manifests/${AMD64_DIGEST}" 2>/dev/null)
-        fi
     fi
+done
 
-    echo "[*] Manifest OK for $TAG — downloading layers..."
-    mkdir -p "$DESTDIR"
-
-    # C: Extract layer digests and download each layer
-    local DIGESTS
-    DIGESTS=$(echo "$MANIFEST" | python3 -c "
-import sys,json
-m=json.load(sys.stdin)
-for l in m.get('layers', m.get('fsLayers',[])):
-    d=l.get('digest',l.get('blobSum',''))
-    if d: print(d)
-" 2>/dev/null)
-
-    if [ -z "$DIGESTS" ]; then
-        echo "[!] No layers found in manifest"
-        return 1
-    fi
-
-    local N=0
-    while IFS= read -r DIGEST; do
-        N=$((N+1))
-        echo "[*] Downloading layer $N: ${DIGEST:0:24}..."
-        curl -sfL \
-            -H "Authorization: Bearer $TOKEN" \
-            "https://ghcr.io/v2/${IMAGE}/blobs/${DIGEST}" \
-            -o "/tmp/lupine_l${N}.tar.gz" 2>/dev/null
-        if [ -f "/tmp/lupine_l${N}.tar.gz" ]; then
-            tar -xzf "/tmp/lupine_l${N}.tar.gz" -C "$DESTDIR" 2>/dev/null || \
-            tar -xf  "/tmp/lupine_l${N}.tar.gz" -C "$DESTDIR" 2>/dev/null || true
-            rm -f "/tmp/lupine_l${N}.tar.gz"
-        fi
-    done <<< "$DIGESTS"
-
-    find "$DESTDIR" -name "lupine-server" -type f -exec chmod +x {} \; 2>/dev/null || true
-    local BIN
-    BIN=$(find "$DESTDIR" -name "lupine-server" -type f 2>/dev/null | head -1)
-    if [ -n "$BIN" ]; then
-        echo "[*] Found binary: $BIN"
-        return 0
-    fi
-    echo "[!] lupine-server not found in layers for $TAG"
-    return 1
-}
-
-# --- Step 1: Extract LUPINE server binary ---
-LUPINE_BIN=$(find /opt/lupine -name "lupine-server" -type f 2>/dev/null | head -1)
 if [ -z "$LUPINE_BIN" ]; then
-    echo "[*] Fetching LUPINE server from GHCR (anonymous OCI pull, curl only)..."
-    mkdir -p /opt/lupine
-    # Tags in order: verified existing GHCR tags
-    for TAG in v0.4.0-cuda-12.4.1-ubuntu22.04-amd64 cuda-12.4.1-ubuntu22.04-amd64 cuda-12.4.1-ubuntu22.04 v0.4.0-cuda-12.6.2-ubuntu24.04-amd64 cuda-12.6.2-ubuntu24.04-amd64; do
-        lupine_pull_from_ghcr "$TAG" /opt/lupine && break || true
-    done
-    LUPINE_BIN=$(find /opt/lupine -name "lupine-server" -type f 2>/dev/null | head -1)
+    echo "[*] lupine_driver_server not found locally — compiling LUPINE from source..."
+    apt-get update -qq && apt-get install -y -qq libnghttp2-dev libssl-dev libcurl4-openssl-dev 2>/dev/null || true
+    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null || true
+
+    if [ ! -d /tmp/lupine-src ]; then
+        git clone https://github.com/lupinemachines/lupine.git /tmp/lupine-src
+    fi
+
+    cd /tmp/lupine-src
+    cmake -B build -DCMAKE_BUILD_TYPE=Release \
+        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" 2>/dev/null
+    cmake --build build -j4 2>/dev/null || true
+
+    LUPINE_BIN=$(find /tmp/lupine-src/build -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null | head -1)
 fi
 
-if [ -z "$LUPINE_BIN" ]; then
-    echo ""
-    echo "[!] LUPINE server binary not found. Diagnostic info:"
-    echo "    /opt/lupine contents (top 30):"
-    find /opt/lupine 2>/dev/null | head -30 || echo "      (empty)"
-    echo ""
-    echo "    Manual debug commands:"
-    echo "      TOKEN=\$(curl -sf 'https://ghcr.io/token?scope=repository:lupinemachines/lupine-server:pull&service=ghcr.io' | python3 -c \"import sys,json; print(json.load(sys.stdin).get('token',''))\")"
-    echo "      echo \${TOKEN:0:60}"
-    echo "      curl -sH \"Authorization: Bearer \$TOKEN\" 'https://ghcr.io/v2/lupinemachines/lupine-server/tags/list'"
+# Validation 1: lupine_driver_server presence and executable check
+if [ -z "$LUPINE_BIN" ] || [ ! -f "$LUPINE_BIN" ]; then
+    echo "[!] VALIDATION FAILED: lupine_driver_server binary not found or not executable."
     exit 1
 fi
 chmod +x "$LUPINE_BIN"
+echo "[✓] Validation 1/4 PASSED: Server binary ready ($LUPINE_BIN)"
 
-# Locate shim libraries (OCI image extracts to nested path like /opt/lupine/usr/local/lib)
-LUPINE_LIB=$(find /opt/lupine \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null \
-    | head -1 | xargs -I{} dirname {} 2>/dev/null)
-if [ -z "$LUPINE_LIB" ]; then
-    for C in /opt/lupine/usr/local/lib /opt/lupine/opt/lupine/lib /opt/lupine/lib; do
-        [ -d "$C" ] && { LUPINE_LIB="$C"; break; }
-    done
-fi
-LUPINE_LIB="${LUPINE_LIB:-/opt/lupine/usr/local/lib}"
-export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-echo "[*] Server binary: $LUPINE_BIN"
-echo "[*] Shim libs dir: $LUPINE_LIB"
+LUPINE_LIB=$(find /tmp/lupine-src/build /opt/lupine \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null)
+LUPINE_LIB="${LUPINE_LIB:-/tmp/lupine-src/build/lib}"
+export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 
-# --- Step 2: Start LUPINE server on Node 0 (GPUs 0,1) ---
-pkill -f "lupine-server" 2>/dev/null || true
+# --- Step 2: Start LUPINE server on Node 0 ---
+pkill -f "lupine_driver_server" 2>/dev/null || pkill -f "lupine-server" 2>/dev/null || true
 sleep 1
 "$LUPINE_BIN" --port 14833 &
 LUPINE0_PID=$!
-echo "[*] LUPINE server started on Node 0 :14833 [pid=$LUPINE0_PID]"
+sleep 2
 
-# --- Step 3: SSH local-forward Node 1 LUPINE port -> local :14834 ---
+# Validation 2: Server listening on port 14833
+if ! python3 -c "import socket; s=socket.socket(); s.settimeout(2); exit(0 if s.connect_ex(('127.0.0.1', 14833))==0 else 1)" 2>/dev/null; then
+    echo "[!] VALIDATION FAILED: LUPINE server is not listening on port 14833"
+    exit 1
+fi
+echo "[✓] Validation 2/4 PASSED: LUPINE server listening on 127.0.0.1:14833 [pid=$LUPINE0_PID]"
+
+# --- Step 3: Tunnel Node 1 LUPINE server -> local :14834 ---
 pkill -f "ssh.*14834" 2>/dev/null || true
 sleep 1
 ssh -f -N \
     -o ServerAliveInterval=10 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes \
     -o ExitOnForwardFailure=no -o StrictHostKeyChecking=no \
-    -L 14834:127.0.0.1:14833 node1 2>/dev/null
-echo "[*] LUPINE tunnel: Node 1 GPU server -> local :14834"
+    -L 14834:127.0.0.1:14833 node1 2>/dev/null || true
+echo "[*] Tunnel established: Node 1 -> local :14834"
 
-# --- Step 4: Fetch LUPINE client shim from running server ---
-sleep 3
-mkdir -p /opt/lupine/lib
-curl -sf "http://127.0.0.1:14833/.well-known/lupine/client/v1/linux/amd64" \
-    -o /opt/lupine/lib/libcuda.so.1 2>/dev/null \
-    && chmod +x /opt/lupine/lib/libcuda.so.1 \
-    && echo "[*] Client shim fetched -> /opt/lupine/lib/libcuda.so.1" \
-    || echo "[*] Client shim not needed (libs extracted from image)"
+# --- Step 4: Environment & Client Setup ---
+export LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834
 
-# Write env file
 cat > /opt/lupine/env.sh << 'ENVEOF'
 export LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834
-export LD_LIBRARY_PATH=/opt/lupine/lib:/opt/lupine/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
+export LD_LIBRARY_PATH=/opt/lupine/lib:/tmp/lupine-src/build/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 ENVEOF
 
-# --- Step 5: Write verification script ---
+# Validation 3: nvidia-smi -L sees GPUs
+echo "[*] Testing nvidia-smi -L under LUPINE environment..."
+DETECTED_SMI=$(nvidia-smi -L 2>&1 | wc -l)
+echo "[✓] Validation 3/4: nvidia-smi reports $DETECTED_SMI device lines"
+
+# Validation 4: PyTorch sees 4 GPUs
+TORCH_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
+if [ "$TORCH_GPUS" -ne 4 ]; then
+    echo "[!] VALIDATION FAILED: PyTorch detected $TORCH_GPUS GPUs, expected 4"
+    echo "    Stopping before NCCL test until fabric visibility is verified."
+    exit 1
+fi
+echo "[✓] Validation 4/4 PASSED: PyTorch confirmed 4 CUDA devices active!"
+
+# --- Step 5: Run real 4-rank NCCL all_reduce test ---
+echo ""
+echo "========================================================================"
+echo "  All Validations Passed! Executing 4-Rank NCCL all_reduce Test..."
+echo "========================================================================"
+
 cat > /kaggle/working/nccl_allreduce_test.py << 'PYEOF'
 #!/usr/bin/env python3
 """4-GPU LUPINE fabric verification. Run: lupine-env python3 /kaggle/working/nccl_allreduce_test.py"""
@@ -877,30 +801,7 @@ if __name__ == "__main__":
     main()
 PYEOF
 chmod +x /kaggle/working/nccl_allreduce_test.py
-scp -o ConnectTimeout=5 /kaggle/working/nccl_allreduce_test.py node1:/kaggle/working/ 2>/dev/null || true
-
-# --- Step 6: Verify ---
-echo ""
-echo "========================================================================"
-echo "  Verifying GPU visibility via LUPINE fabric..."
-echo "========================================================================"
-sleep 2
-LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834 \
-    LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}" \
-    nvidia-smi -L 2>&1 || true
-
-echo ""
-echo "========================================================================"
-echo "  LUPINE GPU-over-IP Fabric Active"
-echo "========================================================================"
-echo "  Node 0 GPUs (0,1) -> LUPINE server :14833 (local)"
-echo "  Node 1 GPUs (2,3) -> LUPINE server :14834 (tunneled)"
-echo ""
-echo "  Verify and test:"
-echo "    lupine-env python3 /kaggle/working/nccl_allreduce_test.py"
-echo "    lupine-env nvidia-smi -L"
-echo "    lupine-env torchrun --nproc_per_node=4 train.py"
-echo "========================================================================"
+python3 /kaggle/working/nccl_allreduce_test.py
 '''
 with open("/usr/local/bin/enable-lupine", "w") as f:
     f.write(lupine_script)

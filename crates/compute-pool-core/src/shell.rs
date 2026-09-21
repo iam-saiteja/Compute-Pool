@@ -697,7 +697,7 @@ lupine_pull_from_ghcr() {
     local MANIFEST
     MANIFEST=$(curl -sf \
         -H "Authorization: Bearer $TOKEN" \
-        -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
         "https://ghcr.io/v2/${IMAGE}/manifests/${TAG}" 2>/dev/null)
     if [ -z "$MANIFEST" ]; then
         echo "[!] No manifest for tag: $TAG (tag may not exist or auth required)"
@@ -721,7 +721,7 @@ for mf in m.get('manifests',[]):
         if [ -n "$AMD64_DIGEST" ]; then
             MANIFEST=$(curl -sf \
                 -H "Authorization: Bearer $TOKEN" \
-                -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+                -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json,application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json" \
                 "https://ghcr.io/v2/${IMAGE}/manifests/${AMD64_DIGEST}" 2>/dev/null)
         fi
     fi

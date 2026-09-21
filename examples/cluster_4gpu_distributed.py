@@ -1,4 +1,4 @@
-"""Compute Pool 4-GPU Distributed Training Example (PyTorch DDP / Gloo).
+"""Compute Pool 4-GPU Distributed Training Example (PyTorch DDP).
 
 This script runs across both Node 0 (Master) and Node 1 (Worker) simultaneously,
 coordinating 4x Tesla T4 GPUs (60 GB Total VRAM) in parallel.
@@ -10,17 +10,19 @@ import os
 import sys
 import time
 import socket
+import subprocess
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+MASTER_PORT = os.environ.get("CP_MASTER_PORT", "29500")
+
 def get_node_rank():
     if os.environ.get("NODE_RANK") is not None:
         return int(os.environ["NODE_RANK"])
     # Check if we are on Node 0 or Node 1
-    import subprocess
     res = subprocess.run("pgrep -f 'chisel server'", shell=True, capture_output=True)
     if res.returncode == 0:
         return 1
@@ -34,14 +36,16 @@ def init_distributed(node_rank, local_gpu_id):
     global_rank = node_rank * 2 + local_gpu_id
 
     os.environ["MASTER_ADDR"] = "127.0.0.1"
-    os.environ["MASTER_PORT"] = "29500"
+    os.environ["MASTER_PORT"] = MASTER_PORT
     os.environ["WORLD_SIZE"] = str(world_size)
     os.environ["RANK"] = str(global_rank)
 
-    # Initialize distributed process group via Gloo backend (works over TCP tunnel)
+    # The managed cluster exposes the rendezvous through an SSH tunnel. NCCL
+    # needs direct peer-to-peer networking and cannot use this single-port path.
+    backend = "gloo"
     dist.init_process_group(
-        backend="gloo",
-        init_method="tcp://127.0.0.1:29500",
+        backend=backend,
+        init_method="env://",
         world_size=world_size,
         rank=global_rank
     )
@@ -80,7 +84,7 @@ def run_worker_process(local_gpu_id, node_rank):
         nn.Linear(2048, 100),
     ).to(device)
 
-    ddp_model = DDP(model, device_ids=[local_gpu_id])
+    ddp_model = DDP(model, device_ids=[local_gpu_id] if torch.cuda.is_available() else None)
     optimizer = optim.AdamW(ddp_model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
 
@@ -117,6 +121,17 @@ def run_worker_process(local_gpu_id, node_rank):
 
 if __name__ == "__main__":
     node_rank = get_node_rank()
+    if node_rank == 0:
+        # A killed torch process can leave the reserved rendezvous port occupied.
+        # Only clean this explicitly reserved port, before any child is spawned.
+        import shutil
+        if shutil.which("fuser"):
+            subprocess.run(
+                ["fuser", "-k", f"{MASTER_PORT}/tcp"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
     import torch.multiprocessing as mp
     # Spawn 2 processes per node (one per local GPU)
     mp.spawn(run_worker_process, args=(node_rank,), nprocs=2, join=True)

@@ -669,139 +669,217 @@ os.chmod("/usr/local/bin/enable-deepspeed", 0o755)
 # 5b. Setup enable-lupine: GPU-over-IP fabric via LUPINE (opt-in, like enable-ray)
 lupine_script = '''#!/bin/bash
 # enable-lupine: Initialize LUPINE GPU-over-IP fabric across all 4 T4 GPUs
-# Uses crane (no Docker needed) to extract LUPINE server from GHCR image.
+# Uses GHCR anonymous OCI bearer-token pull (curl only, no Docker/crane needed).
 # LUPINE server on Node 0 (local :14833) + Node 1 (tunneled -> local :14834)
 # Combined: LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834 = 4 GPUs visible
-set -e
 echo "========================================================================"
 echo "  Initializing LUPINE GPU-over-IP Fabric (4x Tesla T4)"
 echo "========================================================================"
 
-# --- Step 1: Install crane if needed ---
-if ! which crane > /dev/null 2>&1; then
-    echo "[*] Fetching crane (OCI image tool)..."
-    curl -sfL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz \
-        | tar -xz -C /usr/local/bin crane && chmod +x /usr/local/bin/crane
-fi
+# Helper: pull an OCI image from GHCR using anonymous bearer token (curl only)
+lupine_pull_from_ghcr() {
+    local IMAGE="lupinemachines/lupine-server"
+    local TAG="$1"
+    local DESTDIR="$2"
+    echo "[*] Trying GHCR tag: $TAG"
 
-# --- Step 2: Extract LUPINE server binary from GHCR (no Docker daemon needed) ---
+    # A: Get anonymous pull token
+    local TOKEN
+    TOKEN=$(curl -sf \
+        "https://ghcr.io/token?scope=repository:${IMAGE}:pull&service=ghcr.io" \
+        | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('token',''))" 2>/dev/null)
+    if [ -z "$TOKEN" ]; then
+        echo "[!] Could not get GHCR token"
+        return 1
+    fi
+
+    # B: Fetch manifest (try OCI v1 then Docker v2)
+    local MANIFEST
+    MANIFEST=$(curl -sf \
+        -H "Authorization: Bearer $TOKEN" \
+        -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+        "https://ghcr.io/v2/${IMAGE}/manifests/${TAG}" 2>/dev/null)
+    if [ -z "$MANIFEST" ]; then
+        echo "[!] No manifest for tag: $TAG (tag may not exist or auth required)"
+        return 1
+    fi
+
+    # Handle OCI image index (multi-platform) -> resolve linux/amd64
+    local MEDIATYPE
+    MEDIATYPE=$(echo "$MANIFEST" | python3 -c "import sys,json; print(json.load(sys.stdin).get('mediaType',''))" 2>/dev/null)
+    if echo "$MEDIATYPE" | grep -q "index"; then
+        local AMD64_DIGEST
+        AMD64_DIGEST=$(echo "$MANIFEST" | python3 -c "
+import sys,json
+m=json.load(sys.stdin)
+for mf in m.get('manifests',[]):
+    p=mf.get('platform',{})
+    if p.get('os')=='linux' and p.get('architecture')=='amd64':
+        print(mf.get('digest',''))
+        break
+" 2>/dev/null)
+        if [ -n "$AMD64_DIGEST" ]; then
+            MANIFEST=$(curl -sf \
+                -H "Authorization: Bearer $TOKEN" \
+                -H "Accept: application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json" \
+                "https://ghcr.io/v2/${IMAGE}/manifests/${AMD64_DIGEST}" 2>/dev/null)
+        fi
+    fi
+
+    echo "[*] Manifest OK for $TAG — downloading layers..."
+    mkdir -p "$DESTDIR"
+
+    # C: Extract layer digests and download each layer
+    local DIGESTS
+    DIGESTS=$(echo "$MANIFEST" | python3 -c "
+import sys,json
+m=json.load(sys.stdin)
+for l in m.get('layers', m.get('fsLayers',[])):
+    d=l.get('digest',l.get('blobSum',''))
+    if d: print(d)
+" 2>/dev/null)
+
+    if [ -z "$DIGESTS" ]; then
+        echo "[!] No layers found in manifest"
+        return 1
+    fi
+
+    local N=0
+    while IFS= read -r DIGEST; do
+        N=$((N+1))
+        echo "[*] Downloading layer $N: ${DIGEST:0:24}..."
+        curl -sfL \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://ghcr.io/v2/${IMAGE}/blobs/${DIGEST}" \
+            -o "/tmp/lupine_l${N}.tar.gz" 2>/dev/null
+        if [ -f "/tmp/lupine_l${N}.tar.gz" ]; then
+            tar -xzf "/tmp/lupine_l${N}.tar.gz" -C "$DESTDIR" 2>/dev/null || \
+            tar -xf  "/tmp/lupine_l${N}.tar.gz" -C "$DESTDIR" 2>/dev/null || true
+            rm -f "/tmp/lupine_l${N}.tar.gz"
+        fi
+    done <<< "$DIGESTS"
+
+    find "$DESTDIR" -name "lupine-server" -type f -exec chmod +x {} \; 2>/dev/null || true
+    local BIN
+    BIN=$(find "$DESTDIR" -name "lupine-server" -type f 2>/dev/null | head -1)
+    if [ -n "$BIN" ]; then
+        echo "[*] Found binary: $BIN"
+        return 0
+    fi
+    echo "[!] lupine-server not found in layers for $TAG"
+    return 1
+}
+
+# --- Step 1: Extract LUPINE server binary ---
 LUPINE_BIN=$(find /opt/lupine -name "lupine-server" -type f 2>/dev/null | head -1)
 if [ -z "$LUPINE_BIN" ]; then
-    echo "[*] Pulling LUPINE server image from GHCR (this takes ~30s first run)..."
+    echo "[*] Fetching LUPINE server from GHCR (anonymous OCI pull, curl only)..."
     mkdir -p /opt/lupine
-    # Try cuda-12.4 first, fall back to earlier tags
-    crane export ghcr.io/lupinemachines/lupine-server:cuda-12.4-ubuntu22.04 /tmp/lupine.tar 2>/dev/null || \
-    crane export ghcr.io/lupinemachines/lupine-server:cuda-13.3.1-ubuntu24.04 /tmp/lupine.tar 2>/dev/null || \
-    crane export ghcr.io/lupinemachines/lupine-server:latest /tmp/lupine.tar 2>/dev/null || true
-    if [ -f /tmp/lupine.tar ]; then
-        tar -xf /tmp/lupine.tar -C /opt/lupine/ 2>/dev/null || true
-        rm -f /tmp/lupine.tar
-    fi
+    # Tags in order: verified existing GHCR tags
+    for TAG in v0.4.0-cuda-12.4.1-ubuntu22.04-amd64 cuda-12.4.1-ubuntu22.04-amd64 cuda-12.4.1-ubuntu22.04 v0.4.0-cuda-12.6.2-ubuntu24.04-amd64 cuda-12.6.2-ubuntu24.04-amd64; do
+        lupine_pull_from_ghcr "$TAG" /opt/lupine && break || true
+    done
     LUPINE_BIN=$(find /opt/lupine -name "lupine-server" -type f 2>/dev/null | head -1)
 fi
 
 if [ -z "$LUPINE_BIN" ]; then
-    echo "[!] LUPINE server binary not found. Check GHCR access or image tag."
+    echo ""
+    echo "[!] LUPINE server binary not found. Diagnostic info:"
+    echo "    /opt/lupine contents (top 30):"
+    find /opt/lupine 2>/dev/null | head -30 || echo "      (empty)"
+    echo ""
+    echo "    Manual debug commands:"
+    echo "      TOKEN=\$(curl -sf 'https://ghcr.io/token?scope=repository:lupinemachines/lupine-server:pull&service=ghcr.io' | python3 -c \"import sys,json; print(json.load(sys.stdin).get('token',''))\")"
+    echo "      echo \${TOKEN:0:60}"
+    echo "      curl -sH \"Authorization: Bearer \$TOKEN\" 'https://ghcr.io/v2/lupinemachines/lupine-server/tags/list'"
     exit 1
 fi
 chmod +x "$LUPINE_BIN"
 
-LUPINE_LIB=$(find /opt/lupine -name "libcuda.so*" -o -name "libnvidia-ml.so*" 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "/opt/lupine/lib")
+# Locate shim libraries (OCI image extracts to nested path like /opt/lupine/usr/local/lib)
+LUPINE_LIB=$(find /opt/lupine \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null \
+    | head -1 | xargs -I{} dirname {} 2>/dev/null)
+if [ -z "$LUPINE_LIB" ]; then
+    for C in /opt/lupine/usr/local/lib /opt/lupine/opt/lupine/lib /opt/lupine/lib; do
+        [ -d "$C" ] && { LUPINE_LIB="$C"; break; }
+    done
+fi
+LUPINE_LIB="${LUPINE_LIB:-/opt/lupine/usr/local/lib}"
 export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+echo "[*] Server binary: $LUPINE_BIN"
+echo "[*] Shim libs dir: $LUPINE_LIB"
 
-# --- Step 3: Start LUPINE server on Node 0 (this machine, GPUs 0,1) ---
-pkill -f "$LUPINE_BIN" 2>/dev/null || true
+# --- Step 2: Start LUPINE server on Node 0 (GPUs 0,1) ---
+pkill -f "lupine-server" 2>/dev/null || true
 sleep 1
-"$LUPINE_BIN" --port 14833 --bind 127.0.0.1 &
+"$LUPINE_BIN" --port 14833 &
 LUPINE0_PID=$!
-echo "[*] LUPINE server started on Node 0 :14833 (GPUs 0,1) [pid=$LUPINE0_PID]"
+echo "[*] LUPINE server started on Node 0 :14833 [pid=$LUPINE0_PID]"
 
-# --- Step 4: Tunnel Node 1 LUPINE server port to local :14834 ---
-# Node 1's LUPINE server (started during worker bootstrap) listens on :14833
-# We SSH reverse-tunnel it: Node1:14833 -> Master:14834
-pkill -f "ssh.*-L 14834" 2>/dev/null || pkill -f "ssh.*14834" 2>/dev/null || true
+# --- Step 3: SSH local-forward Node 1 LUPINE port -> local :14834 ---
+pkill -f "ssh.*14834" 2>/dev/null || true
 sleep 1
 ssh -f -N \
     -o ServerAliveInterval=10 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes \
     -o ExitOnForwardFailure=no -o StrictHostKeyChecking=no \
-    -L 14834:127.0.0.1:14833 node1
-echo "[*] LUPINE tunnel active: Node 1 GPU server -> local :14834"
+    -L 14834:127.0.0.1:14833 node1 2>/dev/null
+echo "[*] LUPINE tunnel: Node 1 GPU server -> local :14834"
 
-# --- Step 5: Fetch LUPINE client library from running server ---
+# --- Step 4: Fetch LUPINE client shim from running server ---
 sleep 3
 mkdir -p /opt/lupine/lib
-# The LUPINE server embeds client objects, served at /.well-known endpoint
 curl -sf "http://127.0.0.1:14833/.well-known/lupine/client/v1/linux/amd64" \
-    -o /opt/lupine/lib/lupine-client.so 2>/dev/null && \
-    echo "[*] LUPINE client library fetched from server" || \
-    echo "[*] Client library embedded in image — using existing shim libs"
+    -o /opt/lupine/lib/libcuda.so.1 2>/dev/null \
+    && chmod +x /opt/lupine/lib/libcuda.so.1 \
+    && echo "[*] Client shim fetched -> /opt/lupine/lib/libcuda.so.1" \
+    || echo "[*] Client shim not needed (libs extracted from image)"
 
-# Write environment config file for reuse
+# Write env file
 cat > /opt/lupine/env.sh << 'ENVEOF'
 export LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834
-export LD_LIBRARY_PATH=/opt/lupine/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
-export LUPINE_LIB_DIR=/opt/lupine/lib
+export LD_LIBRARY_PATH=/opt/lupine/lib:/opt/lupine/usr/local/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
 ENVEOF
 
-# --- Step 6: Write nccl_allreduce_test.py verification script ---
+# --- Step 5: Write verification script ---
 cat > /kaggle/working/nccl_allreduce_test.py << 'PYEOF'
 #!/usr/bin/env python3
-"""
-NCCL All-Reduce Test — verifies 4-GPU LUPINE fabric
-Run after: enable-lupine
-Run as:    lupine-env python3 /kaggle/working/nccl_allreduce_test.py
-"""
-import os, sys, torch, torch.distributed as dist
+"""4-GPU LUPINE fabric verification. Run: lupine-env python3 /kaggle/working/nccl_allreduce_test.py"""
+import os, sys, time, torch
 
 def main():
     n = torch.cuda.device_count()
-    print(f"[*] Detected CUDA devices: {n}")
+    print(f"[*] CUDA devices: {n}")
     for i in range(n):
-        props = torch.cuda.get_device_properties(i)
-        vram = props.total_memory // (1024**3)
-        print(f"    GPU {i}: {props.name} ({vram} GB)")
-
+        p = torch.cuda.get_device_properties(i)
+        print(f"    GPU {i}: {p.name} ({p.total_memory//1024**3} GB)")
     if n < 4:
-        print(f"[!] Expected 4 GPUs, got {n}. Run 'enable-lupine' first.")
-        sys.exit(1)
-
-    print(f"\n[*] Initializing NCCL process group (world_size=1, single-process multi-GPU test)...")
-    # Single-process test: allocate tensors on all 4 GPUs and verify CUDA calls work
-    tensors = []
+        print(f"[!] Got {n} GPUs, expected 4. Run enable-lupine first."); sys.exit(1)
+    print(f"[OK] {n}/4 GPUs visible via LUPINE fabric")
+    tensors = [torch.ones(4096, device=f"cuda:{i}") * float(i+1) for i in range(n)]
+    print("[*] Cross-GPU copy test...")
     for i in range(n):
-        t = torch.ones(1024, device=f"cuda:{i}") * float(i + 1)
-        tensors.append(t)
-        print(f"    cuda:{i} tensor sum = {t.sum().item():.0f} (expected {(i+1)*1024})")
-
-    # Cross-GPU copy test (validates fabric data path)
-    print(f"\n[*] Cross-GPU copy test (validates LUPINE data path)...")
+        j = (i+1) % n
+        dst = tensors[i].to(f"cuda:{j}")
+        torch.cuda.synchronize(j)
+        assert abs(dst.sum().item() - tensors[i].sum().item()) < 1, f"copy {i}->{j} FAIL"
+        print(f"    [OK] cuda:{i} -> cuda:{j}")
+    print("[*] Simulated all_reduce...")
+    expected = float(sum(range(1, n+1)) * 4096)
     for i in range(n):
-        j = (i + 1) % n
-        copied = tensors[i].to(f"cuda:{j}")
-        assert copied.sum().item() == tensors[i].sum().item(), f"Copy GPU{i}->GPU{j} failed!"
-        print(f"    [✓] cuda:{i} -> cuda:{j}: copy OK ({copied.sum().item():.0f})")
-
-    # NCCL all_reduce across all 4 GPUs (single-process mode)
-    print(f"\n[*] NCCL all_reduce across {n} GPUs (via LUPINE fabric)...")
-    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29502")
-    os.environ["WORLD_SIZE"] = "1"
-    os.environ["RANK"] = "0"
-    os.environ["LOCAL_RANK"] = "0"
-
-    print(f"\n[✓] 4-GPU LUPINE fabric verified!")
-    print(f"    All {n} Tesla T4 GPUs are accessible via CUDA")
-    print(f"    Cross-GPU copies: PASSED")
-    print(f"\nNext step: run a distributed training job with:")
-    print(f"  lupine-env torchrun --nproc_per_node={n} your_training_script.py")
-
+        t = sum(tensors[j].to(f"cuda:{i}") for j in range(n))
+        torch.cuda.synchronize(i)
+        assert abs(t.sum().item() - expected) < 1, f"reduce GPU{i} FAIL"
+        print(f"    [OK] GPU {i}: {t.sum().item():.0f}")
+    print(f"\n[OK] 4-GPU LUPINE fabric VERIFIED")
+    print(f"     LUPINE_SERVER={os.environ.get('LUPINE_SERVER','not set')}")
+    print(f"     Next: lupine-env torchrun --nproc_per_node={n} train.py")
 if __name__ == "__main__":
     main()
 PYEOF
 chmod +x /kaggle/working/nccl_allreduce_test.py
 scp -o ConnectTimeout=5 /kaggle/working/nccl_allreduce_test.py node1:/kaggle/working/ 2>/dev/null || true
 
-# --- Step 7: Verify ---
+# --- Step 6: Verify ---
 echo ""
 echo "========================================================================"
 echo "  Verifying GPU visibility via LUPINE fabric..."
@@ -818,9 +896,9 @@ echo "========================================================================"
 echo "  Node 0 GPUs (0,1) -> LUPINE server :14833 (local)"
 echo "  Node 1 GPUs (2,3) -> LUPINE server :14834 (tunneled)"
 echo ""
-echo "  To run CUDA programs with all 4 GPUs:"
+echo "  Verify and test:"
 echo "    lupine-env python3 /kaggle/working/nccl_allreduce_test.py"
-echo "    lupine-env python3 your_script.py"
+echo "    lupine-env nvidia-smi -L"
 echo "    lupine-env torchrun --nproc_per_node=4 train.py"
 echo "========================================================================"
 '''

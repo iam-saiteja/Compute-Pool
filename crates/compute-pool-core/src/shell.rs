@@ -681,7 +681,8 @@ LUPINE_BIN=$(find /tmp/lupine-src/build -name "lupine_driver_server" -o -name "l
 if [ -z "$LUPINE_BIN" ] || [ ! -f "$LUPINE_BIN" ]; then
     echo "[*] Compiling native lupine_driver_server against local CUDA headers..."
     apt-get update -qq && apt-get install -y -qq libnghttp2-dev libssl-dev libcurl4-openssl-dev 2>/dev/null || true
-    ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null || true
+    ln -sf /usr/local/nvidia/lib64/libcuda.so /usr/lib/libcuda.so 2>/dev/null || true
+    ln -sf /usr/local/nvidia/lib64/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null || true
 
     if [ ! -d /tmp/lupine-src ]; then
         git clone https://github.com/lupinemachines/lupine.git /tmp/lupine-src
@@ -689,9 +690,9 @@ if [ -z "$LUPINE_BIN" ] || [ ! -f "$LUPINE_BIN" ]; then
 
     cd /tmp/lupine-src
     cmake -B build -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" 2>/dev/null
-    cmake --build build -j4 2>/dev/null || true
+        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/nvidia/lib64" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/nvidia/lib64" 2>/dev/null
+    cmake --build build --target lupine_driver_server -j4 2>/dev/null || true
 
     LUPINE_BIN=$(find /tmp/lupine-src/build -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null | head -1)
 fi
@@ -706,7 +707,7 @@ echo "[✓] Validation 1/4 PASSED: Server binary ready ($LUPINE_BIN)"
 
 LUPINE_LIB=$(find /tmp/lupine-src/build \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null)
 LUPINE_LIB="${LUPINE_LIB:-/tmp/lupine-src/build/lib}"
-export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 
 # --- Step 2: Start LUPINE server on Node 0 ---
 pkill -f "lupine_driver_server" 2>/dev/null || pkill -f "lupine-server" 2>/dev/null || true

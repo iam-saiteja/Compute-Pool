@@ -674,18 +674,12 @@ echo "========================================================================"
 echo "  Initializing LUPINE GPU-over-IP Fabric (4x Tesla T4)"
 echo "========================================================================"
 
-# --- Step 1: Locate or compile lupine_driver_server ---
-LUPINE_BIN=""
-for CANDIDATE in \
-    $(find /opt/lupine /usr/local/bin /kaggle/working /tmp/lupine-src -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null); do
-    if [ -f "$CANDIDATE" ]; then
-        LUPINE_BIN="$CANDIDATE"
-        break
-    fi
-done
+# --- Step 1: Locate or compile native lupine_driver_server ---
+rm -rf /opt/lupine 2>/dev/null || true
+LUPINE_BIN=$(find /tmp/lupine-src/build -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null | head -1)
 
-if [ -z "$LUPINE_BIN" ]; then
-    echo "[*] lupine_driver_server not found locally — compiling LUPINE from source..."
+if [ -z "$LUPINE_BIN" ] || [ ! -f "$LUPINE_BIN" ]; then
+    echo "[*] Compiling native lupine_driver_server against local CUDA headers..."
     apt-get update -qq && apt-get install -y -qq libnghttp2-dev libssl-dev libcurl4-openssl-dev 2>/dev/null || true
     ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null || true
 
@@ -710,7 +704,7 @@ fi
 chmod +x "$LUPINE_BIN"
 echo "[✓] Validation 1/4 PASSED: Server binary ready ($LUPINE_BIN)"
 
-LUPINE_LIB=$(find /tmp/lupine-src/build /opt/lupine \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null)
+LUPINE_LIB=$(find /tmp/lupine-src/build \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null)
 LUPINE_LIB="${LUPINE_LIB:-/tmp/lupine-src/build/lib}"
 export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64/stubs:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
 

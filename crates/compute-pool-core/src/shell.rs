@@ -14,7 +14,6 @@ pub const WORKER_BOOTSTRAP_TEMPLATE: &str = r#"
 import json
 import os
 import re
-import secrets
 import shutil
 import subprocess
 import sys
@@ -209,9 +208,12 @@ for line in cf_proc.stdout:
 
 # 4. Start File Browser on Worker port 8081, tunneled out for the user's own
 #    browser only. Authenticated: --noauth gave anyone with the tunnel URL a
-#    root-container file manager (compute-pool#1).
+#    root-container file manager (compute-pool#1). Fixed default credential,
+#    by the account owner's own choice -- they manage it themselves (e.g.
+#    `filebrowser users update`) over the SSH access they already have,
+#    rather than this script generating and then needing to disclose one.
 fb_user = "compute-pool"
-fb_password = secrets.token_urlsafe(12)
+fb_password = "1234"
 fb_db = "/root/.filebrowser.db"
 subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "config", "init"], check=False)
 subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "users", "add", fb_user, fb_password, "--perm.admin"], check=False)
@@ -313,15 +315,24 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias halt='/usr/local/bin/stop'\n")
     f.write("alias exit='/usr/local/bin/stop'\n")
 
+# Fixed default credential, by the account owner's own choice -- they manage
+# it themselves (e.g. `filebrowser users update`, restarting ttyd with a new
+# -c) over the SSH access they already have (compute-pool#1).
+web_user = "compute-pool"
+web_password = "1234"
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
+    "-c", f"{web_user}:{web_password}",
     "-t", "enableClipboard=true",
     "-t", "fontSize=15",
     "-t", "disableLeaveAlert=true",
     "bash"
 ])
+fb_db = "/root/.filebrowser.db"
+subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "config", "init"], check=False)
+subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "users", "add", web_user, web_password, "--perm.admin"], check=False)
 fb_proc = subprocess.Popen([
-    "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8080", "--noauth"
+    "/usr/local/bin/filebrowser", "-d", fb_db, "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8080"
 ])
 time.sleep(1)
 
@@ -844,15 +855,24 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias exit='/usr/local/bin/stop'\n")
 
 # 8. Web terminal, file manager and their Cloudflare tunnels for the user's browser.
+# Fixed default credential, by the account owner's own choice -- they manage
+# it themselves (e.g. `filebrowser users update`, restarting ttyd with a new
+# -c) over the SSH access they already have (compute-pool#1).
+web_user = "compute-pool"
+web_password = "1234"
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
+    "-c", f"{web_user}:{web_password}",
     "-t", "enableClipboard=true",
     "-t", "fontSize=15",
     "-t", "disableLeaveAlert=true",
     "bash"
 ])
+fb_db = "/root/.filebrowser.db"
+subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "config", "init"], check=False)
+subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "users", "add", web_user, web_password, "--perm.admin"], check=False)
 fb_proc = subprocess.Popen([
-    "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8080", "--noauth"
+    "/usr/local/bin/filebrowser", "-d", fb_db, "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8080"
 ])
 time.sleep(1)
 

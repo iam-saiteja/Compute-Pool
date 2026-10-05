@@ -24,6 +24,19 @@ Kaggle sessions accept no inbound connections and have no fixed address, so node
 
 A health loop pings every node every 30 seconds; a node that misses 3 checks in a row is marked `down` and drops out of dispatch, and returns automatically once it answers again.
 
+### Web terminal / file manager credentials
+
+The web terminal (`ttyd`) and file manager (`filebrowser`) tunneled to your browser are protected with a **fixed default login, `compute-pool` / `1234`**, not a generated one -- change it yourself once the cluster is up, over the SSH access you already have:
+
+```bash
+# File manager (run on whichever node you want to change):
+ssh node1 "pkill -f filebrowser; filebrowser -d /root/.filebrowser.db users update compute-pool --password 'your-new-password'"
+# then restart it the same way the bootstrap script does (filebrowser -d /root/.filebrowser.db -r /kaggle/working -a 0.0.0.0 -p 8080/8081 &)
+
+# Web terminal (master/single-shell only): kill and relaunch ttyd with a new -c user:pass
+ssh node0 "pkill -f ttyd; /usr/local/bin/ttyd -W -p 7681 -c compute-pool:your-new-password bash &"
+```
+
 ## Quick start
 
 ```bash

@@ -751,6 +751,7 @@ def main():
     ap.add_argument("--job-id", default="pool-map-job", help="checkpoint job id (rerun with the same id to resume)")
     ap.add_argument("--checkpoint-uri", default="local:///kaggle/working/checkpoints")
     ap.add_argument("--max-retries", type=int, default=2)
+    ap.add_argument("--output", help="write the combined per-shard results as JSON to this path")
     args = ap.parse_args()
 
     nodes = [n for n in json.load(open(REGISTRY))["nodes"] if n.get("status") == "online"]
@@ -770,6 +771,10 @@ def main():
     print(f"done: {len(out['results'])}/{args.shards} shards completed, {len(out['failed'])} failed permanently")
     if out["failed"]:
         print("failed shards:", out["failed"])
+    if args.output:
+        with open(args.output, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"combined results written to {args.output}")
     sys.exit(1 if out["failed"] else 0)
 
 

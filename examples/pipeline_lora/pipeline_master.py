@@ -47,12 +47,12 @@ MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 MAX_LEN = 256
 MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
-STEPS = 150
+STEPS = int(os.environ.get("STEPS", "150"))
 LR = 2e-4
 LOG_EVERY = 10
-CKPT_EVERY = 25
-EVAL_EVERY = 25
-EVAL_HOLDOUT = 20
+CKPT_EVERY = int(os.environ.get("CKPT_EVERY", "25"))
+EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "25"))
+EVAL_HOLDOUT = int(os.environ.get("EVAL_HOLDOUT", "20"))
 DATASET_ROWS = 800
 WORKER_HOST = "node1"
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
@@ -75,7 +75,9 @@ subprocess.run(
 )
 _worker_env = " ".join(
     f"{k}={shlex.quote(os.environ.get(k, default))}"
-    for k, default in [("PROFILE", "0"), ("CHECKPOINT_URI", CHECKPOINT_URI), ("CHECKPOINT_JOB_ID", os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo"))]
+    for k, default in [("PROFILE", "0"), ("CHECKPOINT_URI", CHECKPOINT_URI),
+                        ("CHECKPOINT_JOB_ID", os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo")),
+                        ("CKPT_EVERY", str(CKPT_EVERY))]
 )
 worker = spawn(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=20",
                 WORKER_HOST, f"cd /kaggle/working && {_worker_env} exec python3 -u pipeline_worker.py"])

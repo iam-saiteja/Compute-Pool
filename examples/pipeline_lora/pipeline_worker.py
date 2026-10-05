@@ -43,7 +43,7 @@ from workers.kaggle.amp import DynamicLossScaler  # noqa: E402
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 LR = 2e-4
-CKPT_EVERY = 25
+CKPT_EVERY = int(os.environ.get("CKPT_EVERY", "25"))
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
 JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + "-worker"
 

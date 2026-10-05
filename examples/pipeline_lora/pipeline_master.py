@@ -24,7 +24,7 @@ from cp_wire import recv, spawn, start_writer
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 MAX_LEN = 256
-MICROBATCHES = 2
+MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
 STEPS = 150
 LR = 2e-4
 LOSS_SCALE = 1024.0

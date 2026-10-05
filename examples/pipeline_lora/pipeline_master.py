@@ -11,6 +11,13 @@ continues from the last saved step instead of starting over. If the worker
 disconnects mid-run, progress is saved before exiting, so the fix is just to
 rerun -- it is not a crash that loses work.
 
+The fp16 loss scale is owned by the worker (workers/kaggle/amp.py), since the
+scale it applies at `loss * scale` is the single factor baked into every
+gradient in the backward chain, including this side's once it continues
+backprop from the gradient the worker returns. This file unscales with the
+scale value the worker reports per micro-batch, not an independent value of
+its own.
+
 Needs cp_wire.py and pipeline_worker.py next to it.
 Run on the master from /kaggle/working:
     python3 pipeline_master.py
@@ -42,9 +49,10 @@ MAX_LEN = 256
 MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
 STEPS = 150
 LR = 2e-4
-LOSS_SCALE = 1024.0
 LOG_EVERY = 10
 CKPT_EVERY = 25
+EVAL_EVERY = 25
+EVAL_HOLDOUT = 20
 DATASET_ROWS = 800
 WORKER_HOST = "node1"
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
@@ -146,8 +154,25 @@ def encode(example):
 
 log("loading dataset")
 ds = load_dataset("tatsu-lab/alpaca", split="train").select(range(DATASET_ROWS))
-examples = [e for e in (encode(ex) for ex in ds) if any(label != -100 for label in e[1])]
-log(f"{len(examples)} usable examples; {STEPS} steps x {MICROBATCHES} micro-batches")
+all_examples = [e for e in (encode(ex) for ex in ds) if any(label != -100 for label in e[1])]
+n_holdout = min(EVAL_HOLDOUT, max(1, len(all_examples) // 10))
+held_out, examples = all_examples[:n_holdout], all_examples[n_holdout:]
+log(f"{len(examples)} training examples, {len(held_out)} held out for eval; "
+    f"{STEPS} steps x {MICROBATCHES} micro-batches")
+
+
+@torch.no_grad()
+def evaluate():
+    """Mean loss on held_out, which training never sees. Forward-only on both
+    sides: no backward, no optimizer step, no loss-scale needed."""
+    total = 0.0
+    for ids, labels in held_out:
+        h = forward_stage0(torch.tensor([ids], device=dev))
+        w_q.put({"cmd": "eval", "h": h, "labels": torch.tensor([labels])})
+        reply = recv(w_out)
+        total += float(reply["loss"])
+    return total / len(held_out)
+
 
 start_step = resume()
 if start_step >= STEPS:
@@ -158,8 +183,15 @@ if start_step >= STEPS:
     worker.wait()
     sys.exit(0)
 
+try:
+    log(f"held-out loss before this run: {evaluate():.4f}")
+except (EOFError, BrokenPipeError, OSError) as exc:
+    log(f"worker connection lost before training started ({exc!r}). Nothing was trained; rerun.")
+    sys.exit(1)
+
 started = time.time()
 t_forward = t_wait = t_backward = t_step = 0.0
+ema_loss = None
 PROFILE = os.environ.get("PROFILE") == "1"
 prof = None
 last_completed_step = start_step
@@ -179,6 +211,7 @@ try:
         t_forward += time.time() - t
 
         losses = []
+        step_scale = None
         for h in hs:
             t = time.time()
             reply = recv(w_out)
@@ -187,13 +220,14 @@ try:
             h.backward(reply["grad"].to(device=h.device, dtype=h.dtype))
             t_backward += time.time() - t
             losses.append(float(reply["loss"]))
+            step_scale = reply["scale"]  # the worker's scale; every mb this step reports the same value
 
         t = time.time()
         finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
         if finite:
             for p in params:
                 if p.grad is not None:
-                    p.grad.div_(LOSS_SCALE * MICROBATCHES)
+                    p.grad.div_(step_scale * MICROBATCHES)
             opt.step()
         else:
             log(f"step {step}: non-finite gradient, skipping update")
@@ -209,15 +243,22 @@ try:
         if ack["finite"] != finite:
             log(f"step {step}: master and worker disagree on gradient finiteness; they may have diverged")
 
+        # Updated every step regardless of LOG_EVERY, so the smoothing isn't
+        # biased by which steps happen to be printed.
+        step_loss = sum(losses) / len(losses)
+        ema_loss = step_loss if ema_loss is None else 0.9 * ema_loss + 0.1 * step_loss
+
         if step == start_step + 1 or step % LOG_EVERY == 0:
             n = step - start_step
             per_step = (time.time() - started) / n
-            log(f"step {step}/{STEPS}  loss {sum(losses) / len(losses):.4f}  {per_step:.2f}s/step")
+            log(f"step {step}/{STEPS}  loss {step_loss:.4f} (smoothed {ema_loss:.4f})  {per_step:.2f}s/step")
             log(f"  per step avg: master forward+send {t_forward / n:.2f}s, waiting on worker {t_wait / n:.2f}s, "
                 f"master backward {t_backward / n:.2f}s, optimizer {t_step / n:.2f}s")
         last_completed_step = step
         if step % CKPT_EVERY == 0:
             save_ckpt(step)
+        if step % EVAL_EVERY == 0:
+            log(f"step {step}: held-out loss {evaluate():.4f}")
 except (EOFError, BrokenPipeError, OSError) as exc:
     # The worker went away mid-run (connection lost, OOM-killed, Kaggle session
     # ended, ...). Progress up to the last completed step is already on disk
@@ -227,6 +268,14 @@ except (EOFError, BrokenPipeError, OSError) as exc:
     log(f"worker connection lost ({exc!r}) at step {last_completed_step}/{STEPS}.")
     log(f"progress saved. rerun this script to resume from step {last_completed_step}.")
     sys.exit(1)
+
+# Must run before the worker is told to stop. Training already finished and
+# checkpointed above, so a lost connection here only costs this one number,
+# not the run -- log a warning and still shut down cleanly.
+try:
+    log(f"held-out loss after this run: {evaluate():.4f}")
+except (EOFError, BrokenPipeError, OSError) as exc:
+    log(f"worker connection lost while computing the final held-out loss ({exc!r}); skipping it.")
 
 w_q.put({"cmd": "stop"})
 w_q.put(None)

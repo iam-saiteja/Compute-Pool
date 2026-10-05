@@ -12,6 +12,15 @@ previous gradient.
 Checkpointed and resumed the same way as the master (workers/kaggle/checkpoint.py):
 on start, it loads its own latest checkpoint if one exists and continues.
 
+Uses dynamic fp16 loss scaling (workers/kaggle/amp.py), owned here: the scale
+is applied once at `loss * scale` and that single factor is what's baked into
+every gradient in the backward chain, including the master's half once it
+continues backprop from the gradient this worker returns. So this worker
+reports the scale it used with every micro-batch reply, and the master must
+unscale with that reported value, not a value of its own -- an independently
+adjusted scale on the master's side would silently diverge from what's
+actually in the gradients it receives.
+
 Needs cp_wire.py next to it.
 """
 import os
@@ -29,10 +38,10 @@ from cp_wire import start_reader, start_writer
 sys.path.insert(0, "/kaggle/working")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
+from workers.kaggle.amp import DynamicLossScaler  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
-LOSS_SCALE = 1024.0
 LR = 2e-4
 CKPT_EVERY = 25
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
@@ -65,6 +74,7 @@ params = [p for p in peft_model.parameters() if p.requires_grad]
 for p in params:
     p.data = p.data.float()
 opt = torch.optim.AdamW(params, lr=LR)
+scaler = DynamicLossScaler()
 
 
 def forward_stage(h):
@@ -119,14 +129,24 @@ while True:
     if msg is None or msg["cmd"] == "stop":
         break
 
+    if msg["cmd"] == "eval":
+        with torch.no_grad():
+            h = msg["h"].to(core.embed_tokens.weight.device)
+            loss = loss_fn(forward_stage(h), msg["labels"])
+        outbox.put({"loss": loss.detach()})
+        continue
+
     if msg["cmd"] == "mb":
         if PROFILE and steps == 4 and accumulated == 0 and prof is None:
             prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
             prof.__enter__()
+        # scaler.scale only changes at the step boundary below, so every
+        # micro-batch in this step snapshots (and reports) the same value.
+        step_scale = scaler.scale
         h = msg["h"].to(core.embed_tokens.weight.device).requires_grad_(True)
         loss = loss_fn(forward_stage(h), msg["labels"])
-        (loss * LOSS_SCALE).backward()
-        outbox.put({"loss": loss.detach(), "grad": h.grad.detach()})
+        (loss * step_scale).backward()
+        outbox.put({"loss": loss.detach(), "grad": h.grad.detach(), "scale": step_scale})
         accumulated += 1
         if accumulated == msg["per_step"]:
             # Update as soon as the step's last gradient is sent, without waiting for the master.
@@ -134,9 +154,10 @@ while True:
             if finite:
                 for p in params:
                     if p.grad is not None:
-                        p.grad.div_(LOSS_SCALE * accumulated)
+                        p.grad.div_(step_scale * accumulated)
                 opt.step()
             opt.zero_grad(set_to_none=True)
+            scaler.update(finite)
             accumulated = 0
             outbox.put({"finite": finite})
             steps += 1

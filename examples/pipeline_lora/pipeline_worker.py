@@ -9,10 +9,14 @@ Receiving and sending run on background threads, so the worker can accept the
 next micro-batch while it computes the current one and while it returns the
 previous gradient.
 
+Checkpointed and resumed the same way as the master (workers/kaggle/checkpoint.py):
+on start, it loads its own latest checkpoint if one exists and continues.
+
 Needs cp_wire.py next to it.
 """
 import os
 import sys
+import tempfile
 import time
 
 import torch
@@ -22,12 +26,17 @@ from transformers import AutoModelForCausalLM
 
 from cp_wire import start_reader, start_writer
 
+sys.path.insert(0, "/kaggle/working")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
+
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 LOSS_SCALE = 1024.0
 LR = 2e-4
 CKPT_EVERY = 25
-CKPT = "/kaggle/working/ckpt_worker.pt"
+CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
+JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + "-worker"
 
 
 def log(*args):
@@ -75,8 +84,26 @@ def loss_fn(h, labels):
     return F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
 
 
-def save_ckpt():
-    torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, CKPT)
+ckpt_store = checkpoint_mod.open_store(CHECKPOINT_URI, JOB_ID)
+
+
+def save_ckpt(step):
+    tmp = tempfile.mkdtemp(prefix="cp-pipeline-ckpt-")
+    path = os.path.join(tmp, "adapters_worker.pt")
+    torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, path)
+    ckpt_store.save(step, {"adapters_worker.pt": path}, meta={"step": step})
+
+
+def resume():
+    tmp = tempfile.mkdtemp(prefix="cp-pipeline-resume-")
+    loaded = ckpt_store.load_latest(tmp)
+    if not loaded:
+        return 0
+    step, _meta = loaded
+    state = torch.load(os.path.join(tmp, "adapters_worker.pt"), map_location=core.embed_tokens.weight.device)
+    peft_model.load_state_dict(state, strict=False)
+    log(f"resumed from checkpoint at step {step}")
+    return step
 
 
 PROFILE = os.environ.get("PROFILE") == "1"
@@ -84,7 +111,7 @@ prof = None
 inbox = start_reader(sys.stdin.buffer)
 outbox, writer = start_writer(sys.stdout.buffer)
 accumulated = 0
-steps = 0
+steps = resume()
 log("ready")
 
 while True:
@@ -119,11 +146,11 @@ while True:
                 prof.export_chrome_trace("/kaggle/working/trace_worker.json")
                 prof = None
             if steps % CKPT_EVERY == 0:
-                save_ckpt()
+                save_ckpt(steps)
 
 outbox.put(None)
 writer.join()
-save_ckpt()
+save_ckpt(steps)
 log("stopped after", steps, "optimizer steps")
 sys.stderr.flush()
 # The stdin reader thread is still blocked on a read; exit hard to avoid a shutdown crash.

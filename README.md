@@ -4,6 +4,8 @@ Compute Pool launches GPU workers on multiple Kaggle accounts and schedules inde
 
 The MVP deliberately does not merge remote GPUs into one CUDA device. Each Kaggle session keeps its native CUDA runtime and sees only its own local GPUs. The cluster layer assigns independent work to those GPUs, including experiments, inference jobs, dataset tasks, and ordinary scripts.
 
+> **Platform risk:** Kaggle's policy is one account per person, enforced (phone-number verification, account bans). Pooling GPU quota across multiple accounts you control -- this project's core mechanism -- is the pattern that policy prohibits, not an edge case of it. Every account in a pool is individually at risk of a ban; see [#12](https://github.com/iam-saiteja/Compute-Pool/issues/12) before using this beyond your own private experimentation.
+
 ## MVP architecture
 
 ```text

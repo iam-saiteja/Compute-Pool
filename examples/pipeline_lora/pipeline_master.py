@@ -253,7 +253,8 @@ try:
         if step == start_step + 1 or step % LOG_EVERY == 0:
             n = step - start_step
             per_step = (time.time() - started) / n
-            log(f"step {step}/{STEPS}  loss {step_loss:.4f} (smoothed {ema_loss:.4f})  {per_step:.2f}s/step")
+            log(f"step {step}/{STEPS}  loss {step_loss:.4f} (smoothed {ema_loss:.4f})  "
+                f"scale {step_scale:.0f}  {per_step:.2f}s/step")
             log(f"  per step avg: master forward+send {t_forward / n:.2f}s, waiting on worker {t_wait / n:.2f}s, "
                 f"master backward {t_backward / n:.2f}s, optimizer {t_step / n:.2f}s")
         last_completed_step = step

@@ -79,6 +79,8 @@ def save_ckpt():
     torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, CKPT)
 
 
+PROFILE = os.environ.get("PROFILE") == "1"
+prof = None
 inbox = start_reader(sys.stdin.buffer)
 outbox, writer = start_writer(sys.stdout.buffer)
 accumulated = 0
@@ -91,6 +93,9 @@ while True:
         break
 
     if msg["cmd"] == "mb":
+        if PROFILE and steps == 4 and accumulated == 0 and prof is None:
+            prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+            prof.__enter__()
         h = msg["h"].to(core.embed_tokens.weight.device).requires_grad_(True)
         loss = loss_fn(forward_stage(h), msg["labels"])
         (loss * LOSS_SCALE).backward()
@@ -108,6 +113,11 @@ while True:
             accumulated = 0
             outbox.put({"finite": finite})
             steps += 1
+            if prof is not None and steps == 5:
+                prof.__exit__(None, None, None)
+                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=25), file=sys.stderr, flush=True)
+                prof.export_chrome_trace("/kaggle/working/trace_worker.json")
+                prof = None
             if steps % CKPT_EVERY == 0:
                 save_ckpt()
 

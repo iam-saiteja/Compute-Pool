@@ -51,7 +51,7 @@ subprocess.run(
     check=True,
 )
 worker = spawn(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=20",
-                WORKER_HOST, "cd /kaggle/working && exec python3 -u pipeline_worker.py"])
+                WORKER_HOST, f"cd /kaggle/working && PROFILE={os.environ.get('PROFILE', '0')} exec python3 -u pipeline_worker.py"])
 w_in, w_out = worker.stdin, worker.stdout
 w_q, w_writer = start_writer(w_in)
 
@@ -115,7 +115,12 @@ log(f"{len(examples)} usable examples; {STEPS} steps x {MICROBATCHES} micro-batc
 
 started = time.time()
 t_forward = t_wait = t_backward = t_step = 0.0
+PROFILE = os.environ.get("PROFILE") == "1"
+prof = None
 for step in range(1, STEPS + 1):
+    if PROFILE and step == 5:
+        prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
+        prof.__enter__()
     base = (step - 1) * MICROBATCHES
     t = time.time()
     hs = []
@@ -147,6 +152,11 @@ for step in range(1, STEPS + 1):
         log(f"step {step}: non-finite gradient, skipping update")
     opt.zero_grad(set_to_none=True)
     t_step += time.time() - t
+    if prof is not None and step == 6:
+        prof.__exit__(None, None, None)
+        print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=25), file=sys.stderr, flush=True)
+        prof.export_chrome_trace("/kaggle/working/trace_master.json")
+        prof = None
 
     ack = recv(w_out)
     if ack["finite"] != finite:

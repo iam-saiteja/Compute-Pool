@@ -47,6 +47,7 @@ MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 MAX_LEN = 256
 MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
+MICRO_BATCH_SIZE = int(os.environ.get("MICRO_BATCH_SIZE", "4"))
 STEPS = int(os.environ.get("STEPS", "150"))
 LR = 2e-4
 LOG_EVERY = 10
@@ -93,6 +94,14 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, torch_dtype=torch.float16, device_map="auto", max_memory={0: "13GiB", 1: "13GiB"}
 )
 model.config.use_cache = False
+# This stage only ever runs layers 0..SPLIT-1 (forward_stage0 below) -- drop
+# the rest, and the unused LM head, before LoRA wraps the model, so neither
+# their weights nor unused LoRA adapters for them sit in GPU memory or the
+# optimizer's state for the whole run (compute-pool#5). See the matching
+# comment in pipeline_worker.py for what this does and does not fix.
+model.model.layers = model.model.layers[:SPLIT]
+del model.lm_head
+torch.cuda.empty_cache()
 peft_model = get_peft_model(
     model,
     LoraConfig(
@@ -104,7 +113,7 @@ peft_model = get_peft_model(
     ),
 )
 core = peft_model.base_model.model.model
-layers = core.layers[:SPLIT]
+layers = core.layers
 params = [p for p in peft_model.parameters() if p.requires_grad]
 for p in params:
     p.data = p.data.float()
@@ -133,12 +142,26 @@ def resume():
     return step
 
 
-def forward_stage0(input_ids):
+def build_4d_mask(attention_mask, dtype, device):
+    """Combine the causal mask with the batch's padding mask into the additive
+    4D form the decoder layers expect directly -- calling them one at a time
+    (instead of the full model forward) skips transformers' usual mask-prep
+    step, so it's redone here by hand rather than relying on an internal
+    helper whose name/signature varies across transformers versions."""
+    seq_len = attention_mask.shape[1]
+    min_value = torch.finfo(dtype).min
+    causal = torch.triu(torch.full((seq_len, seq_len), min_value, device=device, dtype=dtype), diagonal=1)
+    pad = (1.0 - attention_mask.to(dtype=dtype))[:, None, None, :] * min_value
+    return causal[None, None, :, :] + pad
+
+
+def forward_stage0(input_ids, attention_mask=None):
     h = core.embed_tokens(input_ids)
     pos = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
     pe = core.rotary_emb(h, pos)
+    mask = build_4d_mask(attention_mask, h.dtype, h.device) if attention_mask is not None else None
     for layer in layers:
-        out = layer(h, attention_mask=None, position_ids=pos, position_embeddings=pe)
+        out = layer(h, attention_mask=mask, position_ids=pos, position_embeddings=pe)
         h = out[0] if isinstance(out, tuple) else out
     return h
 
@@ -154,13 +177,30 @@ def encode(example):
     return f_ids, [-100] * cut + f_ids[cut:]
 
 
+def collate(batch):
+    """Right-pad a batch of (ids, labels) pairs to the same length and build
+    the matching attention mask -- real multi-example batching needs
+    rectangular tensors, not the variable-length lists encode() produces
+    (compute-pool#6). Pad positions carry label -100 (ignored by the loss) and
+    mask 0 (ignored by attention), so they cannot affect the result."""
+    max_len = max(len(ids) for ids, _ in batch)
+    pad_id = tok.pad_token_id
+    input_ids, labels, mask = [], [], []
+    for ids, lab in batch:
+        pad = max_len - len(ids)
+        input_ids.append(ids + [pad_id] * pad)
+        labels.append(lab + [-100] * pad)
+        mask.append([1] * len(ids) + [0] * pad)
+    return torch.tensor(input_ids, device=dev), torch.tensor(labels), torch.tensor(mask, device=dev)
+
+
 log("loading dataset")
 ds = load_dataset("tatsu-lab/alpaca", split="train").select(range(DATASET_ROWS))
 all_examples = [e for e in (encode(ex) for ex in ds) if any(label != -100 for label in e[1])]
 n_holdout = min(EVAL_HOLDOUT, max(1, len(all_examples) // 10))
 held_out, examples = all_examples[:n_holdout], all_examples[n_holdout:]
 log(f"{len(examples)} training examples, {len(held_out)} held out for eval; "
-    f"{STEPS} steps x {MICROBATCHES} micro-batches")
+    f"{STEPS} steps x {MICROBATCHES} micro-batches x {MICRO_BATCH_SIZE} examples/micro-batch")
 
 
 @torch.no_grad()
@@ -202,14 +242,15 @@ try:
         if PROFILE and step == start_step + 5:
             prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
             prof.__enter__()
-        base = (step - 1) * MICROBATCHES
+        base = (step - 1) * MICROBATCHES * MICRO_BATCH_SIZE
         t = time.time()
         hs = []
         for j in range(MICROBATCHES):
-            ids, labels = examples[(base + j) % len(examples)]
-            h = forward_stage0(torch.tensor([ids], device=dev))
+            batch = [examples[(base + j * MICRO_BATCH_SIZE + k) % len(examples)] for k in range(MICRO_BATCH_SIZE)]
+            input_ids, labels, mask = collate(batch)
+            h = forward_stage0(input_ids, mask)
             hs.append(h)
-            w_q.put({"cmd": "mb", "h": h.detach(), "labels": torch.tensor([labels]), "per_step": MICROBATCHES})
+            w_q.put({"cmd": "mb", "h": h.detach(), "labels": labels, "mask": mask, "per_step": MICROBATCHES})
         t_forward += time.time() - t
 
         losses = []
@@ -259,6 +300,12 @@ try:
                 f"master backward {t_backward / n:.2f}s, optimizer {t_step / n:.2f}s")
         last_completed_step = step
         if step % CKPT_EVERY == 0:
+            # Coordinated save: the worker writes and acks its own checkpoint
+            # for this step before the master writes its own, so a crash
+            # between the two can no longer leave them at different steps
+            # (compute-pool#15).
+            w_q.put({"cmd": "ckpt", "step": step})
+            recv(w_out)  # {"ckpt_done": True}
             save_ckpt(step)
         if step % EVAL_EVERY == 0:
             log(f"step {step}: held-out loss {evaluate():.4f}")

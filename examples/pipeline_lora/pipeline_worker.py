@@ -4,6 +4,8 @@ Holds decoder layers SPLIT..end plus the final norm and LM head. For each
 micro-batch from the master it runs forward and backward, accumulates the
 adapter gradients, and returns the gradient at its input. When the master
 sends "step", it applies one optimizer update over the accumulated gradients.
+Each micro-batch is itself MICRO_BATCH_SIZE (master-side env var) examples
+padded to a common length, with the padding mask sent alongside `h`.
 
 Receiving and sending run on background threads, so the worker can accept the
 next micro-batch while it computes the current one and while it returns the
@@ -43,7 +45,6 @@ from workers.kaggle.amp import DynamicLossScaler  # noqa: E402
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 LR = 2e-4
-CKPT_EVERY = int(os.environ.get("CKPT_EVERY", "25"))
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
 JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + "-worker"
 
@@ -57,6 +58,18 @@ model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID, torch_dtype=torch.float16, device_map="auto", max_memory={0: "13GiB", 1: "13GiB"}
 )
 model.config.use_cache = False
+# This stage only ever runs layers SPLIT..end (forward_stage below) -- drop
+# the rest, and the embedding table (only stage 0 needs it), before LoRA
+# wraps the model, so neither their weights nor unused LoRA adapters for them
+# sit in GPU memory or the optimizer's state for the whole run
+# (compute-pool#5). from_pretrained still downloads and briefly materializes
+# the full checkpoint first -- skipping that too needs a meta-device partial
+# load, not done here since its device_map can't be checked against the real
+# checkpoint without cluster access.
+dev = next(p.device for p in model.model.layers[SPLIT].parameters())
+model.model.layers = model.model.layers[SPLIT:]
+del model.model.embed_tokens
+torch.cuda.empty_cache()
 peft_model = get_peft_model(
     model,
     LoraConfig(
@@ -69,7 +82,7 @@ peft_model = get_peft_model(
 )
 core = peft_model.base_model.model.model
 head = peft_model.base_model.model.lm_head
-layers = core.layers[SPLIT:]
+layers = core.layers
 params = [p for p in peft_model.parameters() if p.requires_grad]
 for p in params:
     p.data = p.data.float()
@@ -77,12 +90,24 @@ opt = torch.optim.AdamW(params, lr=LR)
 scaler = DynamicLossScaler()
 
 
-def forward_stage(h):
-    h = h.to(core.embed_tokens.weight.device)
+def build_4d_mask(attention_mask, dtype, device):
+    """Combine the causal mask with the batch's padding mask into the additive
+    4D form the decoder layers expect directly -- see the matching comment in
+    pipeline_master.py (compute-pool#6)."""
+    seq_len = attention_mask.shape[1]
+    min_value = torch.finfo(dtype).min
+    causal = torch.triu(torch.full((seq_len, seq_len), min_value, device=device, dtype=dtype), diagonal=1)
+    pad = (1.0 - attention_mask.to(dtype=dtype))[:, None, None, :] * min_value
+    return causal[None, None, :, :] + pad
+
+
+def forward_stage(h, attention_mask=None):
+    h = h.to(dev)
     pos = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
     pe = core.rotary_emb(h, pos)
+    mask = build_4d_mask(attention_mask.to(h.device), h.dtype, h.device) if attention_mask is not None else None
     for layer in layers:
-        out = layer(h, attention_mask=None, position_ids=pos, position_embeddings=pe)
+        out = layer(h, attention_mask=mask, position_ids=pos, position_embeddings=pe)
         h = out[0] if isinstance(out, tuple) else out
     return h
 
@@ -113,7 +138,7 @@ def resume():
     if not loaded:
         return 0
     step, meta = loaded
-    state = torch.load(os.path.join(tmp, "adapters_worker.pt"), map_location=core.embed_tokens.weight.device)
+    state = torch.load(os.path.join(tmp, "adapters_worker.pt"), map_location=dev)
     peft_model.load_state_dict(state, strict=False)
     if "scaler" in meta:
         scaler.load_state_dict(meta["scaler"])
@@ -136,9 +161,17 @@ while True:
 
     if msg["cmd"] == "eval":
         with torch.no_grad():
-            h = msg["h"].to(core.embed_tokens.weight.device)
+            h = msg["h"].to(dev)
             loss = loss_fn(forward_stage(h), msg["labels"])
         outbox.put({"loss": loss.detach()})
+        continue
+
+    if msg["cmd"] == "ckpt":
+        # Master-driven, not self-timed: the master only writes its own
+        # checkpoint for this step after this ack, so a crash between the two
+        # saves can no longer leave them at different steps (compute-pool#15).
+        save_ckpt(msg["step"])
+        outbox.put({"ckpt_done": True})
         continue
 
     if msg["cmd"] == "mb":
@@ -148,8 +181,8 @@ while True:
         # scaler.scale only changes at the step boundary below, so every
         # micro-batch in this step snapshots (and reports) the same value.
         step_scale = scaler.scale
-        h = msg["h"].to(core.embed_tokens.weight.device).requires_grad_(True)
-        loss = loss_fn(forward_stage(h), msg["labels"])
+        h = msg["h"].to(dev).requires_grad_(True)
+        loss = loss_fn(forward_stage(h, msg["mask"]), msg["labels"])
         (loss * step_scale).backward()
         outbox.put({"loss": loss.detach(), "grad": h.grad.detach(), "scale": step_scale})
         accumulated += 1
@@ -171,8 +204,6 @@ while True:
                 print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=25), file=sys.stderr, flush=True)
                 prof.export_chrome_trace("/kaggle/working/trace_worker.json")
                 prof = None
-            if steps % CKPT_EVERY == 0:
-                save_ckpt(steps)
 
 outbox.put(None)
 writer.join()

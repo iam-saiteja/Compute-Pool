@@ -44,6 +44,18 @@ def test_scale_is_clamped_to_min_and_max():
     assert s.scale == 2.0 ** 20  # does not keep growing past max
 
 
+def test_state_dict_roundtrip_preserves_scale_and_streak():
+    s = DynamicLossScaler(init_scale=100.0, growth_factor=2.0, growth_interval=3)
+    s.update(True)
+    s.update(True)  # 2 good steps into a streak of 3; not grown yet
+    saved = s.state_dict()
+
+    fresh = DynamicLossScaler(init_scale=100.0, growth_factor=2.0, growth_interval=3)
+    fresh.load_state_dict(saved)
+    assert fresh.scale == 100.0
+    assert fresh.update(True) == 200.0  # the 3rd good step carries over correctly
+
+
 def _run(name, fn):
     try:
         fn()
@@ -60,5 +72,6 @@ if __name__ == "__main__":
         _run("scale_shrinks_immediately_on_overflow", test_scale_shrinks_immediately_on_overflow),
         _run("overflow_resets_the_growth_counter", test_overflow_resets_the_growth_counter),
         _run("scale_is_clamped_to_min_and_max", test_scale_is_clamped_to_min_and_max),
+        _run("state_dict_roundtrip_preserves_scale_and_streak", test_state_dict_roundtrip_preserves_scale_and_streak),
     ]
     sys.exit(0 if all(results) else 1)

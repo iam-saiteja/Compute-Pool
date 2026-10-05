@@ -101,7 +101,10 @@ def save_ckpt(step):
     tmp = tempfile.mkdtemp(prefix="cp-pipeline-ckpt-")
     path = os.path.join(tmp, "adapters_worker.pt")
     torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, path)
-    ckpt_store.save(step, {"adapters_worker.pt": path}, meta={"step": step})
+    # Confirmed as a real (non-fatal) gap on a live cluster run: without
+    # saving the scaler's state, a resumed run restarts it at init_scale and
+    # has to re-earn any growth from scratch.
+    ckpt_store.save(step, {"adapters_worker.pt": path}, meta={"step": step, "scaler": scaler.state_dict()})
 
 
 def resume():
@@ -109,10 +112,12 @@ def resume():
     loaded = ckpt_store.load_latest(tmp)
     if not loaded:
         return 0
-    step, _meta = loaded
+    step, meta = loaded
     state = torch.load(os.path.join(tmp, "adapters_worker.pt"), map_location=core.embed_tokens.weight.device)
     peft_model.load_state_dict(state, strict=False)
-    log(f"resumed from checkpoint at step {step}")
+    if "scaler" in meta:
+        scaler.load_state_dict(meta["scaler"])
+    log(f"resumed from checkpoint at step {step} (loss scale {scaler.scale:.0f})")
     return step
 
 

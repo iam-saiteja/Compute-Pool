@@ -37,3 +37,12 @@ class DynamicLossScaler:
             self.scale = max(self.scale * self.backoff_factor, self.min_scale)
             self._good_steps = 0
         return self.scale
+
+    def state_dict(self):
+        """For checkpointing: without this, a resumed run restarts at
+        init_scale and has to re-earn any growth from scratch."""
+        return {"scale": self.scale, "good_steps": self._good_steps}
+
+    def load_state_dict(self, state):
+        self.scale = state["scale"]
+        self._good_steps = state.get("good_steps", 0)

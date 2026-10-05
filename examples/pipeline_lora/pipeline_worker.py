@@ -1,55 +1,37 @@
 """Stage 1 of a two-node pipeline-parallel LoRA fine-tune (run on the worker node).
 
-Holds decoder layers SPLIT..end plus the final norm and LM head. Receives the
-hidden states at the split point, computes the loss, backpropagates locally,
-and returns the gradient with respect to its input so the master can finish
-the backward pass through its own layers.
+Holds decoder layers SPLIT..end plus the final norm and LM head. For each
+micro-batch from the master it runs forward and backward, accumulates the
+adapter gradients, and returns the gradient at its input. When the master
+sends "step", it applies one optimizer update over the accumulated gradients.
 
-Launched by pipeline_master.py over SSH; protocol is length-prefixed torch
-blobs on stdin/stdout, so nothing else may be printed to stdout.
+Receiving and sending run on background threads, so the worker can accept the
+next micro-batch while it computes the current one and while it returns the
+previous gradient.
+
+Needs cp_wire.py next to it.
 """
-import io
-import struct
+import os
 import sys
+import time
 
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from transformers import AutoModelForCausalLM
 
+from cp_wire import start_reader, start_writer
+
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
 LOSS_SCALE = 1024.0
 LR = 2e-4
+CKPT_EVERY = 25
 CKPT = "/kaggle/working/ckpt_worker.pt"
 
 
 def log(*args):
     print("[worker]", *args, file=sys.stderr, flush=True)
-
-
-def read_exact(stream, n):
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = stream.read(n - len(buf))
-        if not chunk:
-            raise EOFError("master closed the connection")
-        buf.extend(chunk)
-    return bytes(buf)
-
-
-def recv(stream):
-    n = struct.unpack("<Q", read_exact(stream, 8))[0]
-    return torch.load(io.BytesIO(read_exact(stream, n)), weights_only=False)
-
-
-def send(stream, obj):
-    buf = io.BytesIO()
-    torch.save(obj, buf)
-    data = buf.getvalue()
-    stream.write(struct.pack("<Q", len(data)))
-    stream.write(data)
-    stream.flush()
 
 
 log("loading model")
@@ -97,34 +79,45 @@ def save_ckpt():
     torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, CKPT)
 
 
-stream_in = sys.stdin.buffer
-stream_out = sys.stdout.buffer
+inbox = start_reader(sys.stdin.buffer)
+outbox, writer = start_writer(sys.stdout.buffer)
+accumulated = 0
 steps = 0
 log("ready")
 
 while True:
-    msg = recv(stream_in)
-    if msg["cmd"] == "stop":
+    msg = inbox.get()
+    if msg is None or msg["cmd"] == "stop":
         break
 
-    h = msg["h"].to(core.embed_tokens.weight.device).requires_grad_(True)
-    loss = loss_fn(forward_stage(h), msg["labels"])
-    (loss * LOSS_SCALE).backward()
+    if msg["cmd"] == "mb":
+        t0 = time.time()
+        h = msg["h"].to(core.embed_tokens.weight.device).requires_grad_(True)
+        loss = loss_fn(forward_stage(h), msg["labels"])
+        (loss * LOSS_SCALE).backward()
+        grad = h.grad.detach().cpu()
+        outbox.put({"loss": loss.item(), "grad": grad, "compute_s": time.time() - t0})
+        accumulated += 1
+        continue
 
-    finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
-    if finite:
-        for p in params:
-            if p.grad is not None:
-                p.grad.div_(LOSS_SCALE)
-        opt.step()
-    else:
-        log("non-finite gradient, skipping optimizer step")
-    opt.zero_grad(set_to_none=True)
+    if msg["cmd"] == "step":
+        finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
+        if msg["apply"] and finite and accumulated:
+            for p in params:
+                if p.grad is not None:
+                    p.grad.div_(LOSS_SCALE * accumulated)
+            opt.step()
+        opt.zero_grad(set_to_none=True)
+        accumulated = 0
+        outbox.put({"finite": finite})
+        steps += 1
+        if steps % CKPT_EVERY == 0:
+            save_ckpt()
 
-    send(stream_out, {"loss": loss.item(), "grad": h.grad.detach().cpu(), "finite": finite})
-    steps += 1
-    if steps % 50 == 0:
-        save_ckpt()
-
+outbox.put(None)
+writer.join()
 save_ckpt()
-log("stopped after", steps, "steps")
+log("stopped after", steps, "optimizer steps")
+sys.stderr.flush()
+# The stdin reader thread is still blocked on a read; exit hard to avoid a shutdown crash.
+os._exit(0)

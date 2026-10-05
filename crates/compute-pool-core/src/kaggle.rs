@@ -113,7 +113,6 @@ impl KaggleClient {
         slug: &str,
         script_code: &str,
         enable_gpu: bool,
-        _accelerator: Option<&str>,
     ) -> Result<KernelPushResponse> {
         let url = format!("{}/kernels/push", KAGGLE_API_BASE);
         let kernel_ref = format!("{}/{}", self.username, slug);

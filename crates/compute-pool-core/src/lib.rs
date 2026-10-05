@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod distributed;
 pub mod job;
 pub mod kaggle;
 pub mod probe;
@@ -8,7 +7,6 @@ pub mod shell;
 pub mod storage;
 
 pub use auth::{load_all_credentials, load_credentials, save_credentials, Credentials};
-pub use distributed::{run_distributed_workload, DistributedJobResult, NodeResult};
 pub use job::{Job, JobSpec, JobState};
 pub use kaggle::KaggleClient;
 pub use probe::{load_cached_gpu_info, run_probe, save_gpu_info, GPUInfo};

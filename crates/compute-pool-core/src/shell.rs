@@ -3,83 +3,198 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-use crate::auth::load_credentials;
+use crate::auth::{load_all_credentials, load_credentials, MAX_ACCOUNT_SLOTS};
 use crate::job::{Job, JobSpec, JobState};
 use crate::kaggle::KaggleClient;
+use crate::scheduler::get_account_status;
 use crate::storage::{load_all_jobs, upsert_job};
 
 pub const WORKER_BOOTSTRAP_TEMPLATE: &str = r#"
-import http.server
 import json
 import os
 import re
-import socketserver
+import shutil
 import subprocess
 import sys
-import threading
 import time
 import urllib.request
 
 SESSION_ID = "__SESSION_ID__"
+MASTER_SESSION_ID = "__MASTER_SESSION_ID__"
 DURATION_MINUTES = __DURATION_MINUTES__
-NODE_LABEL = "node1-slot2"
+NODE_LABEL = "__NODE_LABEL__"
 
 print(f"[*] Initializing Compute Pool GPU Cluster Worker ({NODE_LABEL})...", flush=True)
 
-# 1. Download Cloudflared, Chisel, and Filebrowser
+def report_failure(exc_type, exc, tb):
+    import traceback
+    text = "".join(traceback.format_exception(exc_type, exc, tb))[-3000:]
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-error", data=text.encode("utf-8"))
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc, tb)
+
+sys.excepthook = report_failure
+
+# 1. Download Cloudflared, Chisel, and Filebrowser (user-facing file manager
+#    plus the reverse TCP bridge used for the node-to-node SSH fabric below).
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared"
 ], check=True)
-
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz | gzip -d > /usr/local/bin/chisel && chmod +x /usr/local/bin/chisel"
 ], check=False)
-
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/filebrowser/filebrowser/releases/download/v2.32.0/linux-amd64-filebrowser.tar.gz | tar -xz -C /usr/local/bin filebrowser && chmod +x /usr/local/bin/filebrowser"
 ], check=False)
 
-# 1b. Extract LUPINE server binary from GHCR image using crane (no Docker required)
-# crane is a single-binary container tool from Google that can pull/export OCI images.
-# The LUPINE server binary is extracted from the image layer and run directly on this node.
-print("[*] Extracting LUPINE GPU-over-IP server...", flush=True)
-subprocess.run(["bash", "-c",
-    "curl -sfL https://github.com/google/go-containerregistry/releases/latest/download/go-containerregistry_Linux_x86_64.tar.gz "
-    "| tar -xz -C /usr/local/bin crane 2>/dev/null && chmod +x /usr/local/bin/crane || true"
-], check=False)
-
-subprocess.run(["bash", "-c",
-    "mkdir -p /opt/lupine && "
-    "crane export ghcr.io/lupinemachines/lupine-server:cuda-12.4-ubuntu22.04 /tmp/lupine.tar 2>/dev/null && "
-    "tar -xf /tmp/lupine.tar -C /opt/lupine/ 2>/dev/null || true && "
-    "find /opt/lupine -name 'lupine-server' -type f -exec chmod +x {} \\; 2>/dev/null || true"
-], check=False)
-
-lupine_server_bin = subprocess.run(
-    ["bash", "-c", "find /opt/lupine -name 'lupine-server' -type f 2>/dev/null | head -1"],
-    capture_output=True, text=True
-).stdout.strip()
-
-if lupine_server_bin and os.path.isfile(lupine_server_bin):
-    os.chmod(lupine_server_bin, 0o755)
-    lupine_lib_dir = subprocess.run(
-        ["bash", "-c", "find /opt/lupine -name 'libcuda.so*' -o -name 'libnvidia-ml.so*' 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo /opt/lupine/lib"],
-        capture_output=True, text=True
-    ).stdout.strip() or "/opt/lupine/lib"
-    lupine_env = os.environ.copy()
-    lupine_env["LD_LIBRARY_PATH"] = f"{lupine_lib_dir}:/usr/local/cuda/lib64:" + lupine_env.get("LD_LIBRARY_PATH", "")
-    subprocess.Popen(
-        [lupine_server_bin, "--port", "14833"],
-        env=lupine_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+# Preserve the worker's native NVIDIA tools for non-interactive task execution.
+# Kaggle's terminal PATH is not necessarily inherited by an SSH session.
+gpu_tool_candidates = [
+    "/opt/bin/nvidia-smi",
+    "/usr/bin/nvidia-smi",
+    "/usr/local/nvidia/bin/nvidia-smi",
+    "/usr/local/cuda/bin/nvidia-smi",
+    "/opt/conda/bin/nvidia-smi",
+]
+gpu_tool = next((path for path in gpu_tool_candidates if os.path.exists(path)), None)
+if not gpu_tool:
+    gpu_tool = shutil.which("nvidia-smi")
+if not gpu_tool:
+    found = subprocess.run(
+        ["bash", "-lc", "find /usr /opt /bin /sbin -name nvidia-smi 2>/dev/null | head -1"],
+        capture_output=True,
+        text=True,
     )
-    print("[*] LUPINE GPU server started on Node 1 :14833 (exporting GPUs 0,1)", flush=True)
+    gpu_tool = found.stdout.strip() or None
+gpu_tool_dir = os.path.dirname(gpu_tool) if gpu_tool else None
+if gpu_tool_dir:
+    os.environ["PATH"] = f"{gpu_tool_dir}:" + os.environ.get("PATH", "")
+    print(f"[*] Worker CUDA tools available from {gpu_tool_dir}", flush=True)
 else:
-    print("[!] LUPINE server binary not found — GPU fabric unavailable on Node 1", flush=True)
+    print("[!] Worker NVIDIA tools could not be located; GPU task validation will fail.", flush=True)
 
-# Start File Browser on Worker port 8081
+# nvidia-smi additionally needs libnvidia-ml.so at runtime -- its directory
+# doesn't always match the binary's, so it's found independently.
+gpu_lib_candidates = [
+    "/usr/local/nvidia/lib64/libnvidia-ml.so",
+    "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so",
+    "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.1",
+]
+gpu_lib = next((path for path in gpu_lib_candidates if os.path.exists(path)), None)
+if not gpu_lib:
+    found = subprocess.run(
+        ["bash", "-lc", "find /usr /opt -iname 'libnvidia-ml.so*' 2>/dev/null | head -1"],
+        capture_output=True,
+        text=True,
+    )
+    gpu_lib = found.stdout.strip() or None
+gpu_lib_dir = os.path.dirname(gpu_lib) if gpu_lib else None
+
+# 2. Start a real sshd, then wait for the master's SSH *public* key over ntfy
+#    and grant it access. The private half is generated on the master and
+#    never leaves it -- only the public key (not sensitive) crosses the wire.
+subprocess.run(["bash", "-c", "which sshd || (apt-get update -qq && apt-get install -y -qq openssh-server)"], check=False)
+subprocess.run(["bash", "-c", "mkdir -p /var/run/sshd /root/.ssh /kaggle/working && chmod 700 /root/.ssh"], check=False)
+subprocess.run(["bash", "-c", "ssh-keygen -A"], check=False)
+# PAM's pam_motd module prints a container-provided MOTD (via /etc/update-motd.d)
+# on every SSH session, including non-interactive `ssh host cmd` runs, which
+# pollutes crun's captured stdout. Drop it; pam_env (needed for the PATH /
+# LD_LIBRARY_PATH fix below) stays untouched.
+subprocess.run(["bash", "-c", "sed -i '/pam_motd/d' /etc/pam.d/sshd 2>/dev/null || true"], check=False)
+
+# sshd spawns a fresh, minimal environment for each `ssh host cmd` exec session
+# -- it does not inherit this process's PATH and does not source .bashrc for
+# non-interactive commands. Worse, PAM's pam_env module re-reads /etc/environment
+# during session setup *after* sshd applies ~/.ssh/environment, silently
+# overwriting PATH with Ubuntu's stock value. Writing /etc/environment directly
+# is what actually sticks; ~/.ssh/environment is kept too as a fallback for
+# systems where PAM isn't in play.
+ssh_path = ":".join(filter(None, [
+    gpu_tool_dir,
+    "/opt/bin",
+    "/usr/local/nvidia/bin",
+    "/usr/local/cuda/bin",
+    "/opt/conda/bin",
+    "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
+    "/usr/games", "/usr/local/games", "/snap/bin",
+]))
+ssh_ld_library_path = ":".join(filter(None, [
+    gpu_lib_dir,
+    "/usr/local/nvidia/lib64",
+    "/usr/local/cuda/lib64",
+]))
+with open("/root/.ssh/environment", "w") as f:
+    f.write(f"PATH={ssh_path}\n")
+    f.write(f"LD_LIBRARY_PATH={ssh_ld_library_path}\n")
+os.chmod("/root/.ssh/environment", 0o600)
+with open("/etc/environment", "w") as f:
+    f.write(f'PATH="{ssh_path}"\n')
+    f.write(f'LD_LIBRARY_PATH="{ssh_ld_library_path}"\n')
+
+pubkey = ""
+for _ in range(150):
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{MASTER_SESSION_ID}-pubkey/raw?poll=1")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            raw = r.read().decode("utf-8").strip()
+            if raw.startswith("ssh-"):
+                pubkey = raw
+                break
+    except Exception:
+        pass
+    time.sleep(2)
+
+if not pubkey:
+    raise RuntimeError("Timed out waiting for the master's SSH public key over ntfy.")
+
+with open("/root/.ssh/authorized_keys", "w") as f:
+    f.write(pubkey + "\n")
+os.chmod("/root/.ssh/authorized_keys", 0o600)
+
+subprocess.Popen([
+    "/usr/sbin/sshd", "-D", "-p", "2222",
+    "-o", "PermitRootLogin=yes",
+    "-o", "PubkeyAuthentication=yes",
+    "-o", "AuthorizedKeysFile=/root/.ssh/authorized_keys",
+    "-o", "PasswordAuthentication=no",
+    "-o", "StrictModes=no",
+    "-o", "AllowTcpForwarding=yes",
+    "-o", "GatewayPorts=yes",
+    "-o", "PermitUserEnvironment=yes",
+    "-o", "TCPKeepAlive=yes",
+    "-o", "ClientAliveInterval=15",
+])
+print("[*] SSH daemon active on port 2222 (master's public key installed).", flush=True)
+
+# 3. Bridge that SSH port back to the master via Chisel over a Cloudflare
+#    quick tunnel -- Kaggle sessions accept no inbound connections and have
+#    no fixed address, so this is how the master reaches this port at all.
+chisel_proc = subprocess.Popen(
+    ["/usr/local/bin/chisel", "server", "--port", "8888", "--reverse"],
+    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+)
+time.sleep(1)
+
+cf_proc = subprocess.Popen(
+    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8888", "--no-autoupdate"],
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+)
+chisel_url = ""
+for line in cf_proc.stdout:
+    clean = line.strip()
+    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
+    if m:
+        chisel_url = m.group(0)
+        break
+
+# 4. Start File Browser on Worker port 8081, tunneled out for the user's own
+#    browser only.
 fb_proc = subprocess.Popen([
     "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8081", "--noauth"
 ])
@@ -98,149 +213,10 @@ for line in cf_fb_proc.stdout:
     m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
     if m:
         worker_files_url = m.group(0)
-        try:
-            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-worker-files", data=worker_files_url.encode("utf-8"))
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
         break
 
-# 2. Setup SSH Daemon and cluster keys
-cluster_priv_key = ""
-try:
-    subprocess.run(["bash", "-c", "which sshd || (apt-get update -qq && apt-get install -y -qq openssh-server)"], check=False)
-    subprocess.run(["bash", "-c", "mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh"], check=False)
-    subprocess.run(["bash", "-c", "ssh-keygen -A"], check=False)
-    
-    subprocess.run(["bash", "-c", "echo 'PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' >> /etc/environment"], check=False)
-    subprocess.run(["bash", "-c", "echo 'export PATH=/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH' >> /root/.bashrc"], check=False)
-    
-    key_path = "/root/.ssh/cluster_key"
-    if not os.path.exists(key_path):
-        subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", "compute-pool-cluster"], check=True)
-    subprocess.run(["bash", "-c", f"cat {key_path}.pub >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"], check=True)
-    
-    with open(key_path, "r") as f:
-        cluster_priv_key = f.read().strip()
-    
-    subprocess.Popen([
-        "/usr/sbin/sshd", "-D", "-p", "2222",
-        "-o", "PermitRootLogin=yes",
-        "-o", "PubkeyAuthentication=yes",
-        "-o", "AuthorizedKeysFile=/root/.ssh/authorized_keys",
-        "-o", "PasswordAuthentication=no",
-        "-o", "StrictModes=no",
-        "-o", "AllowTcpForwarding=yes",
-        "-o", "GatewayPorts=yes",
-        "-o", "PermitUserEnvironment=yes",
-        "-o", "TCPKeepAlive=yes",
-        "-o", "ClientAliveInterval=15"
-    ])
-    print("[*] SSH daemon active on port 2222.", flush=True)
-except Exception as e:
-    print(f"[!] SSH setup notice: {e}", flush=True)
-
-# 3. HTTP Worker & Exec Daemon on port 8889
-class WorkerExecHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "OK", "node": NODE_LABEL}).encode("utf-8"))
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        if self.path == "/exec":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode("utf-8")
-            try:
-                data = json.loads(body)
-                cmd = data.get("cmd", "")
-                env = os.environ.copy()
-                env.update(data.get("env", {}))
-                proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=env)
-                resp = {"exit_code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}
-            except Exception as e:
-                resp = {"exit_code": 1, "stdout": "", "stderr": str(e)}
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(json.dumps(resp).encode("utf-8"))
-        elif self.path == "/stop":
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
-            def _die():
-                time.sleep(0.5)
-                os.system("pkill -9 -f cloudflared; pkill -9 -f chisel; kill -9 -1")
-            threading.Thread(target=_die).start()
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def log_message(self, format, *args):
-        pass
-
-class ThreadedTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-httpd = ThreadedTCPServer(("0.0.0.0", 8889), WorkerExecHandler)
-threading.Thread(target=httpd.serve_forever, daemon=True).start()
-
-# 4. Start Chisel Server on port 8888 for bidirectional TCP bridging
-chisel_proc = subprocess.Popen(
-    ["/usr/local/bin/chisel", "server", "--port", "8888", "--reverse"],
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL
-)
-time.sleep(1)
-
-# 5. Expose Chisel server via Cloudflare tunnel
-cf_proc = subprocess.Popen(
-    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8888", "--no-autoupdate"],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True
-)
-
-chisel_tunnel_url = ""
-for line in cf_proc.stdout:
-    clean = line.strip()
-    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
-    if m:
-        chisel_tunnel_url = m.group(0)
-        break
-
-# 6. Expose HTTP Exec server via second Cloudflare tunnel
-cf_http_proc = subprocess.Popen(
-    ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8889", "--no-autoupdate"],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-    text=True
-)
-
-http_tunnel_url = ""
-for line in cf_http_proc.stdout:
-    clean = line.strip()
-    m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
-    if m:
-        http_tunnel_url = m.group(0)
-        break
-
-# 7. Publish connection payload to ntfy for Master
-payload = json.dumps({
-    "status": "READY",
-    "node": NODE_LABEL,
-    "chisel_url": chisel_tunnel_url,
-    "http_url": http_tunnel_url,
-    "files_url": worker_files_url,
-    "ssh_key": cluster_priv_key
-})
-
+# 5. Publish this worker's tunnel URLs for the master to pick up.
+payload = json.dumps({"chisel_url": chisel_url, "files_url": worker_files_url})
 for _ in range(5):
     try:
         req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=payload.encode("utf-8"))
@@ -248,10 +224,15 @@ for _ in range(5):
         break
     except Exception:
         time.sleep(2)
+try:
+    req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-files", data=worker_files_url.encode("utf-8"))
+    urllib.request.urlopen(req, timeout=10)
+except Exception:
+    pass
 
-print(f"[*] Worker registered. Chisel: {chisel_tunnel_url}, Files: {worker_files_url}", flush=True)
+print(f"[*] Worker registered. Chisel: {chisel_url}, Files: {worker_files_url}", flush=True)
 
-# 8. Keep worker alive until STOP signal
+# 6. Keep worker alive until STOP signal
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
     try:
@@ -265,6 +246,7 @@ for _ in range(int(DURATION_MINUTES * 60 / 3)):
 
 subprocess.run(["pkill", "-9", "-f", "cloudflared"], check=False)
 subprocess.run(["pkill", "-9", "-f", "chisel"], check=False)
+subprocess.run(["pkill", "-9", "-f", "sshd"], check=False)
 subprocess.run(["kill", "-9", "-1"], check=False)
 sys.exit(0)
 "#;
@@ -379,24 +361,48 @@ sys.exit(0)
 "#;
 
 pub const MASTER_BOOTSTRAP_TEMPLATE: &str = r#"
+import json
 import os
+import re
 import subprocess
 import sys
-import time
-import re
-import urllib.request
-import json
 import threading
-import shutil
+import time
+import traceback
+import urllib.request
 
 SESSION_ID = "__SESSION_ID__"
-WORKER_SESSION_ID = "__WORKER_SESSION_ID__"
+WORKER_SESSIONS = __WORKER_SESSIONS__
 DURATION_MINUTES = __DURATION_MINUTES__
 NODE_LABEL = "cluster-master"
+REGISTRY_PATH = "/etc/compute-pool/nodes.json"
+SSH_PORT_BASE = 2200
+PEER_WAIT_SECONDS = 900
+HEALTH_INTERVAL_SECONDS = 30
+HEALTH_FAILURES_BEFORE_DOWN = 3
 
-print("[*] Initializing Compute Pool Master GPU Terminal (4x Tesla T4 Cluster)...", flush=True)
+print(f"[*] Initializing Compute Pool Master GPU Terminal ({len(WORKER_SESSIONS) + 1} nodes)...", flush=True)
 
-# 1. Download core binaries: ttyd, filebrowser, cloudflared, chisel
+def report_failure(exc_type, exc, tb):
+    text = "".join(traceback.format_exception(exc_type, exc, tb))[-3000:]
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-error", data=text.encode("utf-8"))
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc, tb)
+
+sys.excepthook = report_failure
+
+def notify(topic, text):
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{topic}", data=text.encode("utf-8"))
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+# 1. Download ttyd, filebrowser, cloudflared, chisel -- ttyd/filebrowser/cloudflared
+#    serve the user's own browser; chisel carries the node-to-node SSH fabric.
 subprocess.run([
     "bash", "-c",
     "curl -sL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd"
@@ -414,447 +420,363 @@ subprocess.run([
     "curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz | gzip -d > /usr/local/bin/chisel && chmod +x /usr/local/bin/chisel"
 ], check=False)
 
-# 2. Setup crun (cluster runner) script - parallel multi-node command executor
-crun_script = '''#!/usr/bin/env python3
-import sys, os, subprocess, concurrent.futures, shlex
+# 2. Generate the cluster SSH keypair here. The private half never leaves this
+#    machine; only the public half is published for the workers to trust.
+key_path = "/root/.ssh/cluster_key"
+os.makedirs("/root/.ssh", mode=0o700, exist_ok=True)
+if not os.path.exists(key_path):
+    subprocess.run(["ssh-keygen", "-t", "ed25519", "-N", "", "-f", key_path, "-C", "compute-pool-cluster"], check=True)
+with open(f"{key_path}.pub") as f:
+    pubkey = f.read().strip()
 
-if len(sys.argv) < 2:
-    print("Usage: crun <command> [args...]")
-    print("Example: crun nvidia-smi")
-    print("Example: crun python3 train.py")
-    print("Example: crun \\"pip install tabfm\\"")
+def publish_pubkey():
+    for _ in range(100):
+        notify(f"{SESSION_ID}-pubkey", pubkey)
+        time.sleep(3)
+
+threading.Thread(target=publish_pubkey, daemon=True).start()
+
+with open("/root/.ssh/config", "w") as f:
+    for i in range(1, len(WORKER_SESSIONS) + 1):
+        f.write(f"Host node{i}\n")
+        f.write("    HostName 127.0.0.1\n")
+        f.write(f"    Port {SSH_PORT_BASE + i}\n")
+        f.write("    User root\n")
+        f.write(f"    IdentityFile {key_path}\n")
+        f.write("    StrictHostKeyChecking no\n")
+        f.write("    UserKnownHostsFile /dev/null\n")
+        f.write("    LogLevel ERROR\n")
+os.chmod("/root/.ssh/config", 0o600)
+
+# 3. Cluster registry: the single source of truth every cluster tool reads.
+#    node0 is this master; node1..nodeN are the workers, filled in as they peer.
+os.makedirs("/etc/compute-pool", exist_ok=True)
+state_lock = threading.RLock()
+nodes = []
+
+def count_gpus(smi_output):
+    return sum(1 for line in smi_output.splitlines() if line.startswith("GPU "))
+
+def write_registry():
+    with state_lock:
+        tmp = REGISTRY_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(json.dumps({"nodes": nodes}))
+        os.replace(tmp, REGISTRY_PATH)
+
+def update_node(name, **fields):
+    with state_lock:
+        for n in nodes:
+            if n["name"] == name:
+                n.update(fields)
+        write_registry()
+
+try:
+    local_gpu_count = count_gpus(subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True).stdout)
+except FileNotFoundError:
+    local_gpu_count = 0
+nodes.append({"name": "node0", "index": 0, "local": True, "gpus": local_gpu_count, "status": "online", "error": "", "fails": 0})
+for i in range(1, len(WORKER_SESSIONS) + 1):
+    nodes.append({"name": f"node{i}", "index": i, "local": False, "gpus": 0, "status": "pending", "error": "", "fails": 0})
+write_registry()
+
+def ssh_run(name, cmd, timeout=10):
+    try:
+        res = subprocess.run(
+            ["ssh", "-o", f"ConnectTimeout={timeout}", "-o", "BatchMode=yes", name, cmd],
+            capture_output=True, text=True, timeout=timeout + 5,
+        )
+        return res.returncode, res.stdout
+    except Exception as exc:
+        return -1, str(exc)
+
+def peer_worker(index, session_id):
+    name = f"node{index}"
+    worker = None
+    deadline = time.time() + PEER_WAIT_SECONDS
+    while worker is None and time.time() < deadline:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{session_id}/raw?poll=1"), timeout=5) as r:
+                raw = r.read().decode("utf-8").strip()
+                if raw.startswith("{") and "chisel_url" in raw:
+                    worker = json.loads(raw)
+        except Exception:
+            pass
+        if worker is None:
+            time.sleep(3)
+    if worker is None:
+        update_node(name, status="failed", error="worker never registered (check its error topic)")
+        return
+    subprocess.Popen(
+        ["/usr/local/bin/chisel", "client", "--keepalive", "10s", worker["chisel_url"], f"{SSH_PORT_BASE + index}:127.0.0.1:2222"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    rc, out = -1, ""
+    for _ in range(30):
+        rc, out = ssh_run(name, "nvidia-smi -L")
+        if rc == 0:
+            break
+        time.sleep(3)
+    if rc != 0:
+        update_node(name, status="failed", error="tunnel is up but SSH to the worker failed")
+        return
+    update_node(name, status="online", gpus=count_gpus(out), error="", files_url=worker.get("files_url", ""), fails=0)
+    print(f"[*] {name} online ({count_gpus(out)} GPUs)", flush=True)
+
+def health_loop():
+    while True:
+        time.sleep(HEALTH_INTERVAL_SECONDS)
+        with state_lock:
+            targets = [n["name"] for n in nodes if not n["local"] and n["status"] in ("online", "down")]
+        for name in targets:
+            rc, _ = ssh_run(name, "true", timeout=5)
+            went_down = False
+            came_back = False
+            with state_lock:
+                node = next(n for n in nodes if n["name"] == name)
+                if rc == 0:
+                    came_back = node["status"] == "down"
+                    node["fails"] = 0
+                    node["status"] = "online"
+                else:
+                    node["fails"] += 1
+                    if node["status"] == "online" and node["fails"] >= HEALTH_FAILURES_BEFORE_DOWN:
+                        node["status"] = "down"
+                        went_down = True
+                write_registry()
+            if went_down:
+                notify(f"{SESSION_ID}-health", f"{name} is DOWN: no SSH response for {HEALTH_FAILURES_BEFORE_DOWN} checks")
+            if came_back:
+                notify(f"{SESSION_ID}-health", f"{name} recovered")
+
+threading.Thread(target=health_loop, daemon=True).start()
+for i, sid in enumerate(WORKER_SESSIONS, start=1):
+    threading.Thread(target=peer_worker, args=(i, sid), daemon=True).start()
+
+# 4. crun: runs on every online node. Reads the registry on each call, so a node
+#    that goes down drops out of dispatch and comes back when it recovers.
+crun_script = '''#!/usr/bin/env python3
+import concurrent.futures, json, os, shlex, subprocess, sys
+
+REGISTRY = "/etc/compute-pool/nodes.json"
+RENDEZVOUS_ENV = {"MASTER_ADDR": "127.0.0.1", "MASTER_PORT": "29500"}
+
+def print_help():
+    print("Compute Pool Cluster Runner (crun)")
+    print("Usage:")
+    print("  crun <command> [args...]       Run command on every online node")
+    print("  crun --gpus '<command>'        Run one task per online GPU across the cluster")
+    print("  crun -g '<command>'            Shortcut for --gpus")
+    print("")
+    print("Examples:")
+    print("  crun nvidia-smi")
+    print("  crun --gpus 'python3 train.py --fold {task_index}'")
+    print("")
+    print("Placeholders for --gpus mode:")
+    print("  {task_index}  : global task number (0 .. task_count-1)")
+    print("  {gpu_index}   : GPU index on its node")
+    print("  {node_index}  : node number (0 = master)")
+    print("  {task_count}  : total tasks")
+    sys.exit(0)
+
+def load_nodes():
+    with open(REGISTRY) as f:
+        nodes = json.load(f)["nodes"]
+    return [n for n in nodes if n.get("status") == "online"]
+
+def run_remote(name, cmd, env=None, timeout=300):
+    env_str = ""
+    if env:
+        env_str = " ".join(f"export {k}={shlex.quote(str(v))};" for k, v in env.items()) + " "
+    full_cmd = f"cd /kaggle/working 2>/dev/null; {env_str}{cmd}"
+    try:
+        res = subprocess.run(["ssh", "-o", "ConnectTimeout=5", name, full_cmd], capture_output=True, text=True, timeout=timeout)
+        return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"Remote command timed out after {timeout}s"
+    except Exception as e:
+        return -1, "", str(e)
+
+def run_local(cmd, env=None):
+    local_env = os.environ.copy()
+    local_env.update(env or {})
+    res = subprocess.run(cmd, shell=True, executable="/bin/bash", capture_output=True, text=True, env=local_env)
+    return res.returncode, res.stdout, res.stderr
+
+def sync_files(tokens, nodes):
+    for token in tokens:
+        if os.path.isfile(token) and not token.startswith("-"):
+            fname = os.path.basename(token)
+            for n in nodes:
+                if not n["local"]:
+                    subprocess.run(["scp", "-o", "ConnectTimeout=5", token, f"{n['name']}:/kaggle/working/{fname}"], capture_output=True)
+
+def describe(code, out, err):
+    out = (out or "").strip()
+    if err and err.strip():
+        out = out + "\\n[stderr]\\n" + err.strip()
+        out = out.strip()
+    if not out and code == 0:
+        out = "[OK: completed with exit code 0]"
+    elif not out:
+        out = f"[! exited with code {code}]"
+    return out
+
+def run_gpus(template, nodes):
+    tasks = [(n, g) for n in nodes for g in range(n["gpus"])]
+    total = len(tasks)
+    if total == 0:
+        print("No online GPUs in the cluster registry.")
+        return 1
+    sync_files(template.split(), nodes)
+
+    def run_task(item):
+        idx, (n, g) = item
+        cmd = template.format(task_index=idx, gpu_index=g, node_index=n["index"], task_count=total)
+        env = dict(RENDEZVOUS_ENV, CUDA_VISIBLE_DEVICES=str(g), CP_TASK_INDEX=str(idx), CP_TASK_COUNT=str(total), CP_NODE_INDEX=str(n["index"]), WORLD_SIZE=str(total))
+        if n["local"]:
+            return (idx, n, g) + run_local(cmd, env)
+        return (idx, n, g) + run_remote(n["name"], cmd, env)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=total) as pool:
+        results = list(pool.map(run_task, enumerate(tasks)))
+    failed = 0
+    for idx, n, g, code, out, err in sorted(results, key=lambda r: r[0]):
+        status = "PASSED" if code == 0 else f"FAILED (exit {code})"
+        print(f"=== [Task {idx}: {n['name']} GPU {g}] {status} ===")
+        if out and out.strip():
+            print(out.strip())
+        if err and err.strip():
+            print(err.strip(), file=sys.stderr)
+        print()
+        if code != 0:
+            failed += 1
+    return 1 if failed else 0
+
+def run_broadcast(shell_cmd, nodes):
+    sync_files(shell_cmd.split(), nodes)
+
+    def run_node(n):
+        if n["local"]:
+            return (n,) + run_local(shell_cmd, {"NODE_RANK": "0"})
+        return (n,) + run_remote(n["name"], shell_cmd, {"NODE_RANK": str(n["index"])})
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(nodes)) as pool:
+        results = list(pool.map(run_node, nodes))
+    for n, code, out, err in results:
+        role = "Master" if n["local"] else "Worker"
+        print(f"[{n['name']}: {role} (node {n['index']})]")
+        print(describe(code, out, err))
+        print()
+        print("=" * 80)
+        print()
+    return 0
+
+if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+    print_help()
+
+nodes = load_nodes()
+if not nodes:
+    print("No online nodes in the cluster registry.")
     sys.exit(1)
 
-raw_args = sys.argv[1:]
-if len(raw_args) == 1:
-    shell_cmd = raw_args[0]
-else:
-    shell_cmd = " ".join(raw_args)
+if sys.argv[1] in ("--gpus", "-g", "--dispatch"):
+    if len(sys.argv) < 3:
+        print("Usage: crun --gpus '<command template>'")
+        print("Example: crun --gpus 'python3 train.py --fold {task_index}'")
+        sys.exit(1)
+    sys.exit(run_gpus(" ".join(sys.argv[2:]), nodes))
 
-# Auto-sync referenced local files to Node 1 if needed
-for token in shell_cmd.split():
-    if os.path.isfile(token) and not token.startswith("-"):
-        fname = os.path.basename(token)
-        subprocess.run(["scp", "-o", "ConnectTimeout=3", token, f"node1:/kaggle/working/{fname}"], capture_output=True)
-
-def run_local():
-    env = os.environ.copy()
-    env["NODE_RANK"] = "0"
-    try:
-        res = subprocess.run(shell_cmd, shell=True, executable="/bin/bash", capture_output=True, text=True, env=env)
-        out = (res.stdout or "").strip()
-        if res.stderr:
-            out = (out + "\\n[stderr]\\n" + res.stderr.strip()).strip()
-    except Exception as exc:
-        return f"[Node 0: Master (Slot 1 - GPUs 0, 1)]\\n[! Runner error: {exc}]"
-    if not out and res.returncode == 0:
-        out = "[✓ Completed successfully (Exit Code 0)]"
-    elif not out:
-        out = f"[! Exited with code {res.returncode}]"
-    return f"[Node 0: Master (Slot 1 - GPUs 0, 1)]\\n{out}"
-
-def run_remote():
-    remote_exec = f"export NODE_RANK=1; {shell_cmd}"
-    try:
-        res = subprocess.run(["ssh", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=10", "node1", f"bash -c {shlex.quote(remote_exec)}"], capture_output=True, text=True, timeout=180)
-    except subprocess.TimeoutExpired:
-        return "[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n[! Remote command timed out after 180 seconds]"
-    except Exception as exc:
-        return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n[! Runner error: {exc}]"
-    if res.returncode == 0 or (res.stdout and "Connection refused" not in res.stderr):
-        out = (res.stdout or "").strip()
-        if res.stderr:
-            out = (out + "\\n[stderr]\\n" + res.stderr.strip()).strip()
-        if not out and res.returncode == 0:
-            out = "[✓ Completed successfully (Exit Code 0)]"
-        elif not out:
-            out = f"[! Exited with code {res.returncode}]"
-        return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out}"
-    # Fallback to worker-exec HTTP daemon
-    res = subprocess.run(["/usr/local/bin/worker-exec", remote_exec], capture_output=True, text=True)
-    out = (res.stdout or "").strip()
-    if res.stderr:
-        out = (out + "\\n[stderr]\\n" + res.stderr.strip()).strip()
-    if not out and res.returncode == 0:
-        out = "[✓ Completed successfully (Exit Code 0)]"
-    elif not out:
-        out = f"[! Exited with code {res.returncode}]"
-    return f"[Node 1: Worker (Slot 2 - GPUs 2, 3)]\\n{out}"
-
-with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
-    f0 = ex.submit(run_local)
-    f1 = ex.submit(run_remote)
-    out0 = f0.result()
-    out1 = f1.result()
-
-print(out0)
-print("\\n" + "="*80 + "\\n")
-print(out1)
+sys.exit(run_broadcast(" ".join(sys.argv[1:]), nodes))
 '''
 with open("/usr/local/bin/crun", "w") as f:
     f.write(crun_script)
 os.chmod("/usr/local/bin/crun", 0o755)
 
-# 3. Setup worker-exec (HTTP fallback runner)
-worker_exec_script = '''#!/usr/bin/env python3
-import sys, urllib.request, json, os
-
-cmd = " ".join(sys.argv[1:])
-if not cmd:
-    sys.exit(0)
-
-worker_url = ""
-if os.path.exists("/kaggle/working/.cluster_worker_url"):
-    with open("/kaggle/working/.cluster_worker_url") as f:
-        worker_url = f.read().strip()
-
-if not worker_url:
-    sys.stderr.write("Worker node not yet peered.\\n")
-    sys.exit(1)
-
-try:
-    req = urllib.request.Request(
-        f"{worker_url}/exec",
-        data=json.dumps({"cmd": cmd}).encode("utf-8"),
-        headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=30) as r:
-        resp = json.loads(r.read().decode("utf-8"))
-        if resp.get("stdout"):
-            sys.stdout.write(resp["stdout"])
-        if resp.get("stderr"):
-            sys.stderr.write(resp["stderr"])
-        sys.exit(resp.get("exit_code", 0))
-except Exception as e:
-    sys.stderr.write(f"Remote exec error: {e}\\n")
-    sys.exit(1)
+# 5. cp-dispatch: shortcut for crun --gpus
+cp_dispatch_script = '''#!/bin/bash
+exec /usr/local/bin/crun --gpus "$@"
 '''
-with open("/usr/local/bin/worker-exec", "w") as f:
-    f.write(worker_exec_script)
-os.chmod("/usr/local/bin/worker-exec", 0o755)
+with open("/usr/local/bin/cp-dispatch", "w") as f:
+    f.write(cp_dispatch_script)
+os.chmod("/usr/local/bin/cp-dispatch", 0o755)
 
-# 4. Setup cluster-status script
+# 6. cluster-status: reads the registry, so it reports the health loop's view.
 status_script = '''#!/usr/bin/env python3
-import subprocess, sys
+import json
+
+REGISTRY = "/etc/compute-pool/nodes.json"
+nodes = json.load(open(REGISTRY))["nodes"]
+online_gpus = sum(n.get("gpus", 0) for n in nodes if n.get("status") == "online")
 
 print("+----------------------------------------------------------------------+")
-print("|            Compute Pool 4-GPU Cluster Infrastructure Status          |")
+print("|                 Compute Pool GPU Cluster Status                      |")
 print("+----------------------------------------------------------------------+")
-try:
-    smi = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], text=True).strip()
-    gpus_node0 = [l.strip() for l in smi.splitlines() if l.strip()]
-    print(f"[*] Node 0 (Master, Slot 1): Online ({len(gpus_node0)} GPUs: {', '.join(gpus_node0)})")
-except Exception as e:
-    print(f"[!] Node 0 (Master, Slot 1): Query failed ({e})")
-
-try:
-    res = subprocess.run(["ssh", "-o", "ConnectTimeout=3", "node1", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"], capture_output=True, text=True, timeout=5)
-    if res.returncode == 0 and res.stdout.strip():
-        gpus_node1 = [l.strip() for l in res.stdout.strip().splitlines() if l.strip()]
-        print(f"[*] Node 1 (Worker, Slot 2): Online ({len(gpus_node1)} GPUs: {', '.join(gpus_node1)})")
-        print(f"[*] Inter-Node Fabric: Active (SSH & Bidirectional Network Bridge)")
-    else:
-        # Check HTTP fallback
-        res_http = subprocess.run(["/usr/local/bin/worker-exec", "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"], capture_output=True, text=True, timeout=5)
-        if res_http.returncode == 0 and res_http.stdout.strip():
-            gpus_node1 = [l.strip() for l in res_http.stdout.strip().splitlines() if l.strip()]
-            print(f"[*] Node 1 (Worker, Slot 2): Online ({len(gpus_node1)} GPUs: {', '.join(gpus_node1)})")
-            print(f"[*] Inter-Node Fabric: Active (HTTP RPC Bridge)")
-        else:
-            print("[!] Node 1 (Worker, Slot 2): Connecting to cluster...")
-except Exception as e:
-    print(f"[!] Node 1 (Worker, Slot 2): Connecting ({e})")
-
-# LUPINE GPU fabric status
-try:
-    import socket as _s
-    lupine_node0_up = False
-    lupine_node1_up = False
-    for port, label in [(14833, "node0"), (14834, "node1")]:
-        try:
-            c = _s.create_connection(("127.0.0.1", port), timeout=1)
-            c.close()
-            if label == "node0": lupine_node0_up = True
-            else: lupine_node1_up = True
-        except Exception:
-            pass
-    if lupine_node0_up or lupine_node1_up:
-        both = lupine_node0_up and lupine_node1_up
-        gpus_up = (2 if lupine_node0_up else 0) + (2 if lupine_node1_up else 0)
-        status = "Active" if both else "Partial"
-        print(f"[*] LUPINE GPU Fabric: {status} ({gpus_up}/4 GPUs via IP fabric)")
-        print(f"    Node 0 :14833 -> {'UP' if lupine_node0_up else 'DOWN'}   Node 1 :14834 -> {'UP' if lupine_node1_up else 'DOWN'}")
-    else:
-        print("[*] LUPINE GPU Fabric: Inactive (run: enable-lupine)")
-except Exception:
-    print("[*] LUPINE GPU Fabric: Unknown")
-
+for n in nodes:
+    role = "Master" if n.get("local") else "Worker"
+    status = n.get("status", "unknown")
+    mark = "*" if status == "online" else "!"
+    line = f"[{mark}] {n['name']} ({role}): {status}, {n.get('gpus', 0)} GPUs"
+    if n.get("error"):
+        line += f" -- {n['error']}"
+    print(line)
+print(f"[*] Online GPUs in cluster: {online_gpus}")
 print("+----------------------------------------------------------------------+")
 print("Cluster Tools & Commands:")
-print("  • nvidia-smi        -> Real local GPU telemetry (Node 0)")
-print("  • ssh node1         -> Direct SSH shell into Worker (Node 1)")
-print("  • crun <command>    -> Parallel execution across all 4 GPUs")
-print("  • enable-lupine     -> Initialize LUPINE GPU-over-IP fabric (4 GPUs via IP)")
-print("  • enable-ray        -> Initialize unified Ray Cluster across all 4 GPUs")
-print("  • enable-pytorch    -> Setup PyTorch multi-node rendezvous")
-print("  • enable-deepspeed  -> Configure DeepSpeed multi-node hostfile")
-print("  • lupine-env <cmd>  -> Run any CUDA program through LUPINE fabric")
+print("  • nvidia-smi              -> Local GPU telemetry (master)")
+print("  • ssh node1               -> Shell on worker node1 (node<N> for others)")
+print("  • crun <command>          -> Run command on every online node")
+print("  • crun --gpus '<command>' -> Run one task per online GPU")
+print("  • cp-dispatch '<command>' -> Shortcut for crun --gpus")
+print("  • enable-pytorch          -> Set up PyTorch DDP rendezvous over the SSH tunnels")
+print("  • stop                    -> Terminate cluster session")
 print("+----------------------------------------------------------------------+")
 '''
 with open("/usr/local/bin/cluster-status", "w") as f:
     f.write(status_script)
 os.chmod("/usr/local/bin/cluster-status", 0o755)
 
-# 5. Setup helper scripts: enable-ray, enable-pytorch, enable-deepspeed
-ray_script = '''#!/bin/bash
-echo "[*] Initializing Ray Cluster across all 4 GPUs..."
-which ray >/dev/null 2>&1 || (pip install -q "ray[default]" && ssh node1 "pip install -q 'ray[default]'")
-pkill -9 -f ray 2>/dev/null || true
-ssh node1 "pkill -9 -f ray 2>/dev/null || true"
-pkill -9 -f "ssh -f -N -R 6379" 2>/dev/null || true
+# 7. enable-pytorch: rendezvous tunnel to every online worker
+pytorch_script = '''#!/usr/bin/env python3
+import json, subprocess
 
-export RAY_NODE_IP_ADDRESS=127.0.0.1
-ray start --head --node-ip-address=127.0.0.1 --port=6379 --ray-client-server-port=10001 --dashboard-port=8265 --disable-usage-stats --num-gpus=2
-ssh -f -N -o ServerAliveInterval=10 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes -R 6379:127.0.0.1:6379 -R 10001:127.0.0.1:10001 node1
-sleep 1
-ssh node1 "export RAY_NODE_IP_ADDRESS=127.0.0.1; ray start --address=127.0.0.1:6379 --node-ip-address=127.0.0.1 --disable-usage-stats --num-gpus=2"
-echo ""
-echo "[✓] Ray Cluster Active! 4x Tesla T4 GPUs (60 GB Total VRAM) pooled."
-echo "    In Python: import ray; ray.init(address='auto')"
-echo "    Check cluster: ray status"
-'''
-with open("/usr/local/bin/enable-ray", "w") as f:
-    f.write(ray_script)
-os.chmod("/usr/local/bin/enable-ray", 0o755)
+REGISTRY = "/etc/compute-pool/nodes.json"
+nodes = json.load(open(REGISTRY))["nodes"]
+online = [n for n in nodes if n.get("status") == "online"]
+workers = [n["name"] for n in online if not n.get("local")]
+world = sum(n.get("gpus", 0) for n in online)
 
-pytorch_script = '''#!/bin/bash
-set -e
-echo "[*] Initializing PyTorch Distributed Environment..."
-
-# Re-running this helper must replace the old reverse tunnel, not stack another one.
-pkill -f 'ssh.*-R 29500:127.0.0.1:29500' 2>/dev/null || true
-ssh -o ExitOnForwardFailure=yes -f -N \\
-    -o ServerAliveInterval=10 -o ServerAliveCountMax=3 \\
-    -R 29500:127.0.0.1:29500 node1
-
-export MASTER_ADDR=127.0.0.1
-export MASTER_PORT=29500
-export WORLD_SIZE=4
-export CP_MASTER_PORT=29500
-echo "[✓] PyTorch Distributed rendezvous ready on port 29500."
-echo "    Use Gloo for the SSH-tunneled cluster; NCCL requires direct peer networking."
+subprocess.run(["pkill", "-f", "ssh.*-R 29500:127.0.0.1:29500"], check=False)
+for name in workers:
+    res = subprocess.run([
+        "ssh", "-f", "-N", "-o", "ExitOnForwardFailure=yes",
+        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
+        "-R", "29500:127.0.0.1:29500", name,
+    ], capture_output=True, text=True)
+    print(f"[{'ok' if res.returncode == 0 else 'FAILED'}] rendezvous tunnel to {name}")
+print(f"[+] PyTorch rendezvous ready on 127.0.0.1:29500 (WORLD_SIZE={world})")
+print("    Use the gloo backend. crun --gpus exports MASTER_ADDR, MASTER_PORT and WORLD_SIZE to every task.")
 '''
 with open("/usr/local/bin/enable-pytorch", "w") as f:
     f.write(pytorch_script)
 os.chmod("/usr/local/bin/enable-pytorch", 0o755)
 
-deepspeed_script = '''#!/bin/bash
-echo "[*] Setting up DeepSpeed multi-node hostfile..."
-mkdir -p /root/.ssh
-cat << 'EOF' > /root/.ssh/hostfile
-localhost slots=2
-node1 slots=2
-EOF
-cat << 'EOF' > /kaggle/working/hostfile
-localhost slots=2
-node1 slots=2
-EOF
-echo "[✓] DeepSpeed hostfile configured (4 GPU slots across 2 nodes)."
-echo "    Run: deepspeed --hostfile /root/.ssh/hostfile <script.py>"
-'''
-with open("/usr/local/bin/enable-deepspeed", "w") as f:
-    f.write(deepspeed_script)
-os.chmod("/usr/local/bin/enable-deepspeed", 0o755)
-
-# 5b. Setup enable-lupine: GPU-over-IP fabric via LUPINE
-lupine_script = '''#!/bin/bash
-# enable-lupine: Initialize LUPINE GPU-over-IP fabric across all 4 T4 GPUs
-# Prioritizes lupine_driver_server binary and verifies all 4 GPUs before running NCCL test.
-echo "========================================================================"
-echo "  Initializing LUPINE GPU-over-IP Fabric (4x Tesla T4)"
-echo "========================================================================"
-
-# --- Step 1: Locate or compile native lupine_driver_server ---
-rm -rf /opt/lupine 2>/dev/null || true
-LUPINE_BIN=$(find /tmp/lupine-src/build -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null | head -1)
-
-if [ -z "$LUPINE_BIN" ] || [ ! -f "$LUPINE_BIN" ]; then
-    echo "[*] Compiling native lupine_driver_server against local CUDA headers..."
-    apt-get update -qq && apt-get install -y -qq libnghttp2-dev libssl-dev libcurl4-openssl-dev 2>/dev/null || true
-    ln -sf /usr/local/nvidia/lib64/libcuda.so /usr/lib/libcuda.so 2>/dev/null || true
-    ln -sf /usr/local/nvidia/lib64/libcuda.so /usr/lib/x86_64-linux-gnu/libcuda.so 2>/dev/null || true
-
-    if [ ! -d /tmp/lupine-src ]; then
-        git clone https://github.com/lupinemachines/lupine.git /tmp/lupine-src
-    fi
-
-    cd /tmp/lupine-src
-    cmake -B build -DCMAKE_BUILD_TYPE=Release \
-        -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/nvidia/lib64" \
-        -DCMAKE_SHARED_LINKER_FLAGS="-L/usr/local/nvidia/lib64" 2>/dev/null
-    cmake --build build --target lupine_driver_server -j4 2>/dev/null || true
-
-    LUPINE_BIN=$(find /tmp/lupine-src/build -name "lupine_driver_server" -o -name "lupine-server" 2>/dev/null | head -1)
-fi
-
-# Validation 1: lupine_driver_server presence and executable check
-if [ -z "$LUPINE_BIN" ] || [ ! -f "$LUPINE_BIN" ]; then
-    echo "[!] VALIDATION FAILED: lupine_driver_server binary not found or not executable."
-    exit 1
-fi
-chmod +x "$LUPINE_BIN"
-echo "[✓] Validation 1/4 PASSED: Server binary ready ($LUPINE_BIN)"
-
-LUPINE_LIB=$(find /tmp/lupine-src/build \( -name "libcuda.so*" -o -name "libnvidia-ml.so*" \) 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null)
-LUPINE_LIB="${LUPINE_LIB:-/tmp/lupine-src/build/lib}"
-export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/nvidia/lib64:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-
-# --- Step 2: Start LUPINE server on Node 0 ---
-pkill -f "lupine_driver_server" 2>/dev/null || pkill -f "lupine-server" 2>/dev/null || true
-sleep 1
-"$LUPINE_BIN" --port 14833 &
-LUPINE0_PID=$!
-sleep 2
-
-# Validation 2: Server listening on port 14833
-if ! python3 -c "import socket; s=socket.socket(); s.settimeout(2); exit(0 if s.connect_ex(('127.0.0.1', 14833))==0 else 1)" 2>/dev/null; then
-    echo "[!] VALIDATION FAILED: LUPINE server is not listening on port 14833"
-    exit 1
-fi
-echo "[✓] Validation 2/4 PASSED: LUPINE server listening on 127.0.0.1:14833 [pid=$LUPINE0_PID]"
-
-# --- Step 3: Tunnel Node 1 LUPINE server -> local :14834 ---
-pkill -f "ssh.*14834" 2>/dev/null || true
-sleep 1
-ssh -f -N \
-    -o ServerAliveInterval=10 -o ServerAliveCountMax=10 -o TCPKeepAlive=yes \
-    -o ExitOnForwardFailure=no -o StrictHostKeyChecking=no \
-    -L 14834:127.0.0.1:14833 node1 2>/dev/null || true
-echo "[*] Tunnel established: Node 1 -> local :14834"
-
-# --- Step 4: Environment & Client Setup ---
-export LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834
-
-cat > /opt/lupine/env.sh << 'ENVEOF'
-export LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834
-export LD_LIBRARY_PATH=/opt/lupine/lib:/tmp/lupine-src/build/lib:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}
-ENVEOF
-
-# Validation 3: nvidia-smi -L sees GPUs
-echo "[*] Testing nvidia-smi -L under LUPINE environment..."
-DETECTED_SMI=$(nvidia-smi -L 2>&1 | wc -l)
-echo "[✓] Validation 3/4: nvidia-smi reports $DETECTED_SMI device lines"
-
-# Validation 4: PyTorch sees 4 GPUs
-TORCH_GPUS=$(python3 -c "import torch; print(torch.cuda.device_count())" 2>/dev/null || echo "0")
-if [ "$TORCH_GPUS" -ne 4 ]; then
-    echo "[!] VALIDATION FAILED: PyTorch detected $TORCH_GPUS GPUs, expected 4"
-    echo "    Stopping before NCCL test until fabric visibility is verified."
-    exit 1
-fi
-echo "[✓] Validation 4/4 PASSED: PyTorch confirmed 4 CUDA devices active!"
-
-# --- Step 5: Run real 4-rank NCCL all_reduce test ---
-echo ""
-echo "========================================================================"
-echo "  All Validations Passed! Executing 4-Rank NCCL all_reduce Test..."
-echo "========================================================================"
-
-cat > /kaggle/working/nccl_allreduce_test.py << 'PYEOF'
-#!/usr/bin/env python3
-"""4-GPU LUPINE fabric verification. Run: lupine-env python3 /kaggle/working/nccl_allreduce_test.py"""
-import os, sys, time, torch
-
-def main():
-    n = torch.cuda.device_count()
-    print(f"[*] CUDA devices: {n}")
-    for i in range(n):
-        p = torch.cuda.get_device_properties(i)
-        print(f"    GPU {i}: {p.name} ({p.total_memory//1024**3} GB)")
-    if n < 4:
-        print(f"[!] Got {n} GPUs, expected 4. Run enable-lupine first."); sys.exit(1)
-    print(f"[OK] {n}/4 GPUs visible via LUPINE fabric")
-    tensors = [torch.ones(4096, device=f"cuda:{i}") * float(i+1) for i in range(n)]
-    print("[*] Cross-GPU copy test...")
-    for i in range(n):
-        j = (i+1) % n
-        dst = tensors[i].to(f"cuda:{j}")
-        torch.cuda.synchronize(j)
-        assert abs(dst.sum().item() - tensors[i].sum().item()) < 1, f"copy {i}->{j} FAIL"
-        print(f"    [OK] cuda:{i} -> cuda:{j}")
-    print("[*] Simulated all_reduce...")
-    expected = float(sum(range(1, n+1)) * 4096)
-    for i in range(n):
-        t = sum(tensors[j].to(f"cuda:{i}") for j in range(n))
-        torch.cuda.synchronize(i)
-        assert abs(t.sum().item() - expected) < 1, f"reduce GPU{i} FAIL"
-        print(f"    [OK] GPU {i}: {t.sum().item():.0f}")
-    print(f"\n[OK] 4-GPU LUPINE fabric VERIFIED")
-    print(f"     LUPINE_SERVER={os.environ.get('LUPINE_SERVER','not set')}")
-    print(f"     Next: lupine-env torchrun --nproc_per_node={n} train.py")
-if __name__ == "__main__":
-    main()
-PYEOF
-chmod +x /kaggle/working/nccl_allreduce_test.py
-python3 /kaggle/working/nccl_allreduce_test.py
-'''
-with open("/usr/local/bin/enable-lupine", "w") as f:
-    f.write(lupine_script)
-os.chmod("/usr/local/bin/enable-lupine", 0o755)
-
-# 5c. Setup lupine-env: wrapper that injects LUPINE env vars into any CUDA program
-lupine_env_script = '''#!/bin/bash
-# lupine-env: Run any command with the LUPINE GPU-over-IP environment active
-# Usage: lupine-env python3 train.py
-#        lupine-env torchrun --nproc_per_node=4 train.py
-#        lupine-env nvidia-smi -L
-if [ $# -eq 0 ]; then
-    echo "Usage: lupine-env <command> [args...]"
-    echo "Example: lupine-env python3 train.py"
-    echo "Example: lupine-env nvidia-smi -L"
-    echo ""
-    echo "Environment injected:"
-    echo "  LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834"
-    echo "  LD_LIBRARY_PATH=/opt/lupine/lib:/usr/local/cuda/lib64:..."
-    exit 0
-fi
-LUPINE_LIB=$(find /opt/lupine -name "libcuda.so*" -o -name "libnvidia-ml.so*" 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null || echo "/opt/lupine/lib")
-export LUPINE_SERVER=127.0.0.1:14833,127.0.0.1:14834
-export LD_LIBRARY_PATH="${LUPINE_LIB}:/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
-exec "$@"
-'''
-with open("/usr/local/bin/lupine-env", "w") as f:
-    f.write(lupine_env_script)
-os.chmod("/usr/local/bin/lupine-env", 0o755)
-
-# 6. Setup stop script
 stop_script = '''#!/bin/bash
-if [ -f /kaggle/working/.cluster_worker_url ]; then
-    WURL=$(cat /kaggle/working/.cluster_worker_url)
-    if [ -n "$WURL" ]; then
-        curl -s "$WURL/stop" >/dev/null 2>&1
-    fi
-fi
 kill -9 -1
 '''
 with open("/usr/local/bin/stop", "w") as f:
     f.write(stop_script)
 os.chmod("/usr/local/bin/stop", 0o755)
 
-# 7. Configure shell environment (.bashrc) - NEVER ALIAS nvidia-smi
 with open(os.path.expanduser("~/.bashrc"), "a") as f:
-    f.write("\nexport PATH=/usr/local/bin:$PATH\n")
-    f.write("export MASTER_ADDR=127.0.0.1\n")
-    f.write("export MASTER_PORT=29500\n")
-    f.write("export WORLD_SIZE=2\n")
-    f.write("export CLUSTER_NODES=2\n")
-    f.write("export GPUS_PER_NODE=2\n")
-    f.write("export TOTAL_GPUS=4\n")
-    f.write("export PS1='\\[\\033[01;32m\\]compute-pool@cluster-master\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\n")
+    f.write(f"\nexport PATH=/usr/local/bin:$PATH\n")
+    f.write(f"export PS1='\\[\\033[01;32m\\]compute-pool@{NODE_LABEL}\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ '\n")
+    f.write("alias gpus='nvidia-smi'\n")
+    f.write("alias watch-gpu='watch -n 1 nvidia-smi'\n")
     f.write("alias halt='/usr/local/bin/stop'\n")
     f.write("alias exit='/usr/local/bin/stop'\n")
 
-# 8. Start ttyd Web Terminal and File Browser
+# 8. Web terminal, file manager and their Cloudflare tunnels for the user's browser.
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
     "-t", "enableClipboard=true",
@@ -867,7 +789,6 @@ fb_proc = subprocess.Popen([
 ])
 time.sleep(1)
 
-# 9. Start Cloudflare Tunnel for Web Terminal
 cf_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:7681", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -879,15 +800,9 @@ for line in cf_proc.stdout:
     clean = line.strip()
     m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
     if m:
-        terminal_url = m.group(0)
-        try:
-            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}", data=terminal_url.encode("utf-8"))
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
+        notify(SESSION_ID, m.group(0))
         break
 
-# 10. Start Cloudflare Tunnel for File Browser
 cf_fb_proc = subprocess.Popen(
     ["/usr/local/bin/cloudflared", "tunnel", "--url", "http://127.0.0.1:8080", "--no-autoupdate"],
     stdout=subprocess.PIPE,
@@ -899,75 +814,10 @@ for line in cf_fb_proc.stdout:
     clean = line.strip()
     m = re.search(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", clean)
     if m:
-        files_url = m.group(0)
-        try:
-            req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-files", data=files_url.encode("utf-8"))
-            urllib.request.urlopen(req, timeout=10)
-        except Exception:
-            pass
+        notify(f"{SESSION_ID}-files", m.group(0))
         break
 
-# 11. Inter-Node Discovery & Peering Thread
-def setup_cluster_peering():
-    worker_data = None
-    for _ in range(120):
-        try:
-            req = urllib.request.Request(f"https://ntfy.sh/{WORKER_SESSION_ID}/raw?poll=1")
-            with urllib.request.urlopen(req, timeout=5) as r:
-                raw = r.read().decode("utf-8").strip()
-                if raw.startswith("{") and "chisel_url" in raw:
-                    worker_data = json.loads(raw)
-                    break
-        except Exception:
-            pass
-        time.sleep(3)
-
-    if not worker_data:
-        return
-
-    # Save worker HTTP URL
-    http_url = worker_data.get("http_url", "")
-    if http_url:
-        with open("/kaggle/working/.cluster_worker_url", "w") as f:
-            f.write(http_url)
-
-    # Setup SSH Key
-    ssh_key = worker_data.get("ssh_key", "")
-    if ssh_key:
-        os.makedirs("/root/.ssh", mode=0o700, exist_ok=True)
-        with open("/root/.ssh/cluster_key", "w") as f:
-            f.write(ssh_key + "\n")
-        os.chmod("/root/.ssh/cluster_key", 0o600)
-
-        with open("/root/.ssh/config", "w") as f:
-            f.write("Host node1 worker\n")
-            f.write("    HostName 127.0.0.1\n")
-            f.write("    Port 2222\n")
-            f.write("    User root\n")
-            f.write("    IdentityFile /root/.ssh/cluster_key\n")
-            f.write("    StrictHostKeyChecking no\n")
-            f.write("    UserKnownHostsFile /dev/null\n")
-            f.write("    LogLevel ERROR\n")
-
-    # Connect Chisel Client (bridges port 2222 for SSH - zero port collisions)
-    chisel_url = worker_data.get("chisel_url", "")
-    if chisel_url:
-        subprocess.Popen([
-            "/usr/local/bin/chisel", "client", chisel_url,
-            "2222:127.0.0.1:2222"
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # Notify CLI that peering is established
-    time.sleep(3)
-    try:
-        req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-peered", data=b"PEERED_OK")
-        urllib.request.urlopen(req, timeout=10)
-    except Exception:
-        pass
-
-threading.Thread(target=setup_cluster_peering, daemon=True).start()
-
-# 11. Keep Master alive until STOP signal
+# 9. Keep the master alive until a STOP signal, then tear everything down.
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
     try:
@@ -997,20 +847,17 @@ pub struct ShellInfo {
     pub duration_minutes: u32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterShellInfo {
-    pub master_username: String,
-    pub worker_username: String,
-    pub web_url: String,
-    pub files_url: String,
-    pub worker_files_url: String,
-    pub master_ref: String,
-    pub worker_ref: String,
-    pub duration_minutes: u32,
-}
-
 fn shell_slug_for_slot(slot: usize) -> String {
     format!("interactive-gpu-terminal-s{}", slot)
+}
+
+fn random_suffix() -> String {
+    (0..8)
+        .map(|_| {
+            let chars = b"abcdefghijklmnopqrstuvwxyz0123456789";
+            chars[fastrand::usize(..chars.len())] as char
+        })
+        .collect()
 }
 
 pub async fn launch_gpu_shell(
@@ -1021,12 +868,7 @@ pub async fn launch_gpu_shell(
     let creds = load_credentials(slot)?
         .ok_or_else(|| anyhow::anyhow!("No credentials for slot {}. Run `compute-pool login --slot {}`", slot, slot))?;
 
-    let random_suffix: String = (0..8).map(|_| {
-        let chars = b"abcdefghijklmnopqrstuvwxyz0123456789";
-        chars[fastrand::usize(..chars.len())] as char
-    }).collect();
-
-    let session_id = format!("cp-shell-s{}-{}", slot, random_suffix);
+    let session_id = format!("cp-shell-s{}-{}", slot, random_suffix());
     let slug = shell_slug_for_slot(slot);
 
     // Register job in local state
@@ -1054,7 +896,7 @@ pub async fn launch_gpu_shell(
         .replace("__NODE_LABEL__", &format!("node{}-slot{}", slot - 1, slot));
 
     let client = KaggleClient::new(&creds.username, &creds.key);
-    client.push_kernel(&slug, &script, true, Some("nvidia-tesla-t4")).await
+    client.push_kernel(&slug, &script, true).await
         .context("Failed to push shell kernel to Kaggle")?;
 
     let http_client = reqwest::Client::new();
@@ -1116,209 +958,242 @@ pub async fn launch_gpu_shell(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterNodeInfo {
+    pub node_index: usize,
+    pub slot: usize,
+    pub username: String,
+    pub files_url: String,
+    pub kernel_ref: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterShellInfo {
+    pub web_url: String,
+    pub nodes: Vec<ClusterNodeInfo>,
+    pub duration_minutes: u32,
+}
+
+const DEFAULT_CLUSTER_TIMEOUT_SECS: u64 = 900;
+
+async fn read_ntfy(client: &reqwest::Client, topic: &str) -> String {
+    match client.get(format!("https://ntfy.sh/{}/raw?poll=1", topic)).send().await {
+        Ok(resp) if resp.status().is_success() => resp.text().await.unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+async fn read_ntfy_url(client: &reqwest::Client, topic: &str, re: &Regex) -> String {
+    let text = read_ntfy(client, topic).await;
+    re.find(&text).map(|m| m.as_str().to_string()).unwrap_or_default()
+}
+
+async fn ensure_quota(slot: usize, needed_hours: f64) -> Result<()> {
+    let status = get_account_status(slot).await;
+    if let Some(err) = &status.error {
+        anyhow::bail!("Slot {}: {}", slot, err);
+    }
+    if !status.connected {
+        anyhow::bail!("Slot {} ({}): Kaggle account is not reachable -- check its API key", slot, status.username);
+    }
+    let remaining = status.gpu_hours_remaining();
+    if remaining < needed_hours {
+        anyhow::bail!(
+            "Slot {} ({}): {:.2} GPU hours left, this session needs {:.2}",
+            slot,
+            status.username,
+            remaining,
+            needed_hours
+        );
+    }
+    Ok(())
+}
+
 pub async fn launch_cluster_shell(
+    nodes: usize,
     duration_minutes: u32,
     timeout_seconds: Option<u64>,
 ) -> Result<ClusterShellInfo> {
-    let creds1 = load_credentials(1)?
-        .ok_or_else(|| anyhow::anyhow!("Slot 1 not configured. Run `compute-pool login --slot 1`"))?;
-    let creds2 = load_credentials(2)?
-        .ok_or_else(|| anyhow::anyhow!("Slot 2 not configured. Run `compute-pool login --slot 2`"))?;
+    if nodes < 2 {
+        anyhow::bail!("A cluster needs at least 2 nodes");
+    }
+    if nodes > MAX_ACCOUNT_SLOTS {
+        anyhow::bail!("At most {} nodes are supported (one Kaggle account per node)", MAX_ACCOUNT_SLOTS);
+    }
 
-    let random_suffix: String = (0..8).map(|_| {
-        let chars = b"abcdefghijklmnopqrstuvwxyz0123456789";
-        chars[fastrand::usize(..chars.len())] as char
-    }).collect();
+    let mut creds = Vec::with_capacity(nodes);
+    for slot in 1..=nodes {
+        let c = load_credentials(slot)?.ok_or_else(|| {
+            anyhow::anyhow!("Slot {} not configured. Run `compute-pool login --slot {}`", slot, slot)
+        })?;
+        creds.push(c);
+    }
 
-    let session_master_id = format!("cp-master-{}", random_suffix);
-    let session_worker_id = format!("cp-worker-{}", random_suffix);
+    let needed_hours = duration_minutes as f64 / 60.0;
+    for slot in 1..=nodes {
+        ensure_quota(slot, needed_hours).await?;
+    }
 
-    // Register jobs in local state
-    let mut j_master = Job::new(
-        "job-cluster-master".to_string(),
-        JobSpec {
-            name: "cluster-master-node0".to_string(),
-            script: format!("session_id:{}", session_master_id),
-            gpu: true,
-            gpu_memory_gb: 30.0,
-            max_runtime_hours: (duration_minutes as f64) / 60.0,
-            checkpointable: false,
-            max_retries: 0,
-        },
-    );
-    j_master.state = JobState::Running;
-    j_master.assigned_slot = Some(serde_json::json!(1));
-    j_master.assigned_username = Some(creds1.username.clone());
-    j_master.kaggle_kernel_slug = Some(shell_slug_for_slot(1));
-    upsert_job(&j_master)?;
+    let suffix = random_suffix();
+    let master_id = format!("cp-master-{}", suffix);
+    let worker_ids: Vec<String> = (1..nodes).map(|i| format!("cp-worker{}-{}", i, suffix)).collect();
+    let all_slots: Vec<usize> = (1..=nodes).collect();
 
-    let mut j_worker = Job::new(
-        "job-cluster-worker".to_string(),
-        JobSpec {
-            name: "cluster-worker-node1".to_string(),
-            script: format!("session_id:{}", session_worker_id),
-            gpu: true,
-            gpu_memory_gb: 30.0,
-            max_runtime_hours: (duration_minutes as f64) / 60.0,
-            checkpointable: false,
-            max_retries: 0,
-        },
-    );
-    j_worker.state = JobState::Running;
-    j_worker.assigned_slot = Some(serde_json::json!(2));
-    j_worker.assigned_username = Some(creds2.username.clone());
-    j_worker.kaggle_kernel_slug = Some(shell_slug_for_slot(2));
-    upsert_job(&j_worker)?;
+    for idx in 0..nodes {
+        let slot = idx + 1;
+        let session = if idx == 0 { master_id.clone() } else { worker_ids[idx - 1].clone() };
+        let mut job = Job::new(
+            format!("job-cluster-node{}", idx),
+            JobSpec {
+                name: format!("cluster-node{}", idx),
+                script: format!("session_id:{}", session),
+                gpu: true,
+                gpu_memory_gb: 15.0,
+                max_runtime_hours: needed_hours,
+                checkpointable: false,
+                max_retries: 0,
+            },
+        );
+        job.state = JobState::Running;
+        job.assigned_slot = Some(serde_json::json!(slot));
+        job.assigned_username = Some(creds[idx].username.clone());
+        job.kaggle_kernel_slug = Some(shell_slug_for_slot(slot));
+        upsert_job(&job)?;
+    }
 
     let master_script = MASTER_BOOTSTRAP_TEMPLATE
-        .replace("__SESSION_ID__", &session_master_id)
-        .replace("__WORKER_SESSION_ID__", &session_worker_id)
-        .replace("__DURATION_MINUTES__", &duration_minutes.to_string());
+        .replace("__SESSION_ID__", &master_id)
+        .replace("__DURATION_MINUTES__", &duration_minutes.to_string())
+        .replace("__WORKER_SESSIONS__", &serde_json::to_string(&worker_ids)?);
 
-    let worker_script = WORKER_BOOTSTRAP_TEMPLATE
-        .replace("__SESSION_ID__", &session_worker_id)
-        .replace("__DURATION_MINUTES__", &duration_minutes.to_string());
+    let mut scripts = vec![master_script];
+    for (i, wid) in worker_ids.iter().enumerate() {
+        let node_idx = i + 1;
+        scripts.push(
+            WORKER_BOOTSTRAP_TEMPLATE
+                .replace("__SESSION_ID__", wid)
+                .replace("__DURATION_MINUTES__", &duration_minutes.to_string())
+                .replace("__MASTER_SESSION_ID__", &master_id)
+                .replace("__NODE_LABEL__", &format!("node{}-slot{}", node_idx, node_idx + 1)),
+        );
+    }
 
-    let client1 = KaggleClient::new(&creds1.username, &creds1.key);
-    let client2 = KaggleClient::new(&creds2.username, &creds2.key);
+    let mut pushes = tokio::task::JoinSet::new();
+    for (idx, script) in scripts.into_iter().enumerate() {
+        let slot = idx + 1;
+        let client = KaggleClient::new(&creds[idx].username, &creds[idx].key);
+        let slug = shell_slug_for_slot(slot);
+        let label = if idx == 0 { "master".to_string() } else { format!("worker node{}", idx) };
+        pushes.spawn(async move {
+            client
+                .push_kernel(&slug, &script, true)
+                .await
+                .with_context(|| format!("Failed to push {} kernel", label))
+        });
+    }
+    let mut push_error: Option<anyhow::Error> = None;
+    while let Some(joined) = pushes.join_next().await {
+        match joined {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => push_error = push_error.or(Some(e)),
+            Err(e) => push_error = push_error.or(Some(anyhow::anyhow!("kernel push task failed: {}", e))),
+        }
+    }
+    if let Some(err) = push_error {
+        let _ = stop_slots(&all_slots).await;
+        return Err(err);
+    }
 
-    let slug1 = shell_slug_for_slot(1);
-    let slug2 = shell_slug_for_slot(2);
-    let (m_res, w_res) = tokio::join!(
-        client1.push_kernel(&slug1, &master_script, true, Some("nvidia-tesla-t4")),
-        client2.push_kernel(&slug2, &worker_script, true, Some("nvidia-tesla-t4"))
-    );
-
-    m_res.context("Failed to push Master cluster kernel")?;
-    w_res.context("Failed to push Worker cluster kernel")?;
-
-    let http_client = reqwest::Client::new();
-    let start = Instant::now();
+    let client = reqwest::Client::new();
     let re = Regex::new(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")?;
+    let deadline = Duration::from_secs(timeout_seconds.unwrap_or(DEFAULT_CLUSTER_TIMEOUT_SECS));
+    let start = Instant::now();
+
     let mut web_url = String::new();
-    let mut worker_online = false;
-    let mut cluster_peered = false;
-
-    while match timeout_seconds {
-        Some(t) => start.elapsed() < Duration::from_secs(t),
-        None => true,
-    } {
-        // Poll Master Web Terminal URL
+    let mut ready = vec![false; worker_ids.len()];
+    while start.elapsed() < deadline {
         if web_url.is_empty() {
-            let ntfy_url = format!("https://ntfy.sh/{}/raw?poll=1", session_master_id);
-            if let Ok(resp) = http_client.get(&ntfy_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if let Some(m) = re.find(&text) {
-                            web_url = m.as_str().to_string();
-                        }
-                    }
-                }
+            web_url = read_ntfy_url(&client, &master_id, &re).await;
+        }
+        for (i, wid) in worker_ids.iter().enumerate() {
+            if !ready[i] && read_ntfy(&client, wid).await.contains("chisel_url") {
+                ready[i] = true;
             }
         }
-
-        // Poll Worker Online
-        if !worker_online {
-            let ntfy_w_url = format!("https://ntfy.sh/{}/raw?poll=1", session_worker_id);
-            if let Ok(resp) = http_client.get(&ntfy_w_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if text.contains("READY") || text.contains("chisel_url") {
-                            worker_online = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Poll Peered status
-        if !cluster_peered {
-            let ntfy_p_url = format!("https://ntfy.sh/{}-peered/raw?poll=1", session_master_id);
-            if let Ok(resp) = http_client.get(&ntfy_p_url).send().await {
-                if resp.status().is_success() {
-                    if let Ok(text) = resp.text().await {
-                        if text.contains("PEERED_OK") {
-                            cluster_peered = true;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Both nodes are online and web_url is ready
-        if !web_url.is_empty() && (cluster_peered || worker_online) {
+        if !web_url.is_empty() && ready.iter().all(|r| *r) {
             break;
         }
-
-        tokio::time::sleep(Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 
-    if web_url.is_empty() {
-        anyhow::bail!("Timed out waiting for Master Cluster Web Terminal connection.");
-    }
-
-    let mut files_url = String::new();
-    for _ in 0..5 {
-        let ntfy_files_url = format!("https://ntfy.sh/{}-files/raw?poll=1", session_master_id);
-        if let Ok(resp) = http_client.get(&ntfy_files_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Some(m) = re.find(&text) {
-                        files_url = m.as_str().to_string();
-                        break;
-                    }
-                }
-            }
+    if web_url.is_empty() || ready.iter().any(|r| !*r) {
+        let mut reasons = Vec::new();
+        if web_url.is_empty() {
+            reasons.push("master web terminal did not come online".to_string());
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        for (i, wid) in worker_ids.iter().enumerate() {
+            if ready[i] {
+                continue;
+            }
+            let reported = read_ntfy(&client, &format!("{}-error", wid)).await;
+            let tail: Vec<&str> = reported.trim().lines().rev().take(6).collect();
+            let detail = if tail.is_empty() {
+                "no response (still booting, or crashed before reporting)".to_string()
+            } else {
+                tail.into_iter().rev().collect::<Vec<_>>().join(" | ")
+            };
+            reasons.push(format!("node{} did not come online: {}", i + 1, detail));
+        }
+        let _ = stop_slots(&all_slots).await;
+        anyhow::bail!("Cluster did not come up; stopped all {} accounts. {}", nodes, reasons.join("; "));
     }
 
-    let mut worker_files_url = String::new();
-    for _ in 0..5 {
-        let ntfy_wfiles_url = format!("https://ntfy.sh/{}-worker-files/raw?poll=1", session_worker_id);
-        if let Ok(resp) = http_client.get(&ntfy_wfiles_url).send().await {
-            if resp.status().is_success() {
-                if let Ok(text) = resp.text().await {
-                    if let Some(m) = re.find(&text) {
-                        worker_files_url = m.as_str().to_string();
-                        break;
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
+    let mut node_infos = Vec::with_capacity(nodes);
+    node_infos.push(ClusterNodeInfo {
+        node_index: 0,
+        slot: 1,
+        username: creds[0].username.clone(),
+        files_url: read_ntfy_url(&client, &format!("{}-files", master_id), &re).await,
+        kernel_ref: format!("{}/{}", creds[0].username, shell_slug_for_slot(1)),
+    });
+    for (i, wid) in worker_ids.iter().enumerate() {
+        let slot = i + 2;
+        node_infos.push(ClusterNodeInfo {
+            node_index: i + 1,
+            slot,
+            username: creds[i + 1].username.clone(),
+            files_url: read_ntfy_url(&client, &format!("{}-files", wid), &re).await,
+            kernel_ref: format!("{}/{}", creds[i + 1].username, shell_slug_for_slot(slot)),
+        });
     }
 
     Ok(ClusterShellInfo {
-        master_username: creds1.username.clone(),
-        worker_username: creds2.username.clone(),
         web_url,
-        files_url,
-        worker_files_url,
-        master_ref: format!("{}/{}", creds1.username, shell_slug_for_slot(1)),
-        worker_ref: format!("{}/{}", creds2.username, shell_slug_for_slot(2)),
+        nodes: node_infos,
         duration_minutes,
     })
 }
 
 pub async fn stop_gpu_shell(slot: Option<usize>) -> Result<()> {
-    let slots_to_stop: Vec<usize> = match slot {
+    let slots: Vec<usize> = match slot {
         Some(s) => vec![s],
-        None => vec![1, 2],
+        None => {
+            let mut all: Vec<usize> = load_all_credentials()?.keys().copied().collect();
+            all.sort_unstable();
+            all
+        }
     };
+    stop_slots(&slots).await
+}
 
+async fn stop_slots(slots: &[usize]) -> Result<()> {
     let stop_script = "import sys\nprint('Shell terminated by user.')\nsys.exit(0)\n";
     let http_client = reqwest::Client::new();
     let all_jobs = load_all_jobs().unwrap_or_default();
 
-    for s in slots_to_stop {
-        // Send ntfy STOP signals to any active sessions for this slot
+    for &s in slots {
         for mut j in all_jobs.clone() {
-            let is_slot_match = j.get_slot_number() == Some(s)
-                || j.id.contains(&format!("s{}", s))
-                || (s == 1 && j.id == "job-cluster-master")
-                || (s == 2 && j.id == "job-cluster-worker");
-
+            let is_slot_match = j.get_slot_number() == Some(s);
             if is_slot_match && (j.spec.name.contains("shell") || j.spec.name.contains("cluster")) {
                 if let Some(session_id) = j.spec.script.strip_prefix("session_id:") {
                     let stop_url = format!("https://ntfy.sh/{}-stop", session_id.trim());
@@ -1339,7 +1214,7 @@ pub async fn stop_gpu_shell(slot: Option<usize>) -> Result<()> {
                 "interactive-gpu-session".to_string(),
             ];
             for slug in slugs {
-                let _ = client.push_kernel(&slug, stop_script, false, None).await;
+                let _ = client.push_kernel(&slug, stop_script, false).await;
             }
         }
     }
@@ -1361,5 +1236,32 @@ mod tests {
         assert!(t.contains("SESSION_ID = \"cp-test\""));
         assert!(t.contains("DURATION_MINUTES = 60"));
         assert!(t.contains("NODE_LABEL = \"node0-slot1\""));
+    }
+
+    #[test]
+    fn test_cluster_templates_fill_all_placeholders() {
+        let master = MASTER_BOOTSTRAP_TEMPLATE
+            .replace("__SESSION_ID__", "cp-master-test")
+            .replace("__DURATION_MINUTES__", "60")
+            .replace("__WORKER_SESSIONS__", r#"["cp-worker1-test","cp-worker2-test"]"#);
+
+        assert!(master.contains("SESSION_ID = \"cp-master-test\""));
+        assert!(master.contains(r#"WORKER_SESSIONS = ["cp-worker1-test","cp-worker2-test"]"#));
+        for placeholder in ["__SESSION_ID__", "__WORKER_SESSIONS__", "__DURATION_MINUTES__"] {
+            assert!(!master.contains(placeholder), "unfilled {}", placeholder);
+        }
+
+        let worker = WORKER_BOOTSTRAP_TEMPLATE
+            .replace("__SESSION_ID__", "cp-worker1-test")
+            .replace("__DURATION_MINUTES__", "60")
+            .replace("__MASTER_SESSION_ID__", "cp-master-test")
+            .replace("__NODE_LABEL__", "node1-slot2");
+
+        assert!(worker.contains("SESSION_ID = \"cp-worker1-test\""));
+        assert!(worker.contains("MASTER_SESSION_ID = \"cp-master-test\""));
+        assert!(worker.contains("NODE_LABEL = \"node1-slot2\""));
+        for placeholder in ["__SESSION_ID__", "__MASTER_SESSION_ID__", "__NODE_LABEL__", "__DURATION_MINUTES__"] {
+            assert!(!worker.contains(placeholder), "unfilled {}", placeholder);
+        }
     }
 }

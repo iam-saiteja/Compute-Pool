@@ -3,8 +3,7 @@ use clap::{Args, Parser, Subcommand};
 use colored::*;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
 use compute_pool_core::{
-    auth::{load_credentials, save_credentials, Credentials},
-    distributed::run_distributed_workload,
+    auth::{load_credentials, save_credentials, Credentials, MAX_ACCOUNT_SLOTS},
     job::{Job, JobSpec, JobState},
     kaggle::KaggleClient,
     probe::run_probe,
@@ -22,7 +21,7 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "compute-pool",
-    about = "Compute Pool -- Native High-Performance GPU Cluster & Orchestration Engine",
+    about = "Compute Pool -- Native GPU Task Scheduler",
     version
 )]
 struct Cli {
@@ -66,11 +65,15 @@ enum Commands {
         slot: usize,
     },
 
-    /// Launch live interactive GPU web terminal (Single node or Unified 4-GPU Cluster)
+    /// Launch live interactive GPU web terminal (single node or two-node task cluster)
     Shell {
-        /// Account slot (1, 2) or 'cluster' for 4-GPU unified master-worker session
+        /// Account slot number, or 'cluster' for a multi-node master-worker session
         #[arg(short, long, default_value = "cluster")]
         slot: String,
+
+        /// Number of cluster nodes, one Kaggle account each (cluster mode only)
+        #[arg(short = 'n', long, default_value_t = 2)]
+        nodes: usize,
 
         /// Session duration in minutes (max 120)
         #[arg(short, long, default_value = "120")]
@@ -80,7 +83,7 @@ enum Commands {
         #[arg(long)]
         open: bool,
 
-        /// Connection timeout in seconds (optional; waits indefinitely until online if omitted)
+        /// Seconds to wait for the cluster to come online before giving up (default 900)
         #[arg(long)]
         timeout: Option<u64>,
     },
@@ -93,11 +96,6 @@ enum Commands {
         slot: Option<usize>,
     },
 
-    /// Multi-node distributed GPU training coordinator
-    Distributed {
-        #[command(subcommand)]
-        sub: DistributedSubcommand,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -167,18 +165,6 @@ struct SubmitArgs {
     runtime_hours: f64,
 }
 
-#[derive(Subcommand, Debug)]
-enum DistributedSubcommand {
-    /// Launch PyTorch DDP / multi-node script across 4 GPUs
-    Run {
-        /// Python script path
-        script: PathBuf,
-        /// Job name
-        #[arg(short, long, default_value = "distributed-training")]
-        name: String,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -204,7 +190,7 @@ fn print_welcome_banner() {
     println!();
     println!("{}", "╭────────────────────────────────────────────────────────────────────────╮".cyan());
     println!("{}", "│                     ⚡ Compute Pool GPU Terminal ⚡                     │".bold().cyan());
-    println!("{}", "│      Native Multi-GPU Cluster & Distributed Orchestration Console      │".dimmed().cyan());
+    println!("{}", "│          Native GPU Task Scheduling Console          │".dimmed().cyan());
     println!("{}", "╰────────────────────────────────────────────────────────────────────────╯".cyan());
     println!();
     println!("{}", "Welcome to Compute Pool Interactive Terminal!".bold());
@@ -317,7 +303,7 @@ fn print_help() {
     println!("\n{}", "Compute Pool Interactive Commands:".bold());
     println!("  {}     - Check live remaining GPU & TPU quotas across all accounts", "accounts status".cyan());
     println!("  {}       - List configured account slots", "accounts list".cyan());
-    println!("  {}         - Configure credentials for slot 1 or 2", "login --slot <1|2>".cyan());
+    println!("  {}         - Configure credentials for an account slot (1-{})", "login --slot <N>".cyan(), MAX_ACCOUNT_SLOTS);
     println!("  {}       - Launch unified 4-GPU master-worker web terminal in browser", "shell --open".cyan());
     println!("  {} - Launch single GPU terminal session", "shell --slot <1|2> --open".cyan());
     println!("  {}          - Terminate running shell sessions and release GPU quota", "shell-stop".cyan());
@@ -330,7 +316,6 @@ fn print_help() {
     println!("  {}       - Delete a specific job record", "jobs delete <ID>".cyan());
     println!("  {}          - Re-index all existing jobs sequentially from 0", "jobs reindex".cyan());
     println!("  {}   - Delete all historical job records", "jobs clear --force".cyan());
-    println!("  {} - Run distributed PyTorch script across 4 GPUs", "distributed run <path>".cyan());
     println!("  {}                  - Clear the console screen", "cls / clear".cyan());
     println!("  {}                 - Exit the interactive terminal", "exit / quit".cyan());
     println!();
@@ -360,20 +345,16 @@ async fn execute_command(command: Commands) -> Result<()> {
         }
         Commands::Shell {
             slot,
+            nodes,
             duration,
             open,
             timeout,
         } => {
-            handle_shell(&slot, duration, open, timeout).await?;
+            handle_shell(&slot, nodes, duration, open, timeout).await?;
         }
         Commands::ShellStop { slot } => {
             handle_shell_stop(slot).await?;
         }
-        Commands::Distributed { sub } => match sub {
-            DistributedSubcommand::Run { script, name } => {
-                handle_distributed_run(script, name).await?;
-            }
-        },
     }
     Ok(())
 }
@@ -411,8 +392,8 @@ fn prompt_masked_password(prompt: &str) -> Result<String> {
 }
 
 async fn handle_login(slot: usize, username: Option<String>, key: Option<String>) -> Result<()> {
-    if slot != 1 && slot != 2 {
-        anyhow::bail!("Only Slot 1 and Slot 2 are supported.");
+    if slot == 0 || slot > MAX_ACCOUNT_SLOTS {
+        anyhow::bail!("Slot must be between 1 and {}.", MAX_ACCOUNT_SLOTS);
     }
 
     let u = match username {
@@ -449,7 +430,7 @@ async fn handle_accounts_list() -> Result<()> {
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["Slot", "Username", "Status"]);
 
-    for slot in 1..=2 {
+    for slot in 1..=MAX_ACCOUNT_SLOTS {
         match load_credentials(slot)? {
             Some(creds) => {
                 table.add_row(vec![
@@ -519,42 +500,28 @@ async fn handle_accounts_status() -> Result<()> {
 
     let connected_slots: Vec<_> = statuses.iter().filter(|s| s.connected).collect();
     if !statuses.is_empty() {
+        // Every node runs at the same time, so a cluster hour uses one hour from
+        // each account. The cluster's budget is the account with the least time left.
         if connected_slots.len() == statuses.len() {
-            let total_used: f64 = statuses.iter().map(|s| s.gpu_hours_used()).sum();
-            let total_allowed: f64 = statuses.iter().map(|s| s.gpu_hours_total()).sum();
-            let min_rem: f64 = statuses
-                .iter()
-                .map(|s| s.gpu_hours_remaining())
-                .fold(f64::INFINITY, f64::min);
-            let cluster_gpu_rem = min_rem * 2.0;
+            let wall_used = statuses.iter().map(|s| s.gpu_hours_used()).fold(0.0, f64::max);
+            let wall_total = statuses.iter().map(|s| s.gpu_hours_total()).fold(f64::INFINITY, f64::min);
+            let wall_remaining = statuses.iter().map(|s| s.gpu_hours_remaining()).fold(f64::INFINITY, f64::min);
 
             table.add_row(vec![
                 Cell::new("Cluster").fg(Color::Yellow),
-                Cell::new("2 Nodes (4x GPU)"),
+                Cell::new(format!("{} Nodes, run together", statuses.len())),
                 Cell::new("Connected").fg(Color::Green),
-                Cell::new(format!("{:.2}h", total_used)),
-                Cell::new(format!("{:.2}h (x2 = {:.2}h GPU)", min_rem, cluster_gpu_rem))
-                    .fg(Color::Cyan),
-                Cell::new(format!("{:.1}h", total_allowed)),
-            ]);
-        } else if !connected_slots.is_empty() {
-            let total_used: f64 = connected_slots.iter().map(|s| s.gpu_hours_used()).sum();
-            let total_allowed: f64 = connected_slots.iter().map(|s| s.gpu_hours_total()).sum();
-            table.add_row(vec![
-                Cell::new("Cluster").fg(Color::Yellow),
-                Cell::new(format!("{} Node(s)", connected_slots.len())),
-                Cell::new("Degraded").fg(Color::Yellow),
-                Cell::new(format!("{:.2}h", total_used)),
-                Cell::new("0.00h (Bottleneck)").fg(Color::Yellow),
-                Cell::new(format!("{:.1}h", total_allowed)),
+                Cell::new(format!("{:.2}h", wall_used)),
+                Cell::new(format!("{:.2}h wall-clock", wall_remaining)).fg(Color::Cyan),
+                Cell::new(format!("{:.1}h wall-clock", wall_total)),
             ]);
         } else {
             table.add_row(vec![
                 Cell::new("Cluster").fg(Color::Yellow),
+                Cell::new(format!("{} of {} Nodes connected", connected_slots.len(), statuses.len())),
+                Cell::new("Unavailable").fg(Color::Red),
                 Cell::new("-"),
-                Cell::new("Disconnected").fg(Color::Red),
-                Cell::new("-"),
-                Cell::new("-"),
+                Cell::new("0.00h (a node is disconnected)").fg(Color::Red),
                 Cell::new("-"),
             ]);
         }
@@ -719,7 +686,7 @@ async fn handle_jobs_submit(args: SubmitArgs) -> Result<()> {
         "*".cyan().bold()
     );
     client
-        .push_kernel(&slug, &job.spec.script, job.spec.gpu, Some("nvidia-tesla-t4"))
+        .push_kernel(&slug, &job.spec.script, job.spec.gpu)
         .await?;
 
     let kernel_ref = format!("{}/{}", creds.username, slug);
@@ -900,7 +867,7 @@ async fn handle_jobs_stop(job_id: &str) -> Result<()> {
         if let Ok(Some(creds)) = load_credentials(slot_num) {
             let client = KaggleClient::new(&creds.username, &creds.key);
             let _ = client
-                .push_kernel(s, "import sys\nprint('Terminated by user.')\nsys.exit(0)\n", false, None)
+                .push_kernel(s, "import sys\nprint('Terminated by user.')\nsys.exit(0)\n", false)
                 .await;
         }
     }
@@ -949,29 +916,27 @@ fn handle_jobs_reindex() -> Result<()> {
 
 async fn handle_shell(
     slot_arg: &str,
+    nodes: usize,
     duration: u32,
     open: bool,
     timeout: Option<u64>,
 ) -> Result<()> {
     if slot_arg.eq_ignore_ascii_case("cluster") || slot_arg == "0" {
-        println!("\n{}", "Connecting Unified 4-GPU Cluster...".bold().cyan());
-        println!("{}", "  • Submitting Node 0 (Slot 1, Master) & Node 1 (Slot 2, Worker)...".dimmed());
-        println!("{}", "  • Bootstrapping Chisel TCP bridge & SSH fabric across both nodes...".dimmed());
-        println!("{}", "  • Waiting for both nodes to report online and peered...".dimmed());
+        println!("\n{}", format!("Connecting {}-node GPU task cluster...", nodes).bold().cyan());
+        println!("{}", format!("  • Checking GPU quota on {} accounts...", nodes).dimmed());
+        println!("{}", "  • Submitting master and worker kernels in parallel...".dimmed());
+        println!("{}", "  • Bridging each worker over a Chisel/Cloudflare tunnel...".dimmed());
 
-        let info = launch_cluster_shell(duration, timeout).await?;
-        println!("\n{}", "Compute Pool -- Unified 4-GPU Cluster".bold().green());
-        println!("  Cluster Fabric:        2 Nodes (4x Tesla T4 GPUs) Connected & Peered");
+        let info = launch_cluster_shell(nodes, duration, timeout).await?;
+        println!("\n{}", "Compute Pool -- GPU Task Cluster".bold().green());
+        println!("  Nodes:                 {} (one Kaggle account each)", info.nodes.len());
         println!("  Master Web Terminal:   {}", info.web_url.bold().cyan());
-        if !info.files_url.is_empty() {
-            println!("  Node 0 File Manager:   {}", info.files_url.bold().cyan());
+        for node in &info.nodes {
+            let role = if node.node_index == 0 { "Master" } else { "Worker" };
+            println!("  node{} ({}) files:     {}", node.node_index, role, if node.files_url.is_empty() { "-".to_string() } else { node.files_url.bold().cyan().to_string() });
         }
-        if !info.worker_files_url.is_empty() {
-            println!("  Node 1 File Manager:   {}", info.worker_files_url.bold().cyan());
-        }
-        println!("  Inter-Node SSH:        ssh node1 (from Master terminal)");
         println!("  Cluster Runner:        crun <command> (e.g. crun nvidia-smi)");
-        println!("  Cluster Helpers:       enable-ray, enable-pytorch, enable-deepspeed");
+        println!("  Cluster Dispatcher:    cp-dispatch <command template>");
         println!("  Duration:              {} mins", info.duration_minutes);
         if open {
             let _ = open::that(&info.web_url);
@@ -1002,37 +967,5 @@ async fn handle_shell_stop(slot: Option<usize>) -> Result<()> {
         "{} GPU shell sessions terminated and resources released.",
         "*".green().bold()
     );
-    Ok(())
-}
-
-async fn handle_distributed_run(script: PathBuf, name: String) -> Result<()> {
-    let code = std::fs::read_to_string(&script)
-        .with_context(|| format!("Failed to read script file: {}", script.display()))?;
-
-    println!("\n{}", "Compute Pool -- Multi-Node Distributed Training".bold().cyan());
-    println!("  Script: {}", script.display());
-    println!("  Cluster: 2 Nodes (4x Tesla T4 GPUs total)");
-    println!("{}", "  Dispatching parallel execution across both GPU slots...".dimmed());
-
-    let res = run_distributed_workload(&name, &code, true, 2.0).await?;
-
-    for node in res.node_results {
-        let status_colored = if node.status == "COMPLETE" {
-            node.status.green().bold()
-        } else {
-            node.status.red().bold()
-        };
-        println!("\n{}", format!("--- Node {} (Slot {}: {}) [{}] ---", node.rank, node.slot, node.username, status_colored).bold());
-        for line in node.log.lines().take(40) {
-            println!("  {}", line);
-        }
-    }
-
-    if res.success {
-        println!("\n{} Distributed Job {} finished successfully in {:.1}s!\n", "*".green().bold(), res.job_id, res.elapsed_seconds);
-    } else {
-        println!("\n{} Distributed Job {} failed on one or more nodes.\n", "x".red().bold(), res.job_id);
-    }
-
     Ok(())
 }

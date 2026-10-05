@@ -1,9 +1,9 @@
 """Example PyTorch GPU Workload for Compute Pool.
 
-Submit with:
+Submit to a single GPU slot with:
     compute-pool jobs submit --script examples/train_pytorch.py --name train-mlp --gpu
-Or run distributed across all 4 GPUs:
-    compute-pool distributed run examples/train_pytorch.py
+Or dispatch 4 independent shards across the 2-node cluster (from the `shell --slot cluster` terminal):
+    cp-dispatch "python train_pytorch.py"
 """
 import os
 import time
@@ -11,8 +11,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-rank = int(os.environ.get("CP_NODE_RANK", "0"))
-world_size = int(os.environ.get("CP_WORLD_SIZE", "1"))
+rank = int(os.environ.get("CP_TASK_INDEX", "0"))
+world_size = int(os.environ.get("CP_TASK_COUNT", "1"))
 user = os.environ.get("KAGGLE_USERNAME", "local")
 
 print("==================================================")

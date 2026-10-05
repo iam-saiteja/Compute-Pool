@@ -139,7 +139,7 @@ pub async fn run_probe(slot: usize) -> Result<GPUInfo> {
 
     let client = KaggleClient::new(&creds.username, &creds.key);
     client
-        .push_kernel(PROBE_SLUG, PROBE_CODE, true, Some("nvidia-tesla-t4"))
+        .push_kernel(PROBE_SLUG, PROBE_CODE, true)
         .await
         .context("Failed to push probe kernel to Kaggle")?;
 

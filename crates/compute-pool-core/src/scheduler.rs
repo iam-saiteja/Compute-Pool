@@ -109,8 +109,10 @@ pub async fn get_account_status(slot: usize) -> AccountStatus {
 }
 
 pub async fn get_all_statuses() -> Vec<AccountStatus> {
-    let mut results = Vec::new();
-    for slot in 1..=2 {
+    let mut slots: Vec<usize> = crate::auth::load_all_credentials().unwrap_or_default().keys().copied().collect();
+    slots.sort_unstable();
+    let mut results = Vec::with_capacity(slots.len());
+    for slot in slots {
         results.push(get_account_status(slot).await);
     }
     results

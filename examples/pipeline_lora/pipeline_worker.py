@@ -23,7 +23,6 @@ from transformers import AutoModelForCausalLM
 from cp_wire import start_reader, start_writer
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
-MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
 SPLIT = 16
 LOSS_SCALE = 1024.0
 LR = 2e-4
@@ -99,7 +98,7 @@ while True:
         grad = h.grad.detach().cpu()
         outbox.put({"loss": loss.item(), "grad": grad, "compute_s": time.time() - t0})
         accumulated += 1
-        if accumulated == MICROBATCHES:
+        if accumulated == msg["per_step"]:
             # Update as soon as the step's last gradient is sent, without waiting for the master.
             finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
             if finite:

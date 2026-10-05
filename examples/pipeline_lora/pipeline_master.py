@@ -123,7 +123,7 @@ for step in range(1, STEPS + 1):
         ids, labels = examples[(base + j) % len(examples)]
         h = forward_stage0(torch.tensor([ids], device=dev))
         hs.append(h)
-        w_q.put({"cmd": "mb", "h": h.detach().cpu(), "labels": torch.tensor([labels])})
+        w_q.put({"cmd": "mb", "h": h.detach().cpu(), "labels": torch.tensor([labels]), "per_step": MICROBATCHES})
     t_forward += time.time() - t
 
     losses, worker_compute = [], []

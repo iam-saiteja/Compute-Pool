@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use rand::{rngs::OsRng, RngCore};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
@@ -13,6 +14,7 @@ pub const WORKER_BOOTSTRAP_TEMPLATE: &str = r#"
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -206,9 +208,15 @@ for line in cf_proc.stdout:
         break
 
 # 4. Start File Browser on Worker port 8081, tunneled out for the user's own
-#    browser only.
+#    browser only. Authenticated: --noauth gave anyone with the tunnel URL a
+#    root-container file manager (compute-pool#1).
+fb_user = "compute-pool"
+fb_password = secrets.token_urlsafe(12)
+fb_db = "/root/.filebrowser.db"
+subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "config", "init"], check=False)
+subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "users", "add", fb_user, fb_password, "--perm.admin"], check=False)
 fb_proc = subprocess.Popen([
-    "/usr/local/bin/filebrowser", "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8081", "--noauth"
+    "/usr/local/bin/filebrowser", "-d", fb_db, "-r", "/kaggle/working", "-a", "0.0.0.0", "-p", "8081"
 ])
 time.sleep(1)
 
@@ -910,12 +918,14 @@ fn shell_slug_for_slot(slot: usize) -> String {
     format!("interactive-gpu-terminal-s{}", slot)
 }
 
+// These suffixes become public ntfy.sh topic names carrying tunnel URLs and
+// web-terminal/file-manager credentials (compute-pool#1), so they must not be
+// guessable: a predictable PRNG would let anyone enumerate live sessions.
 fn random_suffix() -> String {
-    (0..8)
-        .map(|_| {
-            let chars = b"abcdefghijklmnopqrstuvwxyz0123456789";
-            chars[fastrand::usize(..chars.len())] as char
-        })
+    let chars = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = OsRng;
+    (0..12)
+        .map(|_| chars[(rng.next_u32() as usize) % chars.len()] as char)
         .collect()
 }
 

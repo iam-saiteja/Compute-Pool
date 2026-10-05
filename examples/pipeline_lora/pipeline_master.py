@@ -123,10 +123,10 @@ for step in range(1, STEPS + 1):
         ids, labels = examples[(base + j) % len(examples)]
         h = forward_stage0(torch.tensor([ids], device=dev))
         hs.append(h)
-        w_q.put({"cmd": "mb", "h": h.detach().cpu(), "labels": torch.tensor([labels]), "per_step": MICROBATCHES})
+        w_q.put({"cmd": "mb", "h": h.detach(), "labels": torch.tensor([labels]), "per_step": MICROBATCHES})
     t_forward += time.time() - t
 
-    losses, worker_compute = [], []
+    losses = []
     for h in hs:
         t = time.time()
         reply = recv(w_out)
@@ -134,8 +134,7 @@ for step in range(1, STEPS + 1):
         t = time.time()
         h.backward(reply["grad"].to(device=h.device, dtype=h.dtype))
         t_backward += time.time() - t
-        losses.append(reply["loss"])
-        worker_compute.append(reply["compute_s"])
+        losses.append(float(reply["loss"]))
 
     t = time.time()
     finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
@@ -158,8 +157,7 @@ for step in range(1, STEPS + 1):
         n = step
         log(f"step {step}/{STEPS}  loss {sum(losses) / len(losses):.4f}  {per_step:.2f}s/step")
         log(f"  per step avg: master forward+send {t_forward / n:.2f}s, waiting on worker {t_wait / n:.2f}s, "
-            f"master backward {t_backward / n:.2f}s, optimizer {t_step / n:.2f}s; "
-            f"worker compute (last micro-batch) {worker_compute[-1]:.2f}s")
+            f"master backward {t_backward / n:.2f}s, optimizer {t_step / n:.2f}s")
     if step % CKPT_EVERY == 0:
         save_ckpt()
 

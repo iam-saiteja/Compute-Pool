@@ -91,12 +91,10 @@ while True:
         break
 
     if msg["cmd"] == "mb":
-        t0 = time.time()
         h = msg["h"].to(core.embed_tokens.weight.device).requires_grad_(True)
         loss = loss_fn(forward_stage(h), msg["labels"])
         (loss * LOSS_SCALE).backward()
-        grad = h.grad.detach().cpu()
-        outbox.put({"loss": loss.item(), "grad": grad, "compute_s": time.time() - t0})
+        outbox.put({"loss": loss.detach(), "grad": h.grad.detach()})
         accumulated += 1
         if accumulated == msg["per_step"]:
             # Update as soon as the step's last gradient is sent, without waiting for the master.

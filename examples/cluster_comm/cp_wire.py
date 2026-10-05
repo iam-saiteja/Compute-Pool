@@ -40,8 +40,20 @@ def spawn(argv):
     return subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
 
 
+def _to_cpu(obj):
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    return obj
+
+
 def start_writer(stream):
-    """Send queued objects from a background thread. Put None to flush and stop."""
+    """Send queued objects from a background thread. Put None to flush and stop.
+
+    Tensors may still be on a GPU when queued: the copy to CPU happens here, so
+    the producing thread does not wait for the GPU before queueing more work.
+    """
     q = queue.Queue()
 
     def run():
@@ -49,7 +61,7 @@ def start_writer(stream):
             obj = q.get()
             if obj is None:
                 break
-            send(stream, obj)
+            send(stream, _to_cpu(obj))
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()

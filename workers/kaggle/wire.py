@@ -75,7 +75,13 @@ def start_writer(stream):
             obj = q.get()
             if obj is None:
                 break
-            send(stream, _to_cpu(obj))
+            try:
+                send(stream, _to_cpu(obj))
+            except (BrokenPipeError, OSError):
+                # The peer is gone. The main thread's own recv() call will
+                # independently raise and handle this; this thread just has
+                # nothing left to do.
+                break
 
     thread = threading.Thread(target=run, daemon=True)
     thread.start()

@@ -10,6 +10,7 @@ and strategy feasibility -- everything that does not need a live cluster.
 import os
 import sys
 import tempfile
+import threading
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -51,6 +52,31 @@ def test_wire_framing_over_pipe():
     assert msg["step"] == 7 and bool((msg["grad"] == 1).all())
 
 
+def test_writer_thread_survives_a_dead_peer():
+    """Found on a live cluster: killing the worker mid-run left an unhandled
+    BrokenPipeError in the background writer thread. Non-fatal (the main
+    thread's own recv() independently detects the disconnect) but it printed
+    a spurious traceback. The writer thread must now exit quietly instead."""
+    r, w = os.pipe()
+    wf, rf = os.fdopen(w, "wb"), os.fdopen(r, "rb")
+
+    captured = []
+    orig_hook = threading.excepthook
+    threading.excepthook = captured.append
+    try:
+        q, t = wire.start_writer(wf)
+        q.put(torch.ones(4))
+        rf.close()  # the peer is gone
+        q.put(torch.ones(4))  # should hit BrokenPipeError and exit quietly
+        q.put(None)
+        t.join(timeout=5)
+    finally:
+        threading.excepthook = orig_hook
+
+    assert not t.is_alive()
+    assert not captured, f"writer thread raised unhandled: {captured}"
+
+
 def test_strategy_feasibility_on_kaggle_fabric():
     f = strategy.KAGGLE_SSH_FABRIC
     feasible = strategy.feasible_strategies(f)
@@ -78,6 +104,7 @@ if __name__ == "__main__":
     results = [
         _run("checkpoint_roundtrip_and_resume", test_checkpoint_roundtrip_and_resume),
         _run("wire_framing_over_pipe", test_wire_framing_over_pipe),
+        _run("writer_thread_survives_a_dead_peer", test_writer_thread_survives_a_dead_peer),
         _run("strategy_feasibility_on_kaggle_fabric", test_strategy_feasibility_on_kaggle_fabric),
     ]
     sys.exit(0 if all(results) else 1)

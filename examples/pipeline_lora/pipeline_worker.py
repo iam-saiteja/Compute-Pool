@@ -59,16 +59,20 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.config.use_cache = False
 # This stage only ever runs layers SPLIT..end (forward_stage below) -- drop
-# the rest, and the embedding table (only stage 0 needs it), before LoRA
-# wraps the model, so neither their weights nor unused LoRA adapters for them
-# sit in GPU memory or the optimizer's state for the whole run
-# (compute-pool#5). from_pretrained still downloads and briefly materializes
-# the full checkpoint first -- skipping that too needs a meta-device partial
-# load, not done here since its device_map can't be checked against the real
-# checkpoint without cluster access.
+# the rest before LoRA wraps the model, so neither their weights nor unused
+# LoRA adapters for them sit in GPU memory or the optimizer's state for the
+# whole run (compute-pool#5). from_pretrained still downloads and briefly
+# materializes the full checkpoint first -- skipping that too needs a
+# meta-device partial load, not done here since its device_map can't be
+# checked against the real checkpoint without cluster access.
+#
+# embed_tokens is NOT dropped even though this stage never calls it: PEFT's
+# get_peft_model() calls model.get_input_embeddings() internally (to check
+# for tied weights), which needs it to exist as a real module regardless of
+# whether this stage ever runs it -- confirmed on a live cluster run, where
+# deleting it raised NotImplementedError inside peft's tied-module check.
 dev = next(p.device for p in model.model.layers[SPLIT].parameters())
 model.model.layers = model.model.layers[SPLIT:]
-del model.model.embed_tokens
 torch.cuda.empty_cache()
 peft_model = get_peft_model(
     model,

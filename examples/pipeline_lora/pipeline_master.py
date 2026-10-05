@@ -95,12 +95,18 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 model.config.use_cache = False
 # This stage only ever runs layers 0..SPLIT-1 (forward_stage0 below) -- drop
-# the rest, and the unused LM head, before LoRA wraps the model, so neither
-# their weights nor unused LoRA adapters for them sit in GPU memory or the
-# optimizer's state for the whole run (compute-pool#5). See the matching
-# comment in pipeline_worker.py for what this does and does not fix.
+# the rest before LoRA wraps the model, so neither their weights nor unused
+# LoRA adapters for them sit in GPU memory or the optimizer's state for the
+# whole run (compute-pool#5). See the matching comment in pipeline_worker.py
+# for what this does and does not fix.
+#
+# lm_head is NOT dropped even though this stage never calls it: deleting the
+# worker's equivalent (embed_tokens) broke peft's get_peft_model() on a live
+# cluster run (it calls model.get_input_embeddings() internally for a
+# tied-weights check, which needs the module to exist structurally). lm_head
+# is the output-embeddings analogue of that same mixin, so it's kept rather
+# than risking the same failure a second time.
 model.model.layers = model.model.layers[:SPLIT]
-del model.lm_head
 torch.cuda.empty_cache()
 peft_model = get_peft_model(
     model,

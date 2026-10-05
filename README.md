@@ -46,7 +46,7 @@ crun --gpus "python train.py --dataset {task_index}"
 
 Each task receives `CUDA_VISIBLE_DEVICES`, `CP_TASK_INDEX`, `CP_TASK_COUNT`, and `CP_NODE_INDEX`.
 
-For `torch.distributed` jobs spanning both nodes, run `enable-pytorch` once first -- it opens a reverse SSH tunnel for rendezvous and exports `MASTER_ADDR`/`MASTER_PORT`/`WORLD_SIZE` (use the `gloo` backend; `nccl` needs direct peer networking this fabric doesn't provide).
+Cross-node `torch.distributed` (gloo or NCCL) collectives do not work on this fabric: the ranks need direct connections to each other, and Kaggle containers don't accept inbound connections. Use the SSH all-reduce in `examples/cluster_comm/cp_wire.py` instead; `allreduce_logreg.py` shows it end to end. Within one node, multi-GPU training with `torch.distributed` is unaffected.
 
 ## Commands
 

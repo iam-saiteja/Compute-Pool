@@ -559,7 +559,6 @@ crun_script = '''#!/usr/bin/env python3
 import concurrent.futures, json, os, shlex, subprocess, sys
 
 REGISTRY = "/etc/compute-pool/nodes.json"
-RENDEZVOUS_ENV = {"MASTER_ADDR": "127.0.0.1", "MASTER_PORT": "29500"}
 
 def print_help():
     print("Compute Pool Cluster Runner (crun)")
@@ -633,7 +632,7 @@ def run_gpus(template, nodes):
     def run_task(item):
         idx, (n, g) = item
         cmd = template.format(task_index=idx, gpu_index=g, node_index=n["index"], task_count=total)
-        env = dict(RENDEZVOUS_ENV, CUDA_VISIBLE_DEVICES=str(g), CP_TASK_INDEX=str(idx), CP_TASK_COUNT=str(total), CP_NODE_INDEX=str(n["index"]), WORLD_SIZE=str(total))
+        env = dict(CUDA_VISIBLE_DEVICES=str(g), CP_TASK_INDEX=str(idx), CP_TASK_COUNT=str(total), CP_NODE_INDEX=str(n["index"]))
         if n["local"]:
             return (idx, n, g) + run_local(cmd, env)
         return (idx, n, g) + run_remote(n["name"], cmd, env)
@@ -728,38 +727,12 @@ print("  • ssh node1               -> Shell on worker node1 (node<N> for other
 print("  • crun <command>          -> Run command on every online node")
 print("  • crun --gpus '<command>' -> Run one task per online GPU")
 print("  • cp-dispatch '<command>' -> Shortcut for crun --gpus")
-print("  • enable-pytorch          -> Set up PyTorch DDP rendezvous over the SSH tunnels")
 print("  • stop                    -> Terminate cluster session")
 print("+----------------------------------------------------------------------+")
 '''
 with open("/usr/local/bin/cluster-status", "w") as f:
     f.write(status_script)
 os.chmod("/usr/local/bin/cluster-status", 0o755)
-
-# 7. enable-pytorch: rendezvous tunnel to every online worker
-pytorch_script = '''#!/usr/bin/env python3
-import json, subprocess
-
-REGISTRY = "/etc/compute-pool/nodes.json"
-nodes = json.load(open(REGISTRY))["nodes"]
-online = [n for n in nodes if n.get("status") == "online"]
-workers = [n["name"] for n in online if not n.get("local")]
-world = sum(n.get("gpus", 0) for n in online)
-
-subprocess.run(["pkill", "-f", "ssh.*-R 29500:127.0.0.1:29500"], check=False)
-for name in workers:
-    res = subprocess.run([
-        "ssh", "-f", "-N", "-o", "ExitOnForwardFailure=yes",
-        "-o", "ServerAliveInterval=10", "-o", "ServerAliveCountMax=3",
-        "-R", "29500:127.0.0.1:29500", name,
-    ], capture_output=True, text=True)
-    print(f"[{'ok' if res.returncode == 0 else 'FAILED'}] rendezvous tunnel to {name}")
-print(f"[+] PyTorch rendezvous ready on 127.0.0.1:29500 (WORLD_SIZE={world})")
-print("    Use the gloo backend. crun --gpus exports MASTER_ADDR, MASTER_PORT and WORLD_SIZE to every task.")
-'''
-with open("/usr/local/bin/enable-pytorch", "w") as f:
-    f.write(pytorch_script)
-os.chmod("/usr/local/bin/enable-pytorch", 0o755)
 
 stop_script = '''#!/bin/bash
 kill -9 -1

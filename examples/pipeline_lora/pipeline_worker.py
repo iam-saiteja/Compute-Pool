@@ -23,6 +23,7 @@ from transformers import AutoModelForCausalLM
 from cp_wire import start_reader, start_writer
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
+MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
 SPLIT = 16
 LOSS_SCALE = 1024.0
 LR = 2e-4
@@ -98,21 +99,20 @@ while True:
         grad = h.grad.detach().cpu()
         outbox.put({"loss": loss.item(), "grad": grad, "compute_s": time.time() - t0})
         accumulated += 1
-        continue
-
-    if msg["cmd"] == "step":
-        finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
-        if msg["apply"] and finite and accumulated:
-            for p in params:
-                if p.grad is not None:
-                    p.grad.div_(LOSS_SCALE * accumulated)
-            opt.step()
-        opt.zero_grad(set_to_none=True)
-        accumulated = 0
-        outbox.put({"finite": finite})
-        steps += 1
-        if steps % CKPT_EVERY == 0:
-            save_ckpt()
+        if accumulated == MICROBATCHES:
+            # Update as soon as the step's last gradient is sent, without waiting for the master.
+            finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
+            if finite:
+                for p in params:
+                    if p.grad is not None:
+                        p.grad.div_(LOSS_SCALE * accumulated)
+                opt.step()
+            opt.zero_grad(set_to_none=True)
+            accumulated = 0
+            outbox.put({"finite": finite})
+            steps += 1
+            if steps % CKPT_EVERY == 0:
+                save_ckpt()
 
 outbox.put(None)
 writer.join()

@@ -50,8 +50,8 @@ subprocess.run(
      f"{WORKER_HOST}:/kaggle/working/"],
     check=True,
 )
-worker = spawn(["ssh", "-o", "BatchMode=yes", WORKER_HOST,
-                "cd /kaggle/working && exec python3 -u pipeline_worker.py"])
+worker = spawn(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=20",
+                WORKER_HOST, "cd /kaggle/working && exec python3 -u pipeline_worker.py"])
 w_in, w_out = worker.stdin, worker.stdout
 w_q, w_writer = start_writer(w_in)
 
@@ -139,11 +139,6 @@ for step in range(1, STEPS + 1):
 
     t = time.time()
     finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
-    w_q.put({"cmd": "step", "apply": finite})
-    ack = recv(w_out)
-    if ack["finite"] != finite:
-        log(f"step {step}: master and worker disagree on gradient finiteness; they may have diverged")
-
     if finite:
         for p in params:
             if p.grad is not None:
@@ -153,6 +148,10 @@ for step in range(1, STEPS + 1):
         log(f"step {step}: non-finite gradient, skipping update")
     opt.zero_grad(set_to_none=True)
     t_step += time.time() - t
+
+    ack = recv(w_out)
+    if ack["finite"] != finite:
+        log(f"step {step}: master and worker disagree on gradient finiteness; they may have diverged")
 
     if step == 1 or step % LOG_EVERY == 0:
         per_step = (time.time() - started) / step

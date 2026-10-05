@@ -53,6 +53,18 @@ subprocess.run([
     "curl -sL https://github.com/filebrowser/filebrowser/releases/download/v2.32.0/linux-amd64-filebrowser.tar.gz | tar -xz -C /usr/local/bin filebrowser && chmod +x /usr/local/bin/filebrowser"
 ], check=False)
 
+# Fetch the worker runtime (checkpoint store, wire transport, execution
+# strategies) from the public repo so pool-map and checkpointed training are
+# available without the user uploading them by hand. Best-effort: if this
+# fails (no internet to GitHub, repo renamed), the cluster still works --
+# only pool-map and pipeline checkpoint/resume need it.
+subprocess.run(["bash", "-c",
+    "curl -sL https://github.com/iam-saiteja/Compute-Pool/archive/refs/heads/main.tar.gz "
+    "| tar -xz -C /tmp "
+    "&& rm -rf /kaggle/working/workers "
+    "&& cp -r /tmp/Compute-Pool-main/workers /kaggle/working/workers"
+], check=False)
+
 # Preserve the worker's native NVIDIA tools for non-interactive task execution.
 # Kaggle's terminal PATH is not necessarily inherited by an SSH session.
 gpu_tool_candidates = [
@@ -420,6 +432,17 @@ subprocess.run([
     "curl -sL https://github.com/jpillora/chisel/releases/download/v1.10.1/chisel_1.10.1_linux_amd64.gz | gzip -d > /usr/local/bin/chisel && chmod +x /usr/local/bin/chisel"
 ], check=False)
 
+# Fetch the worker runtime (checkpoint store, wire transport, execution
+# strategies) from the public repo -- see the matching comment in the worker
+# template. Best-effort: pool-map and checkpointed training need it, the rest
+# of the cluster does not.
+subprocess.run(["bash", "-c",
+    "curl -sL https://github.com/iam-saiteja/Compute-Pool/archive/refs/heads/main.tar.gz "
+    "| tar -xz -C /tmp "
+    "&& rm -rf /kaggle/working/workers "
+    "&& cp -r /tmp/Compute-Pool-main/workers /kaggle/working/workers"
+], check=False)
+
 # 2. Generate the cluster SSH keypair here. The private half never leaves this
 #    machine; only the public half is published for the workers to trust.
 key_path = "/root/.ssh/cluster_key"
@@ -700,6 +723,63 @@ with open("/usr/local/bin/cp-dispatch", "w") as f:
     f.write(cp_dispatch_script)
 os.chmod("/usr/local/bin/cp-dispatch", 0o755)
 
+# 5b. pool-map: checkpointed, retrying shard dispatch across every online GPU
+#     (workers/kaggle/strategies/independent.py, fetched in step 1). A worker
+#     that drops mid-run only loses its in-flight shard, not the job, and the
+#     whole run can also resume if restarted.
+pool_map_script = '''#!/usr/bin/env python3
+import argparse
+import json
+import sys
+
+REGISTRY = "/etc/compute-pool/nodes.json"
+
+
+def main():
+    sys.path.insert(0, "/kaggle/working")
+    try:
+        from workers.kaggle import checkpoint as checkpoint_mod
+        from workers.kaggle.strategies import independent
+    except ImportError:
+        print("pool-map needs /kaggle/working/workers/kaggle -- it was not fetched during", file=sys.stderr)
+        print("cluster startup. Check internet access to github.com and relaunch the cluster.", file=sys.stderr)
+        sys.exit(1)
+
+    ap = argparse.ArgumentParser(description="Checkpointed, retrying shard dispatch across every online GPU.")
+    ap.add_argument("command", help="shell command template; may use {task_index}/{task_count}/{node_index}")
+    ap.add_argument("--shards", type=int, required=True, help="number of shards")
+    ap.add_argument("--job-id", default="pool-map-job", help="checkpoint job id (rerun with the same id to resume)")
+    ap.add_argument("--checkpoint-uri", default="local:///kaggle/working/checkpoints")
+    ap.add_argument("--max-retries", type=int, default=2)
+    args = ap.parse_args()
+
+    nodes = [n for n in json.load(open(REGISTRY))["nodes"] if n.get("status") == "online"]
+    if not nodes:
+        print("No online nodes in the cluster registry.", file=sys.stderr)
+        sys.exit(1)
+
+    store = checkpoint_mod.open_store(args.checkpoint_uri, args.job_id)
+
+    def progress(idx, code, done, total):
+        mark = "ok" if code == 0 else f"FAILED(exit {code})"
+        print(f"[{done}/{total}] shard {idx}: {mark}", flush=True)
+
+    out = independent.run_map(nodes, args.command, args.shards, checkpoint_store=store,
+                               max_retries=args.max_retries, on_progress=progress)
+    print()
+    print(f"done: {len(out['results'])}/{args.shards} shards completed, {len(out['failed'])} failed permanently")
+    if out["failed"]:
+        print("failed shards:", out["failed"])
+    sys.exit(1 if out["failed"] else 0)
+
+
+if __name__ == "__main__":
+    main()
+'''
+with open("/usr/local/bin/pool-map", "w") as f:
+    f.write(pool_map_script)
+os.chmod("/usr/local/bin/pool-map", 0o755)
+
 # 6. cluster-status: reads the registry, so it reports the health loop's view.
 status_script = '''#!/usr/bin/env python3
 import json
@@ -727,6 +807,7 @@ print("  • ssh node1               -> Shell on worker node1 (node<N> for other
 print("  • crun <command>          -> Run command on every online node")
 print("  • crun --gpus '<command>' -> Run one task per online GPU")
 print("  • cp-dispatch '<command>' -> Shortcut for crun --gpus")
+print("  • pool-map '<cmd>' --shards N -> Checkpointed shard dispatch (retries, resumable)")
 print("  • stop                    -> Terminate cluster session")
 print("+----------------------------------------------------------------------+")
 '''

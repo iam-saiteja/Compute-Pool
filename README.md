@@ -46,6 +46,12 @@ crun --gpus "python train.py --dataset {task_index}"
 
 Each task receives `CUDA_VISIBLE_DEVICES`, `CP_TASK_INDEX`, `CP_TASK_COUNT`, and `CP_NODE_INDEX`.
 
+For a sharded job that should survive a worker dropping out or the master restarting, use `pool-map` instead of `crun --gpus`: it retries failed shards, checkpoints progress, and resumes with the same `--job-id`.
+
+```bash
+pool-map "python embed.py --shard {task_index}" --shards 100 --job-id embeddings-run1
+```
+
 Cross-node `torch.distributed` (gloo or NCCL) collectives do not work on this fabric: the ranks need direct connections to each other, and Kaggle containers don't accept inbound connections. Use the SSH all-reduce in `examples/cluster_comm/cp_wire.py` instead; `allreduce_logreg.py` shows it end to end. Within one node, multi-GPU training with `torch.distributed` is unaffected.
 
 ## Commands

@@ -96,12 +96,23 @@ ephemeral container.
   check. The registry ships `independent`, `intra_node_ddp`,
   `data_parallel_sync`, `pipeline`, and `sync_collective`. The scheduler calls
   `feasible_strategies(fabric)` and fails safely on the rest.
+- **`strategies/independent.py` — the `independent` strategy's run loop.**
+  Shards a command across every online GPU: local GPUs run a shard as a direct
+  subprocess, remote nodes run a persistent shard server over `wire.py` so the
+  SSH connection is paid for once. A worker that disappears only costs its
+  in-flight shard (requeued for a survivor); progress checkpoints after every
+  shard, so the whole run also resumes across a restart. Exposed on the
+  cluster as `pool-map`. Locally tested, including the remote path (a local
+  subprocess stands in for SSH) and a resume-after-interruption test.
 
-Reference run loops for two strategies already exist and are verified on a live
-cluster: `examples/cluster_comm/` (periodic-sync data parallel — logistic
-regression, matches single-node to 2e-16) and `examples/pipeline_lora/`
-(pipeline-parallel 8B LoRA across two nodes). These are the canonical
-implementations the runtime strategies are factored from.
+Reference run loops for the other two strategies already exist and are
+verified on a live cluster: `examples/cluster_comm/` (periodic-sync data
+parallel — logistic regression, matches single-node to 2e-16) and
+`examples/pipeline_lora/` (pipeline-parallel 8B LoRA across two nodes, now
+checkpointed and resumable). These are the reference implementations the
+`data_parallel_sync` and `pipeline` strategy modules are factored from when
+they are promoted into `workers/kaggle/strategies/` the same way `independent`
+already is.
 
 ## 5. Scheduling (fail-safe by construction)
 
@@ -149,24 +160,54 @@ strategy and the key V0 workload.
 
 ## 8. Roadmap (phases, from PRD §43)
 
-1. **Foundation (this change):** worker runtime, checkpoint store, strategy
-   registry, transport abstraction — all locally tested.
-2. **Wire it into the control plane:** launch a chosen strategy from the Rust
-   bootstrap; ship `workers/kaggle/` to every node; resume from checkpoint
-   after worker loss.
-3. **Map workloads end to end:** `pool.map`, shard assignment, retry of failed
-   shards, result collection — the V0 success scenario (PRD §48).
+1. **Foundation — done, locally tested.** Worker runtime, checkpoint store,
+   strategy registry, transport abstraction (`workers/kaggle/`).
+2. **Wire it into the control plane — code complete, not yet cluster-verified.**
+   - Ship `workers/kaggle/` to every node: the Rust bootstrap now curl+tar's
+     the package from the public repo on every node at startup (best-effort;
+     the cluster still works without it, only `pool-map` and the pipeline's
+     checkpoint/resume need it).
+   - Launch a chosen strategy from the bootstrap: `pool-map` is a generated
+     command on the master (alongside `crun`), reading the same node
+     registry and running `workers.kaggle.strategies.independent.run_map`.
+   - Resume from checkpoint after worker loss: at the strategy level, which
+     is the right granularity here. For `independent`/map, a lost worker's
+     in-flight shard goes back in the queue for a surviving worker — the job
+     does not restart. For `pipeline`, both sides checkpoint and resume from
+     their own latest state; a worker disconnect now saves progress and exits
+     with a clear message instead of a crash, and rerunning the script
+     continues from the last checkpoint.
+3. **Map workloads end to end — mostly done.** `pool-map` shards, dispatches,
+   retries, checkpoints, and resumes (PRD §48's V0 success scenario). Not yet
+   built: combining per-shard outputs into one result (currently the caller
+   gets a dict of per-shard stdout/stderr and does its own combining).
 4. **Security** (issue #1): authenticate the web terminal and file manager;
    cryptographic rendezvous topic names; workload isolation. Deferred by
    project decision, tracked, required before inviting third-party contributors.
 5. **More providers** behind the provider adapter (Colab, …).
 
-## 9. Known limits (tracked as GitHub issues)
+## 9. What still needs a live cluster to verify
+
+Everything below is written and passes locally (the worker runtime, the map
+strategy's dispatch/retry/checkpoint logic against a local-subprocess stand-in
+for SSH, the pipeline's checkpoint/resume wiring, the bootstrap template
+syntax) but has not run on an actual Kaggle cluster:
+
+- The `workers/kaggle` fetch step in the bootstrap (network access to GitHub
+  from inside the Kaggle container, the tar layout matching what `cp -r`
+  expects).
+- `pool-map` end to end: real shards, a real SSH-spawned `worker_serve`, a
+  real worker disconnect mid-map to confirm the shard requeues.
+- The pipeline's resume: kill the worker mid-training, rerun, confirm it
+  continues from the last checkpoint instead of restarting (#4, #8).
+- The health monitor marking a node down and recovering, and 3+ node clusters
+  generally (#10).
+- The cluster quota row's wall-clock fix in a freshly rebuilt CLI (#11).
+
+## 10. Known limits (tracked as GitHub issues)
 
 - Cross-node tight collectives are physically out of reach on this fabric (#2,
   resolved by documenting and the `sync_collective` fail-safe).
 - Pipeline throughput is capped by link bandwidth, not GPU (#14).
-- Pipeline resume across the session cap, both-nodes-load-full-model, and
-  worker-failure recovery are not yet built (#4, #5, #8).
-- Health monitor and 3+ node clusters are unverified on a live run (#10).
+- Both pipeline nodes load the full model (#5).
 - Web terminal and file manager are unauthenticated (#1).

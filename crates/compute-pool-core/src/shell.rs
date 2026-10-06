@@ -781,15 +781,7 @@ with open("/usr/local/bin/crun", "w") as f:
     f.write(crun_script)
 os.chmod("/usr/local/bin/crun", 0o755)
 
-# 5. cp-dispatch: shortcut for crun --gpus
-cp_dispatch_script = '''#!/bin/bash
-exec /usr/local/bin/crun --gpus "$@"
-'''
-with open("/usr/local/bin/cp-dispatch", "w") as f:
-    f.write(cp_dispatch_script)
-os.chmod("/usr/local/bin/cp-dispatch", 0o755)
-
-# 5b. pool-map: checkpointed, retrying shard dispatch across every online GPU
+# 5. pool-map: checkpointed, retrying shard dispatch across every online GPU
 #     (workers/kaggle/strategies/independent.py, fetched in step 1). A worker
 #     that drops mid-run only loses its in-flight shard, not the job, and the
 #     whole run can also resume if restarted.
@@ -877,7 +869,6 @@ print("  • nvidia-smi              -> Local GPU telemetry (master)")
 print("  • ssh node1               -> Shell on worker node1 (node<N> for others)")
 print("  • crun <command>          -> Run command on every online node")
 print("  • crun --gpus '<command>' -> Run one task per online GPU")
-print("  • cp-dispatch '<command>' -> Shortcut for crun --gpus")
 print("  • pool-map '<cmd>' --shards N -> Checkpointed shard dispatch (retries, resumable)")
 print("  • stop                    -> Terminate cluster session")
 print("+----------------------------------------------------------------------+")

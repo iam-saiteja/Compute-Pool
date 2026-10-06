@@ -130,7 +130,6 @@ Cluster Tools & Commands:
   • ssh node1               -> Shell on worker node1 (node<N> for others)
   • crun <command>          -> Run command on every online node
   • crun --gpus '<command>' -> Run one task per online GPU
-  • cp-dispatch '<command>' -> Shortcut for crun --gpus
   • pool-map '<cmd>' --shards N -> Checkpointed shard dispatch (retries, resumable)
   • stop                    -> Terminate cluster session
 +----------------------------------------------------------------------+
@@ -150,7 +149,6 @@ crun nvidia-smi
 
 # One task per online GPU across the whole cluster -- a hyperparameter sweep:
 crun --gpus "python train.py --lr {task_index}e-4 --dataset {task_index}"
-# shortcut: cp-dispatch "python train.py --lr {task_index}e-4"
 ```
 
 Each task gets `CUDA_VISIBLE_DEVICES`, `CP_TASK_INDEX`, `CP_TASK_COUNT`, and `CP_NODE_INDEX` as environment variables. `crun` syncs any local file your command references to every node first, so you don't need to `scp` your script by hand.

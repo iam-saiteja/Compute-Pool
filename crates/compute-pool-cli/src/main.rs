@@ -1134,7 +1134,7 @@ async fn handle_shell(
             println!("  node{} ({}) files:     {}", node.node_index, role, if node.files_url.is_empty() { "-".to_string() } else { node.files_url.bold().cyan().to_string() });
         }
         println!("  Cluster Runner:        crun <command> (e.g. crun nvidia-smi)");
-        println!("  Cluster Dispatcher:    cp-dispatch <command template>");
+        println!("  Cluster Dispatcher:    crun --gpus <command template>");
         println!("  Duration:              {} mins", info.duration_minutes);
         if open {
             let _ = open::that(&info.web_url);

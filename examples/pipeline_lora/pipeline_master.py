@@ -317,12 +317,14 @@ try:
             log(f"step {step}: held-out loss {evaluate():.4f}")
 except (EOFError, BrokenPipeError, OSError) as exc:
     # The worker went away mid-run (connection lost, OOM-killed, Kaggle session
-    # ended, ...). Progress up to the last completed step is already on disk
-    # via the CKPT_EVERY saves; save once more to capture anything since, then
-    # exit cleanly -- this is a known, resumable condition, not a crash.
-    save_ckpt(last_completed_step)
+    # ended, ...). Do NOT save here: a save without the worker's ack would put
+    # this side ahead of the worker's last coordinated checkpoint, the exact
+    # desync compute-pool#15 fixes. Resume from the last coordinated checkpoint
+    # instead; the steps since then are discarded, which keeps both sides at
+    # the same step.
+    last_ckpt = (last_completed_step // CKPT_EVERY) * CKPT_EVERY
     log(f"worker connection lost ({exc!r}) at step {last_completed_step}/{STEPS}.")
-    log(f"progress saved. rerun this script to resume from step {last_completed_step}.")
+    log(f"discarded steps since the last checkpoint. rerun this script to resume from step {last_ckpt}.")
     sys.exit(1)
 
 # Must run before the worker is told to stop. Training already finished and

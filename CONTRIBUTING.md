@@ -41,6 +41,10 @@ Open an issue with:
 - Match the existing style: comments explain *why* a line exists, not what it does; avoid adding a dependency for something a few lines of stdlib already covers; keep the shortest diff that's still correct, not the most defensive one.
 - No duplicate commands. If an existing command already does something, extend it or add a flag rather than adding a second name for the same action (`cp-dispatch` was removed for exactly this reason: it was a literal one-line alias for `crun --gpus`).
 
+## Using an AI coding assistant on this repo
+
+See [AGENTS.md](AGENTS.md) first. It has the specific gotchas this codebase has already hit once (a few of them twice), so an agent doesn't rediscover them the slow way.
+
 ## Code map
 
 - `crates/compute-pool-core/` -- the CLI's logic: account credentials and settings (`auth.rs`), Kaggle API client (`kaggle.rs`), job scheduling (`scheduler.rs`, `job.rs`), the bootstrap scripts the CLI pushes to Kaggle kernels (`shell.rs`).

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use colored::*;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
 use compute_pool_core::{
@@ -47,9 +47,9 @@ struct Cli {
 enum Commands {
     /// Store a Kaggle account's username and API key for one slot (1 to 8)
     Login {
-        /// Account slot number, 1 to 8. Each node in a cluster uses its own slot.
-        #[arg(short, long, default_value = "1")]
-        slot: usize,
+        /// Account slot, 1 to 8. Omit it to use the next free slot.
+        #[arg(short, long)]
+        slot: Option<usize>,
 
         /// Kaggle username (prompted if omitted)
         #[arg(short, long)]
@@ -78,7 +78,7 @@ enum Commands {
 
     /// Probe live GPU hardware details on an account slot
     Probe {
-        /// Account slot number (1 or 2)
+        /// Account slot number, 1 to 8 (1 or 2 for a single session)
         #[arg(short, long, default_value = "1")]
         slot: usize,
     },
@@ -207,20 +207,14 @@ async fn main() -> Result<()> {
 fn print_welcome_banner() {
     println!();
     println!("{}", "╭────────────────────────────────────────────────────────────────────────╮".cyan());
-    println!("{}", "│                     ⚡ Compute Pool GPU Terminal ⚡                     │".bold().cyan());
-    println!("{}", "│          Native GPU Task Scheduling Console          │".dimmed().cyan());
+    println!("{}", "│                     ⚡ Compute Pool GPU Terminal ⚡                      │".bold().cyan());
+    println!("{}", "│                   Native GPU Task Scheduling Console                   │".dimmed().cyan());
     println!("{}", "╰────────────────────────────────────────────────────────────────────────╯".cyan());
     println!();
     println!("{}", "Welcome to Compute Pool Interactive Terminal!".bold());
-    println!("Type commands directly without any prefix:");
-    println!("  • {}           - Check live GPU & TPU quotas", "accounts status".bold().green());
-    println!("  • {}             - Launch 4-GPU unified master-worker cluster", "shell --open".bold().green());
-    println!("  • {}                - Inspect all 0-indexed job records", "jobs list".bold().green());
-    println!("  • {}          - Submit PyTorch script for GPU execution", "jobs submit".bold().green());
-    println!("  • {}             - Probe real-time GPU hardware details", "probe --slot 1".bold().green());
-    println!("  • {}              - Release all GPU sessions immediately", "shell-stop".bold().green());
-    println!("  • {} / {}             - Show help or clear screen", "help".bold().yellow(), "cls".bold().yellow());
-    println!("  • {} / {}             - Exit the terminal", "exit".bold().red(), "quit".bold().red());
+    println!("Type a command without any prefix.");
+    println!();
+    print_command_list();
     println!();
 }
 
@@ -264,6 +258,10 @@ async fn run_interactive_terminal() -> Result<()> {
                     print_help();
                     continue;
                 }
+
+                // `help login` is the same as `login --help`.
+                let help_form = input.strip_prefix("help ").map(|rest| format!("{} --help", rest.trim()));
+                let input = help_form.as_deref().unwrap_or(input);
 
                 // Strip leading 'compute-pool' if typed by habit
                 let clean_input = if input.starts_with("compute-pool ") {
@@ -317,25 +315,33 @@ async fn run_interactive_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Every command, generated from the clap definitions, so this list cannot drift
+/// from what the commands actually accept.
+fn print_command_list() {
+    let root = Cli::command();
+    println!("{}", "Commands:".bold());
+    for sub in root.get_subcommands() {
+        let name = sub.get_name();
+        if sub.get_subcommands().next().is_some() {
+            for nested in sub.get_subcommands() {
+                let full = format!("{} {}", name, nested.get_name());
+                let about = nested.get_about().map(|a| a.to_string()).unwrap_or_default();
+                println!("  {} {}", format!("{:<24}", full).bold().green(), about);
+            }
+        } else {
+            let about = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+            println!("  {} {}", format!("{:<24}", name).bold().green(), about);
+        }
+    }
+    println!("  {} {}", format!("{:<24}", "help [command]").bold().yellow(), "Show this list, or the options of one command");
+    println!("  {} {}", format!("{:<24}", "cls").bold().yellow(), "Clear the screen");
+    println!("  {} {}", format!("{:<24}", "exit / quit").bold().red(), "Leave the terminal");
+    println!("Every command also takes -h or --help for its own options, e.g. `login -h`.");
+}
+
 fn print_help() {
-    println!("\n{}", "Compute Pool Interactive Commands:".bold());
-    println!("  {}     - Check live remaining GPU & TPU quotas across all accounts", "accounts status".cyan());
-    println!("  {}       - List configured account slots", "accounts list".cyan());
-    println!("  {}         - Configure credentials for an account slot (1-{})", "login --slot <N>".cyan(), MAX_ACCOUNT_SLOTS);
-    println!("  {}       - Launch unified 4-GPU master-worker web terminal in browser", "shell --open".cyan());
-    println!("  {} - Launch single GPU terminal session", "shell --slot <1|2> --open".cyan());
-    println!("  {}          - Terminate running shell sessions and release GPU quota", "shell-stop".cyan());
-    println!("  {}            - Probe real-time GPU hardware details via nvidia-smi", "probe --slot <1|2>".cyan());
-    println!("  {}             - List all batch jobs in sequential 0-indexed order", "jobs list".cyan());
-    println!("  {} - Submit a Python script for GPU execution", "jobs submit --script <path> --gpu".cyan());
-    println!("  {}       - Inspect status and metadata of job <ID>", "jobs status <ID>".cyan());
-    println!("  {}         - View output logs of job <ID>", "jobs logs <ID>".cyan());
-    println!("  {}         - Terminate a running job remotely", "jobs stop <ID>".cyan());
-    println!("  {}       - Delete a specific job record", "jobs delete <ID>".cyan());
-    println!("  {}          - Re-index all existing jobs sequentially from 0", "jobs reindex".cyan());
-    println!("  {}   - Delete all historical job records", "jobs clear --force".cyan());
-    println!("  {}                  - Clear the console screen", "cls / clear".cyan());
-    println!("  {}                 - Exit the interactive terminal", "exit / quit".cyan());
+    println!();
+    print_command_list();
     println!();
 }
 
@@ -438,28 +444,65 @@ fn ensure_policy_accepted() -> Result<()> {
     Ok(())
 }
 
-/// Prompt for the web terminal / file manager password and store it. The fixed
-/// default is gone: the password is whatever the user sets here.
+/// Set the web terminal / file manager password. If one is already set, the
+/// current password is required first. The previous password is shown once,
+/// so the user knows what still works for a session already running. The new
+/// password is never printed: it takes effect at the next `compute-pool shell`.
 fn set_web_password() -> Result<()> {
-    let pw = dialoguer::Password::new()
-        .with_prompt("New web password (letters, digits, and - _ . ! @ # % + =)")
-        .with_confirmation("Repeat the password", "The two passwords do not match")
-        .interact()?;
-    validate_web_password(&pw)?;
     let mut settings = load_settings()?;
-    settings.web_password = Some(pw);
+    let previous = settings.web_password.clone();
+
+    if let Some(current) = &previous {
+        let entered = prompt_masked_password("Current web password")?;
+        if &entered != current {
+            anyhow::bail!("Current password is wrong. Nothing was changed.");
+        }
+    }
+
+    let new = prompt_masked_password("New web password (letters, digits, and - _ . ! @ # % + =)")?;
+    validate_web_password(&new)?;
+    let again = prompt_masked_password("Repeat the new password")?;
+    if new != again {
+        anyhow::bail!("The two new passwords do not match. Nothing was changed.");
+    }
+
+    settings.web_password = Some(new);
     save_settings(&settings)?;
-    println!(
-        "{} Web password saved. It applies to the next `compute-pool shell`; \
-a session that is already running keeps the password it started with.",
-        "*".green().bold()
-    );
+
+    match previous {
+        Some(old) => {
+            println!("{} Previous password: {}", "*".green().bold(), old.bold());
+            println!("  It stays in effect for a session that is already running.");
+            println!("  The new password is saved and takes effect at the next `compute-pool shell`.");
+        }
+        None => println!(
+            "{} Web password saved. It takes effect at the next `compute-pool shell`.",
+            "*".green().bold()
+        ),
+    }
     Ok(())
 }
 
-async fn handle_login(slot: usize, username: Option<String>, key: Option<String>) -> Result<()> {
+/// The lowest slot with no account stored, so a first login never asks for a slot.
+fn next_free_slot() -> Result<usize> {
+    for slot in 1..=MAX_ACCOUNT_SLOTS {
+        if load_credentials(slot)?.is_none() {
+            return Ok(slot);
+        }
+    }
+    anyhow::bail!("All {} slots are configured. Pass --slot N to replace one.", MAX_ACCOUNT_SLOTS);
+}
+
+async fn handle_login(slot: Option<usize>, username: Option<String>, key: Option<String>) -> Result<()> {
+    let slot = match slot {
+        Some(s) => s,
+        None => next_free_slot()?,
+    };
     if slot == 0 || slot > MAX_ACCOUNT_SLOTS {
         anyhow::bail!("Slot must be between 1 and {}.", MAX_ACCOUNT_SLOTS);
+    }
+    if let Some(existing) = load_credentials(slot)? {
+        println!("{} Slot {} already has account {}; it will be replaced.", "!".yellow().bold(), slot, existing.username);
     }
     ensure_policy_accepted()?;
 
@@ -1019,7 +1062,7 @@ async fn handle_shell(
     } else {
         let slot: usize = slot_arg
             .parse()
-            .context("Slot must be 1, 2, or 'cluster'")?;
+            .context("Slot must be a number from 1 to 8, or 'cluster'")?;
         let info = launch_gpu_shell(slot, duration, timeout).await?;
         println!("\n{}", "Compute Pool -- Interactive GPU Terminal".bold().green());
         println!("  Slot: {}", info.slot);

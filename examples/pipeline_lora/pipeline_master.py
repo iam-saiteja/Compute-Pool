@@ -32,7 +32,7 @@ import time
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
 
 from cp_wire import recv, spawn, start_writer
 
@@ -42,6 +42,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, "/kaggle/working")
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
+from workers.kaggle.model_shard import load_stage  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
@@ -90,23 +91,12 @@ if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 
 log("loading model")
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, torch_dtype=torch.float16, device_map="auto", max_memory={0: "13GiB", 1: "13GiB"}
-)
-model.config.use_cache = False
-# This stage only ever runs layers 0..SPLIT-1 (forward_stage0 below) -- drop
-# the rest before LoRA wraps the model, so neither their weights nor unused
-# LoRA adapters for them sit in GPU memory or the optimizer's state for the
-# whole run (compute-pool#5). See the matching comment in pipeline_worker.py
-# for what this does and does not fix.
-#
-# lm_head is NOT dropped even though this stage never calls it: deleting the
-# worker's equivalent (embed_tokens) broke peft's get_peft_model() on a live
-# cluster run (it calls model.get_input_embeddings() internally for a
-# tied-weights check, which needs the module to exist structurally). lm_head
-# is the output-embeddings analogue of that same mixin, so it's kept rather
-# than risking the same failure a second time.
-model.model.layers = model.model.layers[:SPLIT]
+# Load only this stage's tensors (layers 0..SPLIT-1 plus the embedding), reading
+# only the checkpoint shards that contain them. The LM head and the other half's
+# layers are never read, downloaded, or allocated (compute-pool#5).
+# See workers/kaggle/model_shard.py.
+GPUS =[torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())] or [torch.device("cpu")]
+model = load_stage(MODEL_ID, range(0, SPLIT), include_embed=True, include_head=False, devices=GPUS)
 torch.cuda.empty_cache()
 peft_model = get_peft_model(
     model,
@@ -167,7 +157,14 @@ def forward_stage0(input_ids, attention_mask=None):
     pe = core.rotary_emb(h, pos)
     mask = build_4d_mask(attention_mask, h.dtype, h.device) if attention_mask is not None else None
     for layer in layers:
-        out = layer(h, attention_mask=mask, position_ids=pos, position_embeddings=pe)
+        # Layers may sit on different GPUs of this node, so move the inputs to each one.
+        d = next(layer.parameters()).device
+        out = layer(
+            h.to(d),
+            attention_mask=mask.to(d) if mask is not None else None,
+            position_ids=pos.to(d),
+            position_embeddings=tuple(t.to(d) for t in pe),
+        )
         h = out[0] if isinstance(out, tuple) else out
     return h
 

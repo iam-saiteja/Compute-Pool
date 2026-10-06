@@ -33,7 +33,7 @@ import time
 import torch
 import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig
 
 from cp_wire import start_reader, start_writer
 
@@ -41,6 +41,7 @@ sys.path.insert(0, "/kaggle/working")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
 from workers.kaggle.amp import DynamicLossScaler  # noqa: E402
+from workers.kaggle.model_shard import load_stage  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 SPLIT = 16
@@ -54,26 +55,16 @@ def log(*args):
 
 
 log("loading model")
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, torch_dtype=torch.float16, device_map="auto", max_memory={0: "13GiB", 1: "13GiB"}
-)
-model.config.use_cache = False
-# This stage only ever runs layers SPLIT..end (forward_stage below) -- drop
-# the rest before LoRA wraps the model, so neither their weights nor unused
-# LoRA adapters for them sit in GPU memory or the optimizer's state for the
-# whole run (compute-pool#5). from_pretrained still downloads and briefly
-# materializes the full checkpoint first -- skipping that too needs a
-# meta-device partial load, not done here since its device_map can't be
-# checked against the real checkpoint without cluster access.
-#
-# embed_tokens is NOT dropped even though this stage never calls it: PEFT's
-# get_peft_model() calls model.get_input_embeddings() internally (to check
-# for tied weights), which needs it to exist as a real module regardless of
-# whether this stage ever runs it -- confirmed on a live cluster run, where
-# deleting it raised NotImplementedError inside peft's tied-module check.
-dev = next(p.device for p in model.model.layers[SPLIT].parameters())
-model.model.layers = model.model.layers[SPLIT:]
+# Load only this stage's tensors (layers SPLIT..end plus the LM head and norm),
+# reading only the checkpoint shards that contain them. The embedding table and
+# the other half's layers are never read or allocated (compute-pool#5).
+# The embedding stays a meta module so peft's tied-weights check still finds it.
+# See workers/kaggle/model_shard.py.
+GPUS = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())] or [torch.device("cpu")]
+model = load_stage(MODEL_ID, range(SPLIT, AutoConfig.from_pretrained(MODEL_ID).num_hidden_layers),
+                   include_embed=False, include_head=True, devices=GPUS)
 torch.cuda.empty_cache()
+dev = next(model.model.layers[0].parameters()).device  # first layer this stage runs
 peft_model = get_peft_model(
     model,
     LoraConfig(
@@ -111,7 +102,14 @@ def forward_stage(h, attention_mask=None):
     pe = core.rotary_emb(h, pos)
     mask = build_4d_mask(attention_mask.to(h.device), h.dtype, h.device) if attention_mask is not None else None
     for layer in layers:
-        out = layer(h, attention_mask=mask, position_ids=pos, position_embeddings=pe)
+        # Layers may sit on different GPUs of this node, so move the inputs to each one.
+        d = next(layer.parameters()).device
+        out = layer(
+            h.to(d),
+            attention_mask=mask.to(d) if mask is not None else None,
+            position_ids=pos.to(d),
+            position_embeddings=tuple(t.to(d) for t in pe),
+        )
         h = out[0] if isinstance(out, tuple) else out
     return h
 

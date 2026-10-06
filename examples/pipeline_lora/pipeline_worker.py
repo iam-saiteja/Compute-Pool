@@ -1,37 +1,27 @@
-"""Stage 1 of a two-node pipeline-parallel LoRA fine-tune (run on the worker node).
+"""Stage k (k >= 1) of an N-stage pipeline-parallel LoRA fine-tune, run on a worker node.
 
-Holds decoder layers SPLIT..end plus the final norm and LM head. For each
-micro-batch from the master it runs forward and backward, accumulates the
-adapter gradients, and returns the gradient at its input. When the master
-sends "step", it applies one optimizer update over the accumulated gradients.
-Each micro-batch is itself MICRO_BATCH_SIZE (master-side env var) examples
-padded to a common length, with the padding mask sent alongside `h`.
+The master (stage 0) routes every micro-batch through the stages in order. This process
+only ever talks to the master, over the SSH link it was started with. Each message
+asks for one thing:
+  fwd       run this stage's layers, return the output (middle stages)
+  fwd_loss  run the last stage, compute the loss, backpropagate, return the gradient
+            for the stage before it (last stage only)
+  bwd       backpropagate a gradient through this stage, return the one for upstream
+  check     report whether this stage's gradients are finite
+  apply     divide the accumulated gradients, step if the whole pipeline agreed, clear
+  ckpt      save this stage's adapters for a step
+  stop      exit
 
-Receiving and sending run on background threads, so the worker can accept the
-next micro-batch while it computes the current one and while it returns the
-previous gradient.
-
-Checkpointed and resumed the same way as the master (workers/kaggle/checkpoint.py):
-on start, it loads its own latest checkpoint if one exists and continues.
-
-Uses dynamic fp16 loss scaling (workers/kaggle/amp.py), owned here: the scale
-is applied once at `loss * scale` and that single factor is what's baked into
-every gradient in the backward chain, including the master's half once it
-continues backprop from the gradient this worker returns. So this worker
-reports the scale it used with every micro-batch reply, and the master must
-unscale with that reported value, not a value of its own -- an independently
-adjusted scale on the master's side would silently diverge from what's
-actually in the gradients it receives.
+Stage index, stage count and checkpoint settings come from the environment, set by the
+master when it launches this process. The model code lives in workers/kaggle/pipeline.py.
 
 Needs cp_wire.py next to it.
 """
 import os
 import sys
 import tempfile
-import time
 
 import torch
-import torch.nn.functional as F
 from peft import LoraConfig, get_peft_model
 from transformers import AutoConfig
 
@@ -42,29 +32,28 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
 from workers.kaggle.amp import DynamicLossScaler  # noqa: E402
 from workers.kaggle.model_shard import load_stage  # noqa: E402
+from workers.kaggle.pipeline import Stage, split_layers  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
-SPLIT = 16
 LR = 2e-4
+N_STAGES = int(os.environ["N_STAGES"])
+STAGE = int(os.environ["STAGE_INDEX"])
+LAST = STAGE == N_STAGES - 1
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
-JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + "-worker"
+JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + f"-stage{STAGE}"
 
 
 def log(*args):
-    print("[worker]", *args, file=sys.stderr, flush=True)
+    print(f"[worker stage {STAGE}]", *args, file=sys.stderr, flush=True)
 
 
-log("loading model")
-# Load only this stage's tensors (layers SPLIT..end plus the LM head and norm),
-# reading only the checkpoint shards that contain them. The embedding table and
-# the other half's layers are never read or allocated (compute-pool#5).
-# The embedding stays a meta module so peft's tied-weights check still finds it.
-# See workers/kaggle/model_shard.py.
+n_layers = AutoConfig.from_pretrained(MODEL_ID).num_hidden_layers
+LAYERS = split_layers(n_layers, N_STAGES)[STAGE]
 GPUS = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())] or [torch.device("cpu")]
-model = load_stage(MODEL_ID, range(SPLIT, AutoConfig.from_pretrained(MODEL_ID).num_hidden_layers),
-                   include_embed=False, include_head=True, devices=GPUS)
+
+log(f"loading layers {LAYERS.start}..{LAYERS.stop - 1}{' + head' if LAST else ''}")
+model = load_stage(MODEL_ID, LAYERS, include_embed=False, include_head=LAST, devices=GPUS)
 torch.cuda.empty_cache()
-dev = next(model.model.layers[0].parameters()).device  # first layer this stage runs
 peft_model = get_peft_model(
     model,
     LoraConfig(
@@ -77,61 +66,23 @@ peft_model = get_peft_model(
 )
 core = peft_model.base_model.model.model
 head = peft_model.base_model.model.lm_head
-layers = core.layers
-params = [p for p in peft_model.parameters() if p.requires_grad]
+params = [p for p in peft_model.parameters() if p.requires_grad and p.device.type != "meta"]
 for p in params:
     p.data = p.data.float()
-opt = torch.optim.AdamW(params, lr=LR)
-scaler = DynamicLossScaler()
-
-
-def build_4d_mask(attention_mask, dtype, device):
-    """Combine the causal mask with the batch's padding mask into the additive
-    4D form the decoder layers expect directly -- see the matching comment in
-    pipeline_master.py (compute-pool#6)."""
-    seq_len = attention_mask.shape[1]
-    min_value = torch.finfo(dtype).min
-    causal = torch.triu(torch.full((seq_len, seq_len), min_value, device=device, dtype=dtype), diagonal=1)
-    pad = (1.0 - attention_mask.to(dtype=dtype))[:, None, None, :] * min_value
-    return causal[None, None, :, :] + pad
-
-
-def forward_stage(h, attention_mask=None):
-    h = h.to(dev)
-    pos = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
-    pe = core.rotary_emb(h, pos)
-    mask = build_4d_mask(attention_mask.to(h.device), h.dtype, h.device) if attention_mask is not None else None
-    for layer in layers:
-        # Layers may sit on different GPUs of this node, so move the inputs to each one.
-        d = next(layer.parameters()).device
-        out = layer(
-            h.to(d),
-            attention_mask=mask.to(d) if mask is not None else None,
-            position_ids=pos.to(d),
-            position_embeddings=tuple(t.to(d) for t in pe),
-        )
-        h = out[0] if isinstance(out, tuple) else out
-    return h
-
-
-def loss_fn(h, labels):
-    logits = head(core.norm(h)).float()
-    shift_logits = logits[:, :-1].reshape(-1, logits.size(-1))
-    shift_labels = labels[:, 1:].reshape(-1).to(logits.device)
-    return F.cross_entropy(shift_logits, shift_labels, ignore_index=-100)
-
-
+scaler = DynamicLossScaler() if LAST else None
+stage = Stage(core, head, first=False, last=LAST, params=params, lr=LR, scaler=scaler)
 ckpt_store = checkpoint_mod.open_store(CHECKPOINT_URI, JOB_ID)
 
 
 def save_ckpt(step):
     tmp = tempfile.mkdtemp(prefix="cp-pipeline-ckpt-")
-    path = os.path.join(tmp, "adapters_worker.pt")
+    path = os.path.join(tmp, "adapters.pt")
     torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, path)
-    # Confirmed as a real (non-fatal) gap on a live cluster run: without
-    # saving the scaler's state, a resumed run restarts it at init_scale and
-    # has to re-earn any growth from scratch.
-    ckpt_store.save(step, {"adapters_worker.pt": path}, meta={"step": step, "scaler": scaler.state_dict()})
+    meta = {"step": step}
+    if scaler is not None:
+        # The scale is the loss scale this stage's gradients were computed under.
+        meta["scaler"] = scaler.state_dict()
+    ckpt_store.save(step, {"adapters.pt": path}, meta=meta)
 
 
 def resume():
@@ -140,77 +91,53 @@ def resume():
     if not loaded:
         return 0
     step, meta = loaded
-    state = torch.load(os.path.join(tmp, "adapters_worker.pt"), map_location=dev)
+    state = torch.load(os.path.join(tmp, "adapters.pt"), map_location=params[0].device)
     peft_model.load_state_dict(state, strict=False)
-    if "scaler" in meta:
+    if scaler is not None and "scaler" in meta:
         scaler.load_state_dict(meta["scaler"])
-    log(f"resumed from checkpoint at step {step} (loss scale {scaler.scale:.0f})")
+    log(f"resumed from checkpoint at step {step}")
     return step
 
 
-PROFILE = os.environ.get("PROFILE") == "1"
-prof = None
 inbox = start_reader(sys.stdin.buffer)
 outbox, writer = start_writer(sys.stdout.buffer)
-accumulated = 0
-steps = resume()
+resume()
 log("ready")
 
 while True:
     msg = inbox.get()
     if msg is None or msg["cmd"] == "stop":
         break
+    cmd = msg["cmd"]
+    train = msg.get("train", True)
 
-    if msg["cmd"] == "eval":
-        with torch.no_grad():
-            h = msg["h"].to(dev)
-            loss = loss_fn(forward_stage(h), msg["labels"])
-        outbox.put({"loss": loss.detach()})
-        continue
+    if cmd == "fwd":
+        with torch.set_grad_enabled(train):
+            out = stage.forward(msg["mb"], msg["h"], msg.get("mask"), train=train)
+        outbox.put({"h": out})
 
-    if msg["cmd"] == "ckpt":
-        # Master-driven, not self-timed: the master only writes its own
-        # checkpoint for this step after this ack, so a crash between the two
-        # saves can no longer leave them at different steps (compute-pool#15).
+    elif cmd == "fwd_loss":
+        with torch.set_grad_enabled(train):
+            loss, grad, scale = stage.forward_loss(msg["mb"], msg["h"], msg.get("mask"), msg["labels"], train=train)
+        outbox.put({"loss": loss, "grad": grad, "scale": scale})
+
+    elif cmd == "bwd":
+        outbox.put({"grad": stage.backward(msg["mb"], msg["grad"])})
+
+    elif cmd == "check":
+        outbox.put({"finite": stage.grads_finite()})
+
+    elif cmd == "apply":
+        new_scale = stage.apply(msg["apply"], msg["n_micro"], msg["scale"], msg["finite"])
+        outbox.put({"scale": new_scale})
+
+    elif cmd == "ckpt":
         save_ckpt(msg["step"])
         outbox.put({"ckpt_done": True})
-        continue
-
-    if msg["cmd"] == "mb":
-        if PROFILE and steps == 4 and accumulated == 0 and prof is None:
-            prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
-            prof.__enter__()
-        # scaler.scale only changes at the step boundary below, so every
-        # micro-batch in this step snapshots (and reports) the same value.
-        step_scale = scaler.scale
-        h = msg["h"].to(dev).requires_grad_(True)
-        loss = loss_fn(forward_stage(h, msg["mask"]), msg["labels"])
-        (loss * step_scale).backward()
-        outbox.put({"loss": loss.detach(), "grad": h.grad.detach(), "scale": step_scale})
-        accumulated += 1
-        if accumulated == msg["per_step"]:
-            # Update as soon as the step's last gradient is sent, without waiting for the master.
-            finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
-            if finite:
-                for p in params:
-                    if p.grad is not None:
-                        p.grad.div_(step_scale * accumulated)
-                opt.step()
-            opt.zero_grad(set_to_none=True)
-            scaler.update(finite)
-            accumulated = 0
-            outbox.put({"finite": finite})
-            steps += 1
-            if prof is not None and steps == 5:
-                prof.__exit__(None, None, None)
-                print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=25), file=sys.stderr, flush=True)
-                prof.export_chrome_trace("/kaggle/working/trace_worker.json")
-                prof = None
 
 outbox.put(None)
 writer.join()
-save_ckpt(steps)
-log("stopped after", steps, "optimizer steps")
+log("stopped")
 sys.stderr.flush()
 # The stdin reader thread is still blocked on a read; exit hard to avoid a shutdown crash.
 os._exit(0)

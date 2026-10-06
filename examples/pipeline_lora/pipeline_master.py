@@ -1,27 +1,26 @@
-"""Stage 0 of a two-node pipeline-parallel LoRA fine-tune (run on the master node).
+"""N-stage pipeline-parallel LoRA fine-tune, run on the master node (stage 0).
 
-Holds the embedding and decoder layers 0..SPLIT-1 and drives training. Each
-optimizer step is MICROBATCHES micro-batches: the master sends all of them
-before waiting for gradients, so the worker computes one while the master runs
-forward on the next. Gradients are accumulated and applied once per step.
+The model's decoder layers are split into N contiguous ranges, one per node. This
+process holds stage 0 (the embedding and the first range) and drives training. Each
+micro-batch goes forward through every stage, and its gradient comes back through
+them in reverse. Gradients are accumulated, then applied once per optimizer step,
+after every stage has confirmed its gradients are finite.
 
-Checkpointed every CKPT_EVERY steps to CHECKPOINT_URI (workers/kaggle/checkpoint.py),
-and resumed automatically on restart: rerunning this script after an interruption
-continues from the last saved step instead of starting over. If the worker
-disconnects mid-run, progress is saved before exiting, so the fix is just to
-rerun -- it is not a crash that loses work.
+N comes from the cluster: one stage per online node, unless PIPELINE_STAGES is set.
+Stage k runs on node k. A two-node cluster is the original two-stage pipeline.
 
-The fp16 loss scale is owned by the worker (workers/kaggle/amp.py), since the
-scale it applies at `loss * scale` is the single factor baked into every
-gradient in the backward chain, including this side's once it continues
-backprop from the gradient the worker returns. This file unscales with the
-scale value the worker reports per micro-batch, not an independent value of
-its own.
+Checkpointed every CKPT_EVERY steps. Every stage saves its own adapters, and the
+master asks each stage to save before it saves its own, so a crash cannot leave the
+stages at different steps (compute-pool#15). Rerunning with the same CHECKPOINT_JOB_ID
+resumes. Progress since the last checkpoint is discarded on a lost connection.
 
-Needs cp_wire.py and pipeline_worker.py next to it.
-Run on the master from /kaggle/working:
+The loss scale is owned by the last stage (workers/kaggle/amp.py). The master never
+scales on its own: it passes the scale the last stage reported to every stage.
+
+Needs cp_wire.py and pipeline_worker.py next to it. Run on the master from /kaggle/working:
     python3 pipeline_master.py
 """
+import json
 import os
 import random
 import shlex
@@ -33,20 +32,18 @@ import time
 import torch
 from datasets import load_dataset
 from peft import LoraConfig, get_peft_model
-from transformers import AutoTokenizer
+from transformers import AutoConfig, AutoTokenizer
 
 from cp_wire import recv, spawn, start_writer
 
-# workers/kaggle/checkpoint.py: /kaggle/working on the real target (this file's
-# directory, once shipped there), the repo root for local/dev testing.
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, "/kaggle/working")
 sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
 from workers.kaggle.model_shard import load_stage  # noqa: E402
+from workers.kaggle.pipeline import Stage, split_layers  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
-SPLIT = 16
 MAX_LEN = 256
 MICROBATCHES = int(os.environ.get("MICROBATCHES", "2"))
 MICRO_BATCH_SIZE = int(os.environ.get("MICRO_BATCH_SIZE", "4"))
@@ -57,47 +54,57 @@ CKPT_EVERY = int(os.environ.get("CKPT_EVERY", "25"))
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "25"))
 EVAL_HOLDOUT = int(os.environ.get("EVAL_HOLDOUT", "20"))
 DATASET_ROWS = 800
-WORKER_HOST = "node1"
 CHECKPOINT_URI = os.environ.get("CHECKPOINT_URI", "local:///kaggle/working/checkpoints")
-JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + "-master"
+JOB_ID = os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo") + "-stage0"
 
 
 def log(*args):
     print("[master]", *args, flush=True)
 
 
+def default_stages():
+    """One stage per online node in the cluster registry, at least two."""
+    try:
+        nodes = json.load(open("/etc/compute-pool/nodes.json"))["nodes"]
+        return max(2, sum(1 for n in nodes if n.get("status") == "online"))
+    except Exception:
+        return 2
+
+
+N_STAGES = int(os.environ.get("PIPELINE_STAGES", default_stages()))
+WORKER_HOSTS = [f"node{k}" for k in range(1, N_STAGES)]
+LAYERS = split_layers(AutoConfig.from_pretrained(MODEL_ID).num_hidden_layers, N_STAGES)
+
 # peft refuses to run with the torchao 0.10 that Kaggle images ship, and LoRA does not need it.
 subprocess.run(["pip", "uninstall", "-y", "-q", "torchao"], check=False)
-subprocess.run(["ssh", "-o", "BatchMode=yes", WORKER_HOST, "pip uninstall -y -q torchao"], check=False)
 
-subprocess.run(
-    ["scp", "-o", "ConnectTimeout=5",
-     os.path.join(HERE, "pipeline_worker.py"), os.path.join(HERE, "cp_wire.py"),
-     f"{WORKER_HOST}:/kaggle/working/"],
-    check=True,
-)
-_worker_env = " ".join(
-    f"{k}={shlex.quote(os.environ.get(k, default))}"
-    for k, default in [("PROFILE", "0"), ("CHECKPOINT_URI", CHECKPOINT_URI),
-                        ("CHECKPOINT_JOB_ID", os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo")),
-                        ("CKPT_EVERY", str(CKPT_EVERY))]
-)
-worker = spawn(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=20",
-                WORKER_HOST, f"cd /kaggle/working && {_worker_env} exec python3 -u pipeline_worker.py"])
-w_in, w_out = worker.stdin, worker.stdout
-w_q, w_writer = start_writer(w_in)
+workers, w_out, w_q = [], {}, {}
+for k, host in enumerate(WORKER_HOSTS, start=1):
+    subprocess.run(
+        ["scp", "-o", "ConnectTimeout=5",
+         os.path.join(HERE, "pipeline_worker.py"), os.path.join(HERE, "cp_wire.py"), f"{host}:/kaggle/working/"],
+        check=True,
+    )
+    env = " ".join(f"{k2}={shlex.quote(v)}" for k2, v in [
+        ("STAGE_INDEX", str(k)), ("N_STAGES", str(N_STAGES)),
+        ("CHECKPOINT_URI", CHECKPOINT_URI),
+        ("CHECKPOINT_JOB_ID", os.environ.get("CHECKPOINT_JOB_ID", "pipeline-lora-demo")),
+    ])
+    proc = spawn(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=20",
+                  host, f"pip uninstall -y -q torchao 2>/dev/null; cd /kaggle/working && {env} exec python3 -u pipeline_worker.py"])
+    workers.append(proc)
+    w_out[k] = proc.stdout
+    w_q[k], _ = start_writer(proc.stdin)
 
 tok = AutoTokenizer.from_pretrained(MODEL_ID)
 if tok.pad_token is None:
     tok.pad_token = tok.eos_token
 
+log(f"{N_STAGES} stages: master holds layers {LAYERS[0].start}..{LAYERS[0].stop - 1}; "
+    + ", ".join(f"{h} holds {LAYERS[k].start}..{LAYERS[k].stop - 1}" for k, h in enumerate(WORKER_HOSTS, start=1)))
 log("loading model")
-# Load only this stage's tensors (layers 0..SPLIT-1 plus the embedding), reading
-# only the checkpoint shards that contain them. The LM head and the other half's
-# layers are never read, downloaded, or allocated (compute-pool#5).
-# See workers/kaggle/model_shard.py.
-GPUS =[torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())] or [torch.device("cpu")]
-model = load_stage(MODEL_ID, range(0, SPLIT), include_embed=True, include_head=False, devices=GPUS)
+GPUS = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())] or [torch.device("cpu")]
+model = load_stage(MODEL_ID, LAYERS[0], include_embed=True, include_head=False, devices=GPUS)
 torch.cuda.empty_cache()
 peft_model = get_peft_model(
     model,
@@ -110,21 +117,23 @@ peft_model = get_peft_model(
     ),
 )
 core = peft_model.base_model.model.model
-layers = core.layers
-params = [p for p in peft_model.parameters() if p.requires_grad]
+params = [p for p in peft_model.parameters() if p.requires_grad and p.device.type != "meta"]
 for p in params:
     p.data = p.data.float()
-opt = torch.optim.AdamW(params, lr=LR)
-dev = core.embed_tokens.weight.device
+stage0 = Stage(core, None, first=True, last=False, params=params, lr=LR)
 
-ckpt_store = checkpoint_mod.open_store(CHECKPOINT_URI, JOB_ID)
+
+def call(k, msg):
+    """Send one request to stage k and wait for its reply."""
+    w_q[k].put(msg)
+    return recv(w_out[k])
 
 
 def save_ckpt(step):
     tmp = tempfile.mkdtemp(prefix="cp-pipeline-ckpt-")
-    path = os.path.join(tmp, "adapters_master.pt")
+    path = os.path.join(tmp, "adapters.pt")
     torch.save({n: p.detach().cpu() for n, p in peft_model.named_parameters() if p.requires_grad}, path)
-    ckpt_store.save(step, {"adapters_master.pt": path}, meta={"step": step})
+    ckpt_store.save(step, {"adapters.pt": path}, meta={"step": step})
 
 
 def resume():
@@ -133,41 +142,13 @@ def resume():
     if not loaded:
         return 0
     step, _meta = loaded
-    state = torch.load(os.path.join(tmp, "adapters_master.pt"), map_location=dev)
+    state = torch.load(os.path.join(tmp, "adapters.pt"), map_location=params[0].device)
     peft_model.load_state_dict(state, strict=False)
     log(f"resumed from checkpoint at step {step}")
     return step
 
 
-def build_4d_mask(attention_mask, dtype, device):
-    """Combine the causal mask with the batch's padding mask into the additive
-    4D form the decoder layers expect directly -- calling them one at a time
-    (instead of the full model forward) skips transformers' usual mask-prep
-    step, so it's redone here by hand rather than relying on an internal
-    helper whose name/signature varies across transformers versions."""
-    seq_len = attention_mask.shape[1]
-    min_value = torch.finfo(dtype).min
-    causal = torch.triu(torch.full((seq_len, seq_len), min_value, device=device, dtype=dtype), diagonal=1)
-    pad = (1.0 - attention_mask.to(dtype=dtype))[:, None, None, :] * min_value
-    return causal[None, None, :, :] + pad
-
-
-def forward_stage0(input_ids, attention_mask=None):
-    h = core.embed_tokens(input_ids)
-    pos = torch.arange(h.shape[1], device=h.device).unsqueeze(0)
-    pe = core.rotary_emb(h, pos)
-    mask = build_4d_mask(attention_mask, h.dtype, h.device) if attention_mask is not None else None
-    for layer in layers:
-        # Layers may sit on different GPUs of this node, so move the inputs to each one.
-        d = next(layer.parameters()).device
-        out = layer(
-            h.to(d),
-            attention_mask=mask.to(d) if mask is not None else None,
-            position_ids=pos.to(d),
-            position_embeddings=tuple(t.to(d) for t in pe),
-        )
-        h = out[0] if isinstance(out, tuple) else out
-    return h
+ckpt_store = checkpoint_mod.open_store(CHECKPOINT_URI, JOB_ID)
 
 
 def encode(example):
@@ -182,11 +163,7 @@ def encode(example):
 
 
 def collate(batch):
-    """Right-pad a batch of (ids, labels) pairs to the same length and build
-    the matching attention mask -- real multi-example batching needs
-    rectangular tensors, not the variable-length lists encode() produces
-    (compute-pool#6). Pad positions carry label -100 (ignored by the loss) and
-    mask 0 (ignored by attention), so they cannot affect the result."""
+    """Right-pad a batch of (ids, labels) to one length and build the attention mask."""
     max_len = max(len(ids) for ids, _ in batch)
     pad_id = tok.pad_token_id
     input_ids, labels, mask = [], [], []
@@ -195,7 +172,7 @@ def collate(batch):
         input_ids.append(ids + [pad_id] * pad)
         labels.append(lab + [-100] * pad)
         mask.append([1] * len(ids) + [0] * pad)
-    return torch.tensor(input_ids, device=dev), torch.tensor(labels), torch.tensor(mask, device=dev)
+    return torch.tensor(input_ids, device=stage0.dev), torch.tensor(labels), torch.tensor(mask, device=stage0.dev)
 
 
 log("loading dataset")
@@ -203,12 +180,7 @@ ds = load_dataset("tatsu-lab/alpaca", split="train").select(range(DATASET_ROWS))
 all_examples = [e for e in (encode(ex) for ex in ds) if any(label != -100 for label in e[1])]
 n_holdout = min(EVAL_HOLDOUT, max(1, len(all_examples) // 10))
 held_out, examples = all_examples[:n_holdout], all_examples[n_holdout:]
-
-# Batches are padded to their longest example, and the padding is sent over the
-# link as well as computed. Shuffle, then sort by length within windows of 64, so
-# consecutive examples are similar in length. That cuts padding from ~42% to ~7%
-# of the bytes moved at MICRO_BATCH_SIZE=4, with the same examples seen per epoch
-# (compute-pool#14). The seed is fixed, so a resumed run follows the same order.
+# Length-bucket the training order (seeded): see compute-pool#14.
 _order = list(range(len(examples)))
 random.Random(0).shuffle(_order)
 _bucketed = []
@@ -219,26 +191,35 @@ log(f"{len(examples)} training examples, {len(held_out)} held out for eval; "
     f"{STEPS} steps x {MICROBATCHES} micro-batches x {MICRO_BATCH_SIZE} examples/micro-batch")
 
 
+def run_micro(j, ids, labels, mask, train):
+    """One micro-batch through every stage. Returns (loss, scale). Training also runs the backward pass."""
+    h = stage0.forward(j, ids, mask, train=train)
+    for k in range(1, N_STAGES - 1):
+        h = call(k, {"cmd": "fwd", "mb": j, "h": h, "mask": mask, "train": train})["h"]
+    last = call(N_STAGES - 1, {"cmd": "fwd_loss", "mb": j, "h": h, "mask": mask, "labels": labels, "train": train})
+    if not train:
+        return last["loss"], None
+    grad = last["grad"]
+    for k in range(N_STAGES - 2, 0, -1):
+        grad = call(k, {"cmd": "bwd", "mb": j, "grad": grad})["grad"]
+    stage0.backward(j, grad)
+    return last["loss"], last["scale"]
+
+
 @torch.no_grad()
 def evaluate():
-    """Mean loss on held_out, which training never sees. Forward-only on both
-    sides: no backward, no optimizer step, no loss-scale needed."""
+    """Mean loss on held_out, which training never sees. Forward-only through every stage."""
     total = 0.0
     for ids, labels in held_out:
-        h = forward_stage0(torch.tensor([ids], device=dev))
-        w_q.put({"cmd": "eval", "h": h, "labels": torch.tensor([labels])})
-        reply = recv(w_out)
-        total += float(reply["loss"])
+        loss, _ = run_micro(0, torch.tensor([ids], device=stage0.dev), torch.tensor([labels]),
+                            None, train=False)
+        total += float(loss)
     return total / len(held_out)
 
 
 start_step = resume()
 if start_step >= STEPS:
     log(f"checkpoint is already at step {start_step} >= STEPS={STEPS}; nothing to do")
-    w_q.put({"cmd": "stop"})
-    w_q.put(None)
-    w_writer.join()
-    worker.wait()
     sys.exit(0)
 
 try:
@@ -248,106 +229,66 @@ except (EOFError, BrokenPipeError, OSError) as exc:
     sys.exit(1)
 
 started = time.time()
-t_forward = t_wait = t_backward = t_step = 0.0
 ema_loss = None
-PROFILE = os.environ.get("PROFILE") == "1"
-prof = None
 last_completed_step = start_step
 try:
     for step in range(start_step + 1, STEPS + 1):
-        if PROFILE and step == start_step + 5:
-            prof = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA])
-            prof.__enter__()
         base = (step - 1) * MICROBATCHES * MICRO_BATCH_SIZE
-        t = time.time()
-        hs = []
+        losses, scale = [], None
         for j in range(MICROBATCHES):
             batch = [examples[(base + j * MICRO_BATCH_SIZE + k) % len(examples)] for k in range(MICRO_BATCH_SIZE)]
-            input_ids, labels, mask = collate(batch)
-            h = forward_stage0(input_ids, mask)
-            hs.append(h)
-            w_q.put({"cmd": "mb", "h": h.detach(), "labels": labels, "mask": mask, "per_step": MICROBATCHES})
-        t_forward += time.time() - t
+            ids, labels, mask = collate(batch)
+            loss, scale = run_micro(j, ids, labels, mask, train=True)
+            losses.append(float(loss))
 
-        losses = []
-        step_scale = None
-        for h in hs:
-            t = time.time()
-            reply = recv(w_out)
-            t_wait += time.time() - t
-            t = time.time()
-            h.backward(reply["grad"].to(device=h.device, dtype=h.dtype))
-            t_backward += time.time() - t
-            losses.append(float(reply["loss"]))
-            step_scale = reply["scale"]  # the worker's scale; every mb this step reports the same value
+        # Every stage must agree the gradients are finite before any of them steps.
+        finite = [stage0.grads_finite()] + [call(k, {"cmd": "check"})["finite"] for k in range(1, N_STAGES)]
+        finite_all = all(finite)
+        if not finite_all:
+            log(f"step {step}: non-finite gradient on some stage, skipping update on all stages")
+        new_scale = None
+        for k in range(1, N_STAGES):
+            reply = call(k, {"cmd": "apply", "apply": finite_all, "n_micro": MICROBATCHES,
+                             "scale": scale, "finite": finite_all})
+            if k == N_STAGES - 1:
+                new_scale = reply["scale"]
+        stage0.apply(finite_all, MICROBATCHES, scale, finite_all)
 
-        t = time.time()
-        finite = all(torch.isfinite(p.grad).all().item() for p in params if p.grad is not None)
-        if finite:
-            for p in params:
-                if p.grad is not None:
-                    p.grad.div_(step_scale * MICROBATCHES)
-            opt.step()
-        else:
-            log(f"step {step}: non-finite gradient, skipping update")
-        opt.zero_grad(set_to_none=True)
-        t_step += time.time() - t
-        if prof is not None and step == start_step + 6:
-            prof.__exit__(None, None, None)
-            print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=25), file=sys.stderr, flush=True)
-            prof.export_chrome_trace("/kaggle/working/trace_master.json")
-            prof = None
-
-        ack = recv(w_out)
-        if ack["finite"] != finite:
-            log(f"step {step}: master and worker disagree on gradient finiteness; they may have diverged")
-
-        # Updated every step regardless of LOG_EVERY, so the smoothing isn't
-        # biased by which steps happen to be printed.
         step_loss = sum(losses) / len(losses)
         ema_loss = step_loss if ema_loss is None else 0.9 * ema_loss + 0.1 * step_loss
-
         if step == start_step + 1 or step % LOG_EVERY == 0:
             n = step - start_step
             per_step = (time.time() - started) / n
             log(f"step {step}/{STEPS}  loss {step_loss:.4f} (smoothed {ema_loss:.4f})  "
-                f"scale {step_scale:.0f}  {per_step:.2f}s/step")
-            log(f"  per step avg: master forward+send {t_forward / n:.2f}s, waiting on worker {t_wait / n:.2f}s, "
-                f"master backward {t_backward / n:.2f}s, optimizer {t_step / n:.2f}s")
+                f"scale {scale:.0f}  {per_step:.2f}s/step")
         last_completed_step = step
         if step % CKPT_EVERY == 0:
-            # Coordinated save: the worker writes and acks its own checkpoint
-            # for this step before the master writes its own, so a crash
-            # between the two can no longer leave them at different steps
-            # (compute-pool#15).
-            w_q.put({"cmd": "ckpt", "step": step})
-            recv(w_out)  # {"ckpt_done": True}
+            # The stages save first and ack, then the master saves its own.
+            for k in range(1, N_STAGES):
+                call(k, {"cmd": "ckpt", "step": step})
             save_ckpt(step)
         if step % EVAL_EVERY == 0:
             log(f"step {step}: held-out loss {evaluate():.4f}")
 except (EOFError, BrokenPipeError, OSError) as exc:
-    # The worker went away mid-run (connection lost, OOM-killed, Kaggle session
-    # ended, ...). Do NOT save here: a save without the worker's ack would put
-    # this side ahead of the worker's last coordinated checkpoint, the exact
-    # desync compute-pool#15 fixes. Resume from the last coordinated checkpoint
-    # instead; the steps since then are discarded, which keeps both sides at
-    # the same step.
+    # A stage went away. Don't save here: a save without every stage's ack would put this
+    # side ahead of the stages, the desync compute-pool#15 fixes. Resume from the last
+    # coordinated checkpoint instead.
     last_ckpt = (last_completed_step // CKPT_EVERY) * CKPT_EVERY
     log(f"worker connection lost ({exc!r}) at step {last_completed_step}/{STEPS}.")
     log(f"discarded steps since the last checkpoint. rerun this script to resume from step {last_ckpt}.")
     sys.exit(1)
 
-# Must run before the worker is told to stop. Training already finished and
-# checkpointed above, so a lost connection here only costs this one number,
-# not the run -- log a warning and still shut down cleanly.
 try:
     log(f"held-out loss after this run: {evaluate():.4f}")
 except (EOFError, BrokenPipeError, OSError) as exc:
     log(f"worker connection lost while computing the final held-out loss ({exc!r}); skipping it.")
 
-w_q.put({"cmd": "stop"})
-w_q.put(None)
-w_writer.join()
-worker.wait()
+for k in range(1, N_STAGES):
+    call(k, {"cmd": "ckpt", "step": STEPS})
 save_ckpt(STEPS)
+for k in range(1, N_STAGES):
+    w_q[k].put({"cmd": "stop"})
+    w_q[k].put(None)
+for proc in workers:
+    proc.wait()
 log(f"done: {STEPS} steps in {time.time() - started:.0f}s; adapters saved via {CHECKPOINT_URI}")

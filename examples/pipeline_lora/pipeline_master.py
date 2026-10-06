@@ -42,7 +42,6 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(HERE)))
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
 from workers.kaggle.model_shard import load_stage  # noqa: E402
 from workers.kaggle.pipeline import Stage, split_layers  # noqa: E402
-from workers.kaggle.chain import Channel, run_micro as chain_run_micro, run_micro_batches  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 MAX_LEN = 256
@@ -124,19 +123,10 @@ for p in params:
 stage0 = Stage(core, None, first=True, last=False, params=params, lr=LR)
 
 
-def _reader(k):
-    return lambda: recv(w_out[k])
-
-
-# One FIFO channel per worker. Micro-batches run through these concurrently, so every
-# request and reply to a worker goes through its channel: a second reader on the same
-# pipe would steal replies (workers/kaggle/chain.py).
-channels = {k: Channel(send=w_q[k].put, recv=_reader(k)) for k in range(1, N_STAGES)}
-
-
 def call(k, msg):
     """Send one request to stage k and wait for its reply."""
-    return channels[k].call(msg)
+    w_q[k].put(msg)
+    return recv(w_out[k])
 
 
 def save_ckpt(step):
@@ -202,8 +192,18 @@ log(f"{len(examples)} training examples, {len(held_out)} held out for eval; "
 
 
 def run_micro(j, ids, labels, mask, train):
-    """One micro-batch through every stage (workers/kaggle/chain.py)."""
-    return chain_run_micro(stage0, channels, j, ids, labels, mask, train=train)
+    """One micro-batch through every stage. Returns (loss, scale). Training also runs the backward pass."""
+    h = stage0.forward(j, ids, mask, train=train)
+    for k in range(1, N_STAGES - 1):
+        h = call(k, {"cmd": "fwd", "mb": j, "h": h, "mask": mask, "train": train})["h"]
+    last = call(N_STAGES - 1, {"cmd": "fwd_loss", "mb": j, "h": h, "mask": mask, "labels": labels, "train": train})
+    if not train:
+        return last["loss"], None
+    grad = last["grad"]
+    for k in range(N_STAGES - 2, 0, -1):
+        grad = call(k, {"cmd": "bwd", "mb": j, "grad": grad})["grad"]
+    stage0.backward(j, grad)
+    return last["loss"], last["scale"]
 
 
 @torch.no_grad()
@@ -234,15 +234,12 @@ last_completed_step = start_step
 try:
     for step in range(start_step + 1, STEPS + 1):
         base = (step - 1) * MICROBATCHES * MICRO_BATCH_SIZE
-        # All micro-batches of the step run through the chain at once, so the stages overlap.
-        batches = []
+        losses, scale = [], None
         for j in range(MICROBATCHES):
             batch = [examples[(base + j * MICRO_BATCH_SIZE + k) % len(examples)] for k in range(MICRO_BATCH_SIZE)]
             ids, labels, mask = collate(batch)
-            batches.append((j, ids, labels, mask))
-        results = run_micro_batches(stage0, channels, batches)
-        losses = [float(loss) for loss, _ in results]
-        scale = results[-1][1]
+            loss, scale = run_micro(j, ids, labels, mask, train=True)
+            losses.append(float(loss))
 
         # Every stage must agree the gradients are finite before any of them steps.
         finite = [stage0.grads_finite()] + [call(k, {"cmd": "check"})["finite"] for k in range(1, N_STAGES)]

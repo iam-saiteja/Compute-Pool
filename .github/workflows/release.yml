@@ -17,24 +17,24 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  version:
     # Two independent locks, not one: the "release" environment (Settings -> Environments)
     # requires iam-saiteja's approval before this job runs at all, and this condition means
     # anyone else who somehow triggers the workflow gets an immediate no-op, not a pending
-    # approval request sitting in their name.
+    # approval request sitting in their name. Every other job needs this one, so gating it
+    # here gates the whole release.
     if: github.actor == 'iam-saiteja'
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     environment: release
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
     steps:
-      - uses: actions/checkout@v4
-
       - name: Compute the next version
         id: ver
-        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          latest=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
+          latest=$(gh release list --repo "${{ github.repository }}" --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || true)
           if [ -z "$latest" ]; then
             major=0; minor=1; patch=0
           else
@@ -51,21 +51,49 @@ jobs:
           echo "Previous release: ${latest:-none}. New: $tag"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: compute-pool-${{ needs.version.outputs.tag }}-windows.exe
+            built_path: target/release/compute-pool.exe
+          - os: ubuntu-latest
+            artifact: compute-pool-${{ needs.version.outputs.tag }}-linux
+            built_path: target/release/compute-pool
+          - os: macos-latest
+            artifact: compute-pool-${{ needs.version.outputs.tag }}-macos
+            built_path: target/release/compute-pool
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-
       - name: Build
         run: cargo build --release -p compute-pool-cli
-
-      - name: Package the exe under its version
+      - name: Package under its version and platform
         shell: bash
         run: |
           mkdir dist
-          cp target/release/compute-pool.exe "dist/compute-pool-${{ steps.ver.outputs.tag }}.exe"
+          cp "${{ matrix.built_path }}" "dist/${{ matrix.artifact }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
 
+  release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${{ steps.ver.outputs.tag }}" dist/* \
-            --title "${{ steps.ver.outputs.tag }}" \
+          gh release create "${{ needs.version.outputs.tag }}" dist/* \
+            --repo "${{ github.repository }}" \
+            --title "${{ needs.version.outputs.tag }}" \
             --generate-notes

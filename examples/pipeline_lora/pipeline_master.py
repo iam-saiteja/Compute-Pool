@@ -78,10 +78,29 @@ LAYERS = split_layers(AutoConfig.from_pretrained(MODEL_ID).num_hidden_layers, N_
 # peft refuses to run with the torchao 0.10 that Kaggle images ship, and LoRA does not need it.
 subprocess.run(["pip", "uninstall", "-y", "-q", "torchao"], check=False)
 
-workers, w_out, w_q = [], {}, {}
-for k, host in enumerate(WORKER_HOSTS, start=1):
+class StageDisconnected(Exception):
+    """A call to stage k failed. Carries k, so the caller knows which stage to reconnect."""
+
+    def __init__(self, k, exc):
+        super().__init__(f"stage {k}: {exc!r}")
+        self.k = k
+        self.exc = exc
+
+
+workers, w_out, w_q = {}, {}, {}
+
+
+def connect_stage(k, kill_first=False):
+    """(Re)launch stage k's worker process on its node and (re)open its channel.
+    kill_first=True is for a reconnect: a stray process from before the drop may still be
+    running (compute-pool#16), and a second one talking over the same stdin/stdout would
+    corrupt the protocol, so any previous one is killed first."""
+    host = WORKER_HOSTS[k - 1]
+    if kill_first:
+        subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host,
+                         "pkill -9 -f pipeline_worker.py 2>/dev/null; true"], check=False)
     subprocess.run(
-        ["scp", "-o", "ConnectTimeout=5",
+        ["scp", "-o", "ConnectTimeout=10",
          os.path.join(HERE, "pipeline_worker.py"), os.path.join(HERE, "cp_wire.py"), f"{host}:/kaggle/working/"],
         check=True,
     )
@@ -92,9 +111,13 @@ for k, host in enumerate(WORKER_HOSTS, start=1):
     ])
     proc = spawn(["ssh", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=20",
                   host, f"pip uninstall -y -q torchao 2>/dev/null; cd /kaggle/working && {env} exec python3 -u pipeline_worker.py"])
-    workers.append(proc)
+    workers[k] = proc
     w_out[k] = proc.stdout
     w_q[k], _ = start_writer(proc.stdin)
+
+
+for k in range(1, N_STAGES):
+    connect_stage(k)
 
 tok = AutoTokenizer.from_pretrained(MODEL_ID)
 if tok.pad_token is None:
@@ -125,8 +148,11 @@ stage0 = Stage(core, None, first=True, last=False, params=params, lr=LR)
 
 def call(k, msg):
     """Send one request to stage k and wait for its reply."""
-    w_q[k].put(msg)
-    return recv(w_out[k])
+    try:
+        w_q[k].put(msg)
+        return recv(w_out[k])
+    except (EOFError, BrokenPipeError, OSError) as exc:
+        raise StageDisconnected(k, exc) from exc
 
 
 def save_ckpt(step):
@@ -224,71 +250,111 @@ if start_step >= STEPS:
 
 try:
     log(f"held-out loss before this run: {evaluate():.4f}")
-except (EOFError, BrokenPipeError, OSError) as exc:
-    log(f"worker connection lost before training started ({exc!r}). Nothing was trained; rerun.")
+except StageDisconnected as exc:
+    log(f"worker connection lost before training started ({exc.exc!r}). Nothing was trained; rerun.")
     sys.exit(1)
+
+MAX_RECONNECTS = int(os.environ.get("MAX_RECONNECTS", "5"))
+
+
+def recover_from_disconnect(failed_k):
+    """A stage dropped mid-run. Reconnect it, roll every other live stage back to the
+    last coordinated checkpoint, and reload the master's own state the same way, so
+    every stage ends up at the same step and the run can continue instead of ending
+    (compute-pool#16)."""
+    log(f"stage {failed_k} disconnected; reconnecting it and rolling every stage back "
+        f"to the last checkpoint")
+    connect_stage(failed_k, kill_first=True)
+    for other_k in range(1, N_STAGES):
+        if other_k == failed_k:
+            continue
+        try:
+            call(other_k, {"cmd": "reload"})
+        except StageDisconnected as exc2:
+            log(f"stage {exc2.k} also dropped while rolling back; reconnecting it too")
+            connect_stage(exc2.k, kill_first=True)
+    return resume()  # the master reloads its own last checkpoint the same way
+
 
 started = time.time()
 ema_loss = None
 last_completed_step = start_step
-try:
-    for step in range(start_step + 1, STEPS + 1):
-        base = (step - 1) * MICROBATCHES * MICRO_BATCH_SIZE
-        losses, scale = [], None
-        for j in range(MICROBATCHES):
-            batch = [examples[(base + j * MICRO_BATCH_SIZE + k) % len(examples)] for k in range(MICRO_BATCH_SIZE)]
-            ids, labels, mask = collate(batch)
-            loss, scale = run_micro(j, ids, labels, mask, train=True)
-            losses.append(float(loss))
+reconnects = 0
+step = start_step
+while True:
+    try:
+        for step in range(step + 1, STEPS + 1):
+            base = (step - 1) * MICROBATCHES * MICRO_BATCH_SIZE
+            losses, scale = [], None
+            for j in range(MICROBATCHES):
+                batch = [examples[(base + j * MICRO_BATCH_SIZE + k) % len(examples)] for k in range(MICRO_BATCH_SIZE)]
+                ids, labels, mask = collate(batch)
+                loss, scale = run_micro(j, ids, labels, mask, train=True)
+                losses.append(float(loss))
 
-        # Every stage must agree the gradients are finite before any of them steps.
-        finite = [stage0.grads_finite()] + [call(k, {"cmd": "check"})["finite"] for k in range(1, N_STAGES)]
-        finite_all = all(finite)
-        if not finite_all:
-            log(f"step {step}: non-finite gradient on some stage, skipping update on all stages")
-        new_scale = None
-        for k in range(1, N_STAGES):
-            reply = call(k, {"cmd": "apply", "apply": finite_all, "n_micro": MICROBATCHES,
-                             "scale": scale, "finite": finite_all})
-            if k == N_STAGES - 1:
-                new_scale = reply["scale"]
-        stage0.apply(finite_all, MICROBATCHES, scale, finite_all)
-
-        step_loss = sum(losses) / len(losses)
-        ema_loss = step_loss if ema_loss is None else 0.9 * ema_loss + 0.1 * step_loss
-        if step == start_step + 1 or step % LOG_EVERY == 0:
-            n = step - start_step
-            per_step = (time.time() - started) / n
-            log(f"step {step}/{STEPS}  loss {step_loss:.4f} (smoothed {ema_loss:.4f})  "
-                f"scale {scale:.0f}  {per_step:.2f}s/step")
-        last_completed_step = step
-        if step % CKPT_EVERY == 0:
-            # The stages save first and ack, then the master saves its own.
+            # Every stage must agree the gradients are finite before any of them steps.
+            finite = [stage0.grads_finite()] + [call(k, {"cmd": "check"})["finite"] for k in range(1, N_STAGES)]
+            finite_all = all(finite)
+            if not finite_all:
+                log(f"step {step}: non-finite gradient on some stage, skipping update on all stages")
+            new_scale = None
             for k in range(1, N_STAGES):
-                call(k, {"cmd": "ckpt", "step": step})
-            save_ckpt(step)
-        if step % EVAL_EVERY == 0:
-            log(f"step {step}: held-out loss {evaluate():.4f}")
-except (EOFError, BrokenPipeError, OSError) as exc:
-    # A stage went away. Don't save here: a save without every stage's ack would put this
-    # side ahead of the stages, the desync compute-pool#15 fixes. Resume from the last
-    # coordinated checkpoint instead.
-    last_ckpt = (last_completed_step // CKPT_EVERY) * CKPT_EVERY
-    log(f"worker connection lost ({exc!r}) at step {last_completed_step}/{STEPS}.")
-    log(f"discarded steps since the last checkpoint. rerun this script to resume from step {last_ckpt}.")
-    sys.exit(1)
+                reply = call(k, {"cmd": "apply", "apply": finite_all, "n_micro": MICROBATCHES,
+                                 "scale": scale, "finite": finite_all})
+                if k == N_STAGES - 1:
+                    new_scale = reply["scale"]
+            stage0.apply(finite_all, MICROBATCHES, scale, finite_all)
+
+            step_loss = sum(losses) / len(losses)
+            ema_loss = step_loss if ema_loss is None else 0.9 * ema_loss + 0.1 * step_loss
+            if step == start_step + 1 or step % LOG_EVERY == 0:
+                n = step - start_step
+                per_step = (time.time() - started) / n
+                log(f"step {step}/{STEPS}  loss {step_loss:.4f} (smoothed {ema_loss:.4f})  "
+                    f"scale {scale:.0f}  {per_step:.2f}s/step")
+            last_completed_step = step
+            if step % CKPT_EVERY == 0:
+                # The stages save first and ack, then the master saves its own.
+                for k in range(1, N_STAGES):
+                    call(k, {"cmd": "ckpt", "step": step})
+                save_ckpt(step)
+            if step % EVAL_EVERY == 0:
+                log(f"step {step}: held-out loss {evaluate():.4f}")
+        break  # every step completed
+    except StageDisconnected as exc:
+        reconnects += 1
+        if reconnects > MAX_RECONNECTS:
+            last_ckpt = (last_completed_step // CKPT_EVERY) * CKPT_EVERY
+            log(f"stage {exc.k} disconnected ({exc.exc!r}) at step {last_completed_step}/{STEPS}, "
+                f"and reconnecting failed too many times ({MAX_RECONNECTS}).")
+            log(f"discarded steps since the last checkpoint. rerun this script to resume from step {last_ckpt}.")
+            sys.exit(1)
+        try:
+            step = recover_from_disconnect(exc.k)
+            last_completed_step = step
+            ema_loss = None  # the reloaded weights are the last checkpoint's, not mid-step
+        except Exception as exc2:
+            # scp/ssh failing, or another stage also found broken while rolling back: log it
+            # and let the outer loop try again from the same point, up to MAX_RECONNECTS.
+            log(f"reconnecting after stage {exc.k}'s disconnect failed too ({exc2!r}); will try again")
 
 try:
     log(f"held-out loss after this run: {evaluate():.4f}")
-except (EOFError, BrokenPipeError, OSError) as exc:
-    log(f"worker connection lost while computing the final held-out loss ({exc!r}); skipping it.")
+except StageDisconnected as exc:
+    log(f"worker connection lost while computing the final held-out loss ({exc.exc!r}); skipping it.")
 
-for k in range(1, N_STAGES):
-    call(k, {"cmd": "ckpt", "step": STEPS})
-save_ckpt(STEPS)
+try:
+    for k in range(1, N_STAGES):
+        call(k, {"cmd": "ckpt", "step": STEPS})
+    save_ckpt(STEPS)
+except StageDisconnected as exc:
+    # Training already finished and was checkpointed inside the loop, so a lost connection
+    # here only costs this very last save, not the run.
+    log(f"worker connection lost while saving the final checkpoint ({exc.exc!r}); "
+        f"the last CKPT_EVERY save still has the adapters.")
 for k in range(1, N_STAGES):
     w_q[k].put({"cmd": "stop"})
     w_q[k].put(None)
-for proc in workers:
+for proc in workers.values():
     proc.wait()
 log(f"done: {STEPS} steps in {time.time() - started:.0f}s; adapters saved via {CHECKPOINT_URI}")

@@ -135,6 +135,14 @@ while True:
         save_ckpt(msg["step"])
         outbox.put({"ckpt_done": True})
 
+    elif cmd == "reload":
+        # Another stage disconnected and reconnected; this one stays up, but its in-memory
+        # weights must roll back to the last coordinated checkpoint too, so every stage
+        # ends up at the same step (compute-pool#16). Cheap: only the adapter tensors
+        # reload, not the base model.
+        step = resume()
+        outbox.put({"reloaded_at": step})
+
 outbox.put(None)
 writer.join()
 log("stopped")

@@ -32,8 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspa
 from workers.kaggle import checkpoint as checkpoint_mod  # noqa: E402
 from workers.kaggle.amp import DynamicLossScaler  # noqa: E402
 from workers.kaggle.model_shard import load_stage  # noqa: E402
-from workers.kaggle.chain import HalfPipeline  # noqa: E402
-from workers.kaggle.pipeline import make_halves, split_layers  # noqa: E402
+from workers.kaggle.pipeline import Stage, split_layers  # noqa: E402
 
 MODEL_ID = "NousResearch/Meta-Llama-3.1-8B"
 LR = 2e-4
@@ -71,8 +70,7 @@ params = [p for p in peft_model.parameters() if p.requires_grad and p.device.typ
 for p in params:
     p.data = p.data.float()
 scaler = DynamicLossScaler() if LAST else None
-# This node's layers, split into two halves that run in parallel on its two GPUs.
-front, back = make_halves(core, head, last=LAST, lr=LR, scaler=scaler)
+stage = Stage(core, head, first=False, last=LAST, params=params, lr=LR, scaler=scaler)
 ckpt_store = checkpoint_mod.open_store(CHECKPOINT_URI, JOB_ID)
 
 
@@ -104,7 +102,6 @@ def resume():
 inbox = start_reader(sys.stdin.buffer)
 outbox, writer = start_writer(sys.stdout.buffer)
 resume()
-pipe = HalfPipeline(front, back, reply=outbox.put)
 log("ready")
 
 while True:
@@ -112,19 +109,31 @@ while True:
     if msg is None or msg["cmd"] == "stop":
         break
     cmd = msg["cmd"]
-    if cmd in ("fwd", "fwd_loss", "bwd"):
-        # Queued; the reply goes out when this request finishes. Replies carry the request id.
-        pipe.submit(msg)
+    train = msg.get("train", True)
+
+    if cmd == "fwd":
+        with torch.set_grad_enabled(train):
+            out = stage.forward(msg["mb"], msg["h"], msg.get("mask"), train=train)
+        outbox.put({"h": out})
+
+    elif cmd == "fwd_loss":
+        with torch.set_grad_enabled(train):
+            loss, grad, scale = stage.forward_loss(msg["mb"], msg["h"], msg.get("mask"), msg["labels"], train=train)
+        outbox.put({"loss": loss, "grad": grad, "scale": scale})
+
+    elif cmd == "bwd":
+        outbox.put({"grad": stage.backward(msg["mb"], msg["grad"])})
+
     elif cmd == "check":
-        outbox.put({"id": msg["id"], "finite": pipe.check()})
+        outbox.put({"finite": stage.grads_finite()})
+
     elif cmd == "apply":
-        # The master only sends control messages once every reply for the step is back,
-        # so nothing is in flight here.
-        new_scale = pipe.apply(msg["apply"], msg["n_micro"], msg["scale"], msg["finite"])
-        outbox.put({"id": msg["id"], "scale": new_scale})
+        new_scale = stage.apply(msg["apply"], msg["n_micro"], msg["scale"], msg["finite"])
+        outbox.put({"scale": new_scale})
+
     elif cmd == "ckpt":
         save_ckpt(msg["step"])
-        outbox.put({"id": msg["id"], "ckpt_done": True})
+        outbox.put({"ckpt_done": True})
 
 outbox.put(None)
 writer.join()

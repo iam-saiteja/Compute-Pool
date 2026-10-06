@@ -128,36 +128,3 @@ class Stage:
         mods = [("", self.core)] + ([("lm_head.", self.head)] if self.last else [])
         return [(prefix + n, p) for prefix, m in mods for n, p in m.named_parameters()
                 if p.requires_grad and p.device.type != "meta"]
-
-
-class Part(torch.nn.Module):
-    """A slice of a node's layers, shaped like the core module that Stage expects."""
-
-    def __init__(self, layers, rotary_emb, norm=None):
-        super().__init__()
-        self.layers = torch.nn.ModuleList(layers)
-        self.rotary_emb = rotary_emb
-        if norm is not None:
-            self.norm = norm
-
-
-def _trainable(*modules):
-    return [p for m in modules for p in m.parameters() if p.requires_grad and p.device.type != "meta"]
-
-
-def make_halves(core, head, last, lr, scaler=None):
-    """Split a node's layers into a front half and a back half, each a Stage.
-    The front half runs on the node's first GPU and the back half on its second, so the
-    two can work on different micro-batches at the same time (chain.HalfPipeline).
-    Returns (front Stage, back Stage)."""
-    layers = list(core.layers)
-    if len(layers) < 2:
-        raise ValueError("a node needs at least two layers to split across its GPUs")
-    cut = len(layers) // 2
-    front_part = Part(layers[:cut], core.rotary_emb)
-    back_part = Part(layers[cut:], core.rotary_emb, core.norm if last else None)
-    front = Stage(front_part, None, first=False, last=False, params=_trainable(front_part), lr=lr)
-    back = Stage(back_part, head if last else None, first=False, last=last,
-                 params=_trainable(back_part, head) if last else _trainable(back_part),
-                 lr=lr, scaler=scaler if last else None)
-    return front, back

@@ -185,6 +185,19 @@ subprocess.Popen([
 ])
 print("[*] SSH daemon active on port 2222 (master's public key installed).", flush=True)
 
+# Publish this sshd's host key so the master can pin it. Without this the master
+# would connect blind over the tunnel, and anyone in the middle could impersonate
+# the worker (compute-pool#1 follow-up: no host-key verification).
+with open("/etc/ssh/ssh_host_ed25519_key.pub") as f:
+    host_pubkey = f.read().strip()
+for _ in range(5):
+    try:
+        req = urllib.request.Request(f"https://ntfy.sh/{SESSION_ID}-hostkey", data=host_pubkey.encode("utf-8"))
+        urllib.request.urlopen(req, timeout=10)
+        break
+    except Exception:
+        time.sleep(2)
+
 # 3. Bridge that SSH port back to the master via Chisel over a Cloudflare
 #    quick tunnel -- Kaggle sessions accept no inbound connections and have
 #    no fixed address, so this is how the master reaches this port at all.
@@ -208,12 +221,10 @@ for line in cf_proc.stdout:
 
 # 4. Start File Browser on Worker port 8081, tunneled out for the user's own
 #    browser only. Authenticated: --noauth gave anyone with the tunnel URL a
-#    root-container file manager (compute-pool#1). Fixed default credential,
-#    by the account owner's own choice -- they manage it themselves (e.g.
-#    `filebrowser users update`) over the SSH access they already have,
-#    rather than this script generating and then needing to disclose one.
+#    root-container file manager (compute-pool#1). The password is the one the
+#    user set with `compute-pool pwd`, substituted in when the cluster launches.
 fb_user = "compute-pool"
-fb_password = "1234"
+fb_password = "__WEB_PASSWORD__"
 fb_db = "/root/.filebrowser.db"
 subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "config", "init"], check=False)
 subprocess.run(["/usr/local/bin/filebrowser", "-d", fb_db, "users", "add", fb_user, fb_password, "--perm.admin"], check=False)
@@ -315,11 +326,10 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias halt='/usr/local/bin/stop'\n")
     f.write("alias exit='/usr/local/bin/stop'\n")
 
-# Fixed default credential, by the account owner's own choice -- they manage
-# it themselves (e.g. `filebrowser users update`, restarting ttyd with a new
-# -c) over the SSH access they already have (compute-pool#1).
+# The web terminal and file manager password is the one the user set with
+# `compute-pool pwd`, substituted in when the cluster launches (compute-pool#1).
 web_user = "compute-pool"
-web_password = "1234"
+web_password = "__WEB_PASSWORD__"
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
     "-c", f"{web_user}:{web_password}",
@@ -478,6 +488,8 @@ def publish_pubkey():
 
 threading.Thread(target=publish_pubkey, daemon=True).start()
 
+# Start with no pinned host keys: each worker's key is added when it peers.
+open("/root/.ssh/known_hosts", "w").close()
 with open("/root/.ssh/config", "w") as f:
     for i in range(1, len(WORKER_SESSIONS) + 1):
         f.write(f"Host node{i}\n")
@@ -485,8 +497,10 @@ with open("/root/.ssh/config", "w") as f:
         f.write(f"    Port {SSH_PORT_BASE + i}\n")
         f.write("    User root\n")
         f.write(f"    IdentityFile {key_path}\n")
-        f.write("    StrictHostKeyChecking no\n")
-        f.write("    UserKnownHostsFile /dev/null\n")
+        # Host keys are pinned per worker in peer_worker(), from the worker's own
+        # ntfy publication. An unknown or changed key is refused, not accepted.
+        f.write("    StrictHostKeyChecking yes\n")
+        f.write("    UserKnownHostsFile /root/.ssh/known_hosts\n")
         f.write("    LogLevel ERROR\n")
 os.chmod("/root/.ssh/config", 0o600)
 
@@ -549,6 +563,23 @@ def peer_worker(index, session_id):
     if worker is None:
         update_node(name, status="failed", error="worker never registered (check its error topic)")
         return
+    # Pin the worker's sshd host key before connecting, so the tunnel is verified.
+    hostkey = ""
+    for _ in range(40):
+        try:
+            with urllib.request.urlopen(urllib.request.Request(f"https://ntfy.sh/{session_id}-hostkey/raw?poll=1"), timeout=5) as r:
+                raw = r.read().decode("utf-8").strip()
+                if raw.startswith("ssh-"):
+                    hostkey = raw
+                    break
+        except Exception:
+            pass
+        time.sleep(3)
+    if not hostkey:
+        update_node(name, status="failed", error="worker never published its SSH host key; refusing to connect unverified")
+        return
+    with open("/root/.ssh/known_hosts", "a") as kh:
+        kh.write(f"[127.0.0.1]:{SSH_PORT_BASE + index} {hostkey}\n")
     subprocess.Popen(
         ["/usr/local/bin/chisel", "client", "--keepalive", "10s", worker["chisel_url"], f"{SSH_PORT_BASE + index}:127.0.0.1:2222"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -855,11 +886,10 @@ with open(os.path.expanduser("~/.bashrc"), "a") as f:
     f.write("alias exit='/usr/local/bin/stop'\n")
 
 # 8. Web terminal, file manager and their Cloudflare tunnels for the user's browser.
-# Fixed default credential, by the account owner's own choice -- they manage
-# it themselves (e.g. `filebrowser users update`, restarting ttyd with a new
-# -c) over the SSH access they already have (compute-pool#1).
+# The web terminal and file manager password is the one the user set with
+# `compute-pool pwd`, substituted in when the cluster launches (compute-pool#1).
 web_user = "compute-pool"
-web_password = "1234"
+web_password = "__WEB_PASSWORD__"
 ttyd_proc = subprocess.Popen([
     "/usr/local/bin/ttyd", "-W", "-p", "7681",
     "-c", f"{web_user}:{web_password}",
@@ -949,6 +979,14 @@ fn random_suffix() -> String {
         .collect()
 }
 
+/// The web terminal and file manager password the user set with `compute-pool pwd`.
+pub fn web_password() -> Result<String> {
+    match crate::auth::load_settings()?.web_password {
+        Some(pw) => Ok(pw),
+        None => anyhow::bail!("No web password set yet. Run `compute-pool pwd` to set one."),
+    }
+}
+
 pub async fn launch_gpu_shell(
     slot: usize,
     duration_minutes: u32,
@@ -982,7 +1020,8 @@ pub async fn launch_gpu_shell(
     let script = SINGLE_SHELL_BOOTSTRAP_TEMPLATE
         .replace("__SESSION_ID__", &session_id)
         .replace("__DURATION_MINUTES__", &duration_minutes.to_string())
-        .replace("__NODE_LABEL__", &format!("node{}-slot{}", slot - 1, slot));
+        .replace("__NODE_LABEL__", &format!("node{}-slot{}", slot - 1, slot))
+        .replace("__WEB_PASSWORD__", &web_password()?);
 
     let client = KaggleClient::new(&creds.username, &creds.key);
     client.push_kernel(&slug, &script, true).await
@@ -1118,9 +1157,15 @@ pub async fn launch_cluster_shell(
         creds.push(c);
     }
 
+    // One network call per account; run them concurrently so a 4-node launch
+    // waits for the slowest check, not the sum of all four.
     let needed_hours = duration_minutes as f64 / 60.0;
+    let mut checks = tokio::task::JoinSet::new();
     for slot in 1..=nodes {
-        ensure_quota(slot, needed_hours).await?;
+        checks.spawn(ensure_quota(slot, needed_hours));
+    }
+    while let Some(joined) = checks.join_next().await {
+        joined.context("quota check task failed")??;
     }
 
     let suffix = random_suffix();
@@ -1150,10 +1195,12 @@ pub async fn launch_cluster_shell(
         upsert_job(&job)?;
     }
 
+    let password = web_password()?;
     let master_script = MASTER_BOOTSTRAP_TEMPLATE
         .replace("__SESSION_ID__", &master_id)
         .replace("__DURATION_MINUTES__", &duration_minutes.to_string())
-        .replace("__WORKER_SESSIONS__", &serde_json::to_string(&worker_ids)?);
+        .replace("__WORKER_SESSIONS__", &serde_json::to_string(&worker_ids)?)
+        .replace("__WEB_PASSWORD__", &password);
 
     let mut scripts = vec![master_script];
     for (i, wid) in worker_ids.iter().enumerate() {
@@ -1163,7 +1210,8 @@ pub async fn launch_cluster_shell(
                 .replace("__SESSION_ID__", wid)
                 .replace("__DURATION_MINUTES__", &duration_minutes.to_string())
                 .replace("__MASTER_SESSION_ID__", &master_id)
-                .replace("__NODE_LABEL__", &format!("node{}-slot{}", node_idx, node_idx + 1)),
+                .replace("__NODE_LABEL__", &format!("node{}-slot{}", node_idx, node_idx + 1))
+                .replace("__WEB_PASSWORD__", &password),
         );
     }
 
@@ -1320,7 +1368,8 @@ mod tests {
         let t = SINGLE_SHELL_BOOTSTRAP_TEMPLATE
             .replace("__SESSION_ID__", "cp-test")
             .replace("__DURATION_MINUTES__", "60")
-            .replace("__NODE_LABEL__", "node0-slot1");
+            .replace("__NODE_LABEL__", "node0-slot1")
+            .replace("__WEB_PASSWORD__", "test-pass");
 
         assert!(t.contains("SESSION_ID = \"cp-test\""));
         assert!(t.contains("DURATION_MINUTES = 60"));
@@ -1332,11 +1381,12 @@ mod tests {
         let master = MASTER_BOOTSTRAP_TEMPLATE
             .replace("__SESSION_ID__", "cp-master-test")
             .replace("__DURATION_MINUTES__", "60")
-            .replace("__WORKER_SESSIONS__", r#"["cp-worker1-test","cp-worker2-test"]"#);
+            .replace("__WORKER_SESSIONS__", r#"["cp-worker1-test","cp-worker2-test"]"#)
+            .replace("__WEB_PASSWORD__", "test-pass");
 
         assert!(master.contains("SESSION_ID = \"cp-master-test\""));
         assert!(master.contains(r#"WORKER_SESSIONS = ["cp-worker1-test","cp-worker2-test"]"#));
-        for placeholder in ["__SESSION_ID__", "__WORKER_SESSIONS__", "__DURATION_MINUTES__"] {
+        for placeholder in ["__SESSION_ID__", "__WORKER_SESSIONS__", "__DURATION_MINUTES__", "__WEB_PASSWORD__"] {
             assert!(!master.contains(placeholder), "unfilled {}", placeholder);
         }
 
@@ -1344,12 +1394,13 @@ mod tests {
             .replace("__SESSION_ID__", "cp-worker1-test")
             .replace("__DURATION_MINUTES__", "60")
             .replace("__MASTER_SESSION_ID__", "cp-master-test")
-            .replace("__NODE_LABEL__", "node1-slot2");
+            .replace("__NODE_LABEL__", "node1-slot2")
+            .replace("__WEB_PASSWORD__", "test-pass");
 
         assert!(worker.contains("SESSION_ID = \"cp-worker1-test\""));
         assert!(worker.contains("MASTER_SESSION_ID = \"cp-master-test\""));
         assert!(worker.contains("NODE_LABEL = \"node1-slot2\""));
-        for placeholder in ["__SESSION_ID__", "__MASTER_SESSION_ID__", "__NODE_LABEL__", "__DURATION_MINUTES__"] {
+        for placeholder in ["__SESSION_ID__", "__MASTER_SESSION_ID__", "__NODE_LABEL__", "__DURATION_MINUTES__", "__WEB_PASSWORD__"] {
             assert!(!worker.contains(placeholder), "unfilled {}", placeholder);
         }
     }

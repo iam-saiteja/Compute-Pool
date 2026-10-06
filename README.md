@@ -24,18 +24,83 @@ Kaggle sessions accept no inbound connections and have no fixed address, so node
 
 A health loop pings every node every 30 seconds; a node that misses 3 checks in a row is marked `down` and drops out of dispatch, and returns automatically once it answers again.
 
-### Web terminal / file manager credentials
+### Web terminal and file manager password
 
-The web terminal (`ttyd`) and file manager (`filebrowser`) tunneled to your browser are protected with a **fixed default login, `compute-pool` / `1234`**, not a generated one -- change it yourself once the cluster is up, over the SSH access you already have:
+The web terminal (`ttyd`) and file manager (`filebrowser`) in your browser are protected by a password you set, with the username `compute-pool`.
 
-```bash
-# File manager (run on whichever node you want to change):
-ssh node1 "pkill -f filebrowser; filebrowser -d /root/.filebrowser.db users update compute-pool --password 'your-new-password'"
-# then restart it the same way the bootstrap script does (filebrowser -d /root/.filebrowser.db -r /kaggle/working -a 0.0.0.0 -p 8080/8081 &)
+- **First launch:** `compute-pool shell` asks you to set one if none exists yet. There is no default password.
+- **Change it any time:** `compute-pool pwd`. The new password applies to the **next** `compute-pool shell`. A session that is already running keeps the password it started with, so restart it to pick up the change.
+- **Where it lives:** `~/.compute_pool/credentials.json`, next to your account keys. It is written into each cluster's bootstrap script, and that kernel is pushed to Kaggle as **private**, so only your account can read it.
+- **Allowed characters:** 4 to 64 letters, digits, and `- _ . ! @ # % + =`. Quotes, backslashes and spaces are refused, because the password becomes a string inside the generated script.
 
-# Web terminal (master/single-shell only): kill and relaunch ttyd with a new -c user:pass
-ssh node0 "pkill -f ttyd; /usr/local/bin/ttyd -W -p 7681 -c compute-pool:your-new-password bash &"
+### Account policy (asked once)
+
+The first `compute-pool login` or `compute-pool shell` asks you to accept the policy risk, then records the answer in the same credentials file. Declining stores nothing and runs nothing.
+
+What the answer means: Kaggle's policy, as stated in its rules and community posts, is one account per person. Compute Pool pools several accounts, so accounts used this way can be banned. The full research is in [#12](https://github.com/iam-saiteja/Compute-Pool/issues/12). The full terms were not readable by the tool that researched them, so check the current terms yourself.
+
+### Security
+
+What is protected:
+
+- **Node-to-node SSH** is encrypted and key-authenticated. The master generates the keypair and keeps the private key on its own disk; only the public half goes over the wire.
+- **Host keys are pinned.** Each worker publishes its SSH host key, and the master writes it to `known_hosts` before connecting. An unknown or changed key is refused. Before this, host checking was off, so someone in the middle of the tunnel could have impersonated a worker.
+- **Web terminal and file manager** require the password above. Their URLs are public Cloudflare tunnels, so the password is the only thing between the internet and a shell on your node.
+- **Session topics** on ntfy.sh use a 12-character random suffix from a cryptographically secure generator, so they cannot be guessed. Anyone who learns a topic name can read that session's URLs, which is why the password matters.
+
+What is not protected, and what to know:
+
+- The rendezvous over [ntfy.sh](https://ntfy.sh) is public. The secrecy of a session rests on its random topic name.
+- Kaggle sees everything that runs on its machines. Do not put secrets you cannot share with Kaggle into a job.
+- Pooling accounts can get them banned (see above).
+
+### Performance and latency
+
+Measured on the Kaggle-over-SSH link (see `examples/cluster_comm/link_bench.py`): about 16 MB/s effective bandwidth and about 70 ms round-trip time. A pipeline step moves activations and gradients for every example across that link, so the link, not the GPU, is usually the bottleneck. Practical consequences:
+
+- Work that exchanges data rarely (independent tasks, `pool-map`, periodic all-reduce) runs well over this link.
+- Work that exchanges data every micro-batch (pipeline parallelism) is limited by bytes moved. Batches are length-bucketed so padding is not sent (about 7% padding instead of about 42% for random batches at batch size 4).
+- Tight collectives that synchronize every step on large tensors do not fit this link.
+
+The cluster launch checks every account's GPU quota in parallel, so a larger cluster does not wait for each check in turn.
+
+## Help, troubleshooting, and asking an AI for help
+
+- Run `compute-pool --help`, or `compute-pool <command> --help`, for the options of each command.
+- For a problem with a workload, the **examples are the reference**. Start with the closest one: `examples/cluster_comm/allreduce_logreg.py` for data-parallel, `examples/pipeline_lora/` for model-parallel, `crun`/`pool-map` for independent tasks.
+- Logs from a run show which side failed. A `[master] worker connection lost` line means the worker died; rerun the same command with the same job id to resume.
+
+If you ask an AI assistant for help, paste this prompt first so it works from the same facts:
+
+```text
+You are helping with Compute Pool, a CLI that pools several Kaggle accounts' GPUs into a
+cluster. Facts that matter:
+- Kaggle's policy is one account per person; pooling accounts can get them banned. Do not
+  suggest tactics that hide multiple accounts.
+- Nodes connect over SSH through Cloudflare tunnels; host keys are pinned by the master.
+- The link is about 16 MB/s and 70 ms RTT. Pipeline parallelism is bandwidth-bound.
+- Check the examples before writing new code: examples/cluster_comm/allreduce_logreg.py
+  (data-parallel), examples/pipeline_lora/ (model-parallel with checkpoints),
+  workers/kaggle/ (wire transport, checkpoints, pool-map).
+- Do not claim torch.distributed NCCL or gloo works across nodes; it does not on this fabric.
+Ask me for the exact command and the full error before diagnosing. Then suggest the smallest change.
 ```
+
+## What this can do
+
+- **Data parallelism:** yes. Each node computes gradients on its share of the data and they are summed with an all-reduce over SSH. `examples/cluster_comm/allreduce_logreg.py` checks the result against a single-node run.
+- **Model parallelism (pipeline):** yes. A model is split across two nodes and micro-batches flow through both. `examples/pipeline_lora/` trains an 8B model's LoRA adapters this way, with checkpoint and resume.
+- **Several GPUs at the same time:** yes across nodes, since each node runs its own stage. Within a node, the layers are split across its GPUs, but the two GPUs run one after the other for a given micro-batch. Running them in parallel is not done yet (issue #14).
+- **Not supported:** tight collectives across nodes on every step (`torch.distributed` gloo/NCCL), and tensor parallelism across nodes. Both need direct node-to-node connections, which Kaggle does not allow.
+
+## How many accounts
+
+The code allows up to **8 account slots** (`MAX_ACCOUNT_SLOTS` in `auth.rs`). Each node uses its own slot, so a cluster is at most 8 nodes. Two things set how useful that is:
+
+- **Independent work** (`crun`, `pool-map`) scales with the number of nodes. The SSH ports and the registry grow with the cluster, and this is the path that scales best.
+- **Pipeline work** is two stages in the example. A three-stage pipeline is not implemented, so extra nodes do not speed up a single pipeline.
+
+Eight is a limit in the code, not a tested maximum: only two-node clusters have been run end to end. Three-node failure and recovery is open in [#10](https://github.com/iam-saiteja/Compute-Pool/issues/10).
 
 ## Quick start
 
@@ -165,7 +230,8 @@ You don't need to modify Compute Pool to run your own training or inference code
 ## Commands
 
 ```bash
-compute-pool login --slot N          # store a Kaggle account's credentials for slot N
+compute-pool login --slot N          # store a Kaggle account's credentials for slot N (asks once to accept the policy)
+compute-pool pwd                     # set or change the web terminal / file manager password
 compute-pool accounts status         # GPU-hours remaining per configured account
 compute-pool probe --slot N          # quick GPU/driver check on one account
 compute-pool shell --slot N          # single-node interactive GPU terminal

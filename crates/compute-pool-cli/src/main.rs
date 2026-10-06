@@ -3,7 +3,10 @@ use clap::{Args, Parser, Subcommand};
 use colored::*;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
 use compute_pool_core::{
-    auth::{load_credentials, save_credentials, Credentials, MAX_ACCOUNT_SLOTS},
+    auth::{
+        load_credentials, load_settings, save_credentials, save_settings, validate_web_password,
+        Credentials, MAX_ACCOUNT_SLOTS,
+    },
     job::{Job, JobSpec, JobState},
     kaggle::KaggleClient,
     probe::run_probe,
@@ -21,7 +24,18 @@ use std::time::{Duration, Instant};
 #[derive(Parser, Debug)]
 #[command(
     name = "compute-pool",
-    about = "Compute Pool -- Native GPU Task Scheduler",
+    about = "Compute Pool -- pool several Kaggle accounts' GPUs into one cluster",
+    long_about = "Compute Pool launches Kaggle GPU sessions across one or more accounts, \
+bridges them into a cluster you can dispatch work to, and gives you the tools to run \
+independent, data-parallel or model-parallel workloads across them.\n\n\
+Typical first session:\n  \
+compute-pool login --slot 1          # store account 1 (asks once to accept the policy risk)\n  \
+compute-pool login --slot 2          # store account 2\n  \
+compute-pool pwd                     # set the web terminal / file manager password\n  \
+compute-pool shell --slot cluster    # launch a 2-node cluster and print its URLs\n\n\
+Account policy: Kaggle's terms are one account per person. Pooling accounts can get \
+them banned. Read https://github.com/iam-saiteja/Compute-Pool/issues/12 before using this.",
+    after_help = "Run `compute-pool <command> --help` for the options of a single command.",
     version
 )]
 struct Cli {
@@ -31,20 +45,24 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Save Kaggle credentials for an account slot (1 or 2)
+    /// Store a Kaggle account's username and API key for one slot (1 to 8)
     Login {
-        /// Account slot number (1 or 2)
+        /// Account slot number, 1 to 8. Each node in a cluster uses its own slot.
         #[arg(short, long, default_value = "1")]
         slot: usize,
 
-        /// Kaggle username
+        /// Kaggle username (prompted if omitted)
         #[arg(short, long)]
         username: Option<String>,
 
-        /// Kaggle API key / token
+        /// Kaggle API key (prompted, masked, if omitted)
         #[arg(short, long)]
         key: Option<String>,
     },
+
+    /// Set or change the password for the web terminal and file manager
+    #[command(name = "pwd")]
+    Pwd,
 
     /// Manage multi-account pool and inspect GPU quota
     Accounts {
@@ -326,6 +344,9 @@ async fn execute_command(command: Commands) -> Result<()> {
         Commands::Login { slot, username, key } => {
             handle_login(slot, username, key).await?;
         }
+        Commands::Pwd => {
+            set_web_password()?;
+        }
         Commands::Accounts { sub } => match sub {
             AccountsSubcommand::List => handle_accounts_list().await?,
             AccountsSubcommand::Status => handle_accounts_status().await?,
@@ -391,10 +412,56 @@ fn prompt_masked_password(prompt: &str) -> Result<String> {
     Ok(input.trim().to_string())
 }
 
+/// Asked once, before anything is stored or launched. Compute Pool pools several
+/// Kaggle accounts, and Kaggle's policy is one account per person, so the user
+/// has to accept that risk first. Declining stores nothing and runs nothing.
+fn ensure_policy_accepted() -> Result<()> {
+    let mut settings = load_settings()?;
+    if settings.risk_acknowledged {
+        return Ok(());
+    }
+    println!("\n{}", "Before you continue".bold().yellow());
+    println!("Compute Pool pools several Kaggle accounts into one cluster.");
+    println!("Kaggle's policy, as stated in its rules and community posts, is one account per person.");
+    println!("Accounts used this way can be banned, and that applies to every account in the pool.");
+    println!("I could not read Kaggle's full terms directly: check the current terms yourself.");
+    println!("Research: {}", "https://github.com/iam-saiteja/Compute-Pool/issues/12".cyan());
+    let accepted = dialoguer::Confirm::new()
+        .with_prompt("By continuing you agree to Kaggle's one-account policy and accept the ban risk. Accept?")
+        .default(false)
+        .interact()?;
+    if !accepted {
+        anyhow::bail!("Not accepted. Nothing was stored or launched.");
+    }
+    settings.risk_acknowledged = true;
+    save_settings(&settings)?;
+    Ok(())
+}
+
+/// Prompt for the web terminal / file manager password and store it. The fixed
+/// default is gone: the password is whatever the user sets here.
+fn set_web_password() -> Result<()> {
+    let pw = dialoguer::Password::new()
+        .with_prompt("New web password (letters, digits, and - _ . ! @ # % + =)")
+        .with_confirmation("Repeat the password", "The two passwords do not match")
+        .interact()?;
+    validate_web_password(&pw)?;
+    let mut settings = load_settings()?;
+    settings.web_password = Some(pw);
+    save_settings(&settings)?;
+    println!(
+        "{} Web password saved. It applies to the next `compute-pool shell`; \
+a session that is already running keeps the password it started with.",
+        "*".green().bold()
+    );
+    Ok(())
+}
+
 async fn handle_login(slot: usize, username: Option<String>, key: Option<String>) -> Result<()> {
     if slot == 0 || slot > MAX_ACCOUNT_SLOTS {
         anyhow::bail!("Slot must be between 1 and {}.", MAX_ACCOUNT_SLOTS);
     }
+    ensure_policy_accepted()?;
 
     let u = match username {
         Some(val) => val,
@@ -921,6 +988,14 @@ async fn handle_shell(
     open: bool,
     timeout: Option<u64>,
 ) -> Result<()> {
+    ensure_policy_accepted()?;
+    if load_settings()?.web_password.is_none() {
+        println!(
+            "{}",
+            "No web password is set yet. Set one now; it protects the web terminal and file manager.".yellow()
+        );
+        set_web_password()?;
+    }
     if slot_arg.eq_ignore_ascii_case("cluster") || slot_arg == "0" {
         println!("\n{}", format!("Connecting {}-node GPU task cluster...", nodes).bold().cyan());
         println!("{}", format!("  • Checking GPU quota on {} accounts...", nodes).dimmed());

@@ -23,6 +23,7 @@ Run on the master from /kaggle/working:
     python3 pipeline_master.py
 """
 import os
+import random
 import shlex
 import subprocess
 import sys
@@ -202,6 +203,18 @@ ds = load_dataset("tatsu-lab/alpaca", split="train").select(range(DATASET_ROWS))
 all_examples = [e for e in (encode(ex) for ex in ds) if any(label != -100 for label in e[1])]
 n_holdout = min(EVAL_HOLDOUT, max(1, len(all_examples) // 10))
 held_out, examples = all_examples[:n_holdout], all_examples[n_holdout:]
+
+# Batches are padded to their longest example, and the padding is sent over the
+# link as well as computed. Shuffle, then sort by length within windows of 64, so
+# consecutive examples are similar in length. That cuts padding from ~42% to ~7%
+# of the bytes moved at MICRO_BATCH_SIZE=4, with the same examples seen per epoch
+# (compute-pool#14). The seed is fixed, so a resumed run follows the same order.
+_order = list(range(len(examples)))
+random.Random(0).shuffle(_order)
+_bucketed = []
+for _c in range(0, len(_order), 64):
+    _bucketed += sorted(_order[_c:_c + 64], key=lambda i: len(examples[i][0]))
+examples = [examples[i] for i in _bucketed]
 log(f"{len(examples)} training examples, {len(held_out)} held out for eval; "
     f"{STEPS} steps x {MICROBATCHES} micro-batches x {MICRO_BATCH_SIZE} examples/micro-batch")
 

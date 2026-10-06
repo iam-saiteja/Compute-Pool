@@ -41,6 +41,10 @@ Open an issue with:
 - Match the existing style: comments explain *why* a line exists, not what it does; avoid adding a dependency for something a few lines of stdlib already covers; keep the shortest diff that's still correct, not the most defensive one.
 - No duplicate commands. If an existing command already does something, extend it or add a flag rather than adding a second name for the same action (`cp-dispatch` was removed for exactly this reason: it was a literal one-line alias for `crun --gpus`).
 
+## Branch protection
+
+`.github/ruleset.json` is the repository ruleset for the default branch: pull requests required, CI must pass, no force pushes, no deletion, linear history. Import it under the repo's Settings, Rules, Rulesets, New ruleset, Import a ruleset. The repository owner can still push directly (the bypass rule), so this only changes what's required of everyone else.
+
 ## Using an AI coding assistant on this repo
 
 See [AGENTS.md](AGENTS.md) first. It has the specific gotchas this codebase has already hit once (a few of them twice), so an agent doesn't rediscover them the slow way.

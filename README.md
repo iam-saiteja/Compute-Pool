@@ -254,3 +254,7 @@ compute-pool jobs list
 ## Scope
 
 This is not a managed GPU cloud and does not make several machines look like one CUDA device. It's a CLI that launches a fleet of Kaggle sessions, bridges them into one addressable cluster over SSH, and gives you primitives (checkpointing, a measured-fabric-aware strategy registry, a wire transport) to run independent, data-parallel, or model-parallel workloads across them — choosing which is your code's decision, not a constraint the platform imposes.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) — setup, what "done" means for a change that touches training code, and how to report a bug with evidence that's actually actionable.

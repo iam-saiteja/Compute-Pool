@@ -170,7 +170,7 @@ with open("/root/.ssh/authorized_keys", "w") as f:
     f.write(pubkey + "\n")
 os.chmod("/root/.ssh/authorized_keys", 0o600)
 
-subprocess.Popen([
+SSHD_ARGS = [
     "/usr/sbin/sshd", "-D", "-p", "2222",
     "-o", "PermitRootLogin=yes",
     "-o", "PubkeyAuthentication=yes",
@@ -182,7 +182,8 @@ subprocess.Popen([
     "-o", "PermitUserEnvironment=yes",
     "-o", "TCPKeepAlive=yes",
     "-o", "ClientAliveInterval=15",
-])
+]
+sshd_proc = subprocess.Popen(SSHD_ARGS)
 print("[*] SSH daemon active on port 2222 (master's public key installed).", flush=True)
 
 # Publish this sshd's host key so the master can pin it. Without this the master
@@ -265,9 +266,13 @@ except Exception:
 
 print(f"[*] Worker registered. Chisel: {chisel_url}, Files: {worker_files_url}", flush=True)
 
-# 6. Keep worker alive until STOP signal
+# 6. Keep worker alive until STOP signal. If the SSH server has exited, start it
+#    again: the master cannot restart it from outside, and it is the node's only path in.
 stop_url = f"https://ntfy.sh/{SESSION_ID}-stop/raw?poll=1"
 for _ in range(int(DURATION_MINUTES * 60 / 3)):
+    if sshd_proc.poll() is not None:
+        print("[!] sshd exited; restarting it", flush=True)
+        sshd_proc = subprocess.Popen(SSHD_ARGS)
     try:
         req = urllib.request.Request(stop_url)
         with urllib.request.urlopen(req, timeout=2) as r:
@@ -546,6 +551,14 @@ def ssh_run(name, cmd, timeout=10):
     except Exception as exc:
         return -1, str(exc)
 
+tunnels = {}  # index -> {"url": worker's tunnel URL, "proc": the local chisel client}
+
+def start_tunnel(index, url):
+    return subprocess.Popen(
+        ["/usr/local/bin/chisel", "client", "--keepalive", "10s", url, f"{SSH_PORT_BASE + index}:127.0.0.1:2222"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+
 def peer_worker(index, session_id):
     name = f"node{index}"
     worker = None
@@ -580,10 +593,7 @@ def peer_worker(index, session_id):
         return
     with open("/root/.ssh/known_hosts", "a") as kh:
         kh.write(f"[127.0.0.1]:{SSH_PORT_BASE + index} {hostkey}\n")
-    subprocess.Popen(
-        ["/usr/local/bin/chisel", "client", "--keepalive", "10s", worker["chisel_url"], f"{SSH_PORT_BASE + index}:127.0.0.1:2222"],
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
+    tunnels[index] = {"url": worker["chisel_url"], "proc": start_tunnel(index, worker["chisel_url"])}
     rc, out = -1, ""
     for _ in range(30):
         rc, out = ssh_run(name, "nvidia-smi -L")
@@ -603,6 +613,12 @@ def health_loop():
             targets = [n["name"] for n in nodes if not n["local"] and n["status"] in ("online", "down")]
         for name in targets:
             rc, _ = ssh_run(name, "true", timeout=5)
+            # If our tunnel process itself died, the worker can't be reached until we
+            # restart it. Its own tunnel and SSH server are still the ones it published.
+            index = int(name[len("node"):])
+            tunnel = tunnels.get(index)
+            if rc != 0 and tunnel and tunnel["proc"].poll() is not None:
+                tunnel["proc"] = start_tunnel(index, tunnel["url"])
             went_down = False
             came_back = False
             with state_lock:

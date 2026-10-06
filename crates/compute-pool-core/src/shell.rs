@@ -1137,20 +1137,23 @@ async fn ensure_quota(slot: usize, needed_hours: f64) -> Result<()> {
     Ok(())
 }
 
+/// Launch a cluster from the given account slots. The first slot is the master,
+/// the rest are workers, in the order given.
 pub async fn launch_cluster_shell(
-    nodes: usize,
+    slots: Vec<usize>,
     duration_minutes: u32,
     timeout_seconds: Option<u64>,
 ) -> Result<ClusterShellInfo> {
+    let nodes = slots.len();
     if nodes < 2 {
-        anyhow::bail!("A cluster needs at least 2 nodes");
+        anyhow::bail!("A cluster needs at least 2 accounts. Add one with `compute-pool login`, or choose with `compute-pool cluster use`.");
     }
     if nodes > MAX_ACCOUNT_SLOTS {
         anyhow::bail!("At most {} nodes are supported (one Kaggle account per node)", MAX_ACCOUNT_SLOTS);
     }
 
     let mut creds = Vec::with_capacity(nodes);
-    for slot in 1..=nodes {
+    for &slot in &slots {
         let c = load_credentials(slot)?.ok_or_else(|| {
             anyhow::anyhow!("Slot {} not configured. Run `compute-pool login --slot {}`", slot, slot)
         })?;
@@ -1161,7 +1164,7 @@ pub async fn launch_cluster_shell(
     // waits for the slowest check, not the sum of all four.
     let needed_hours = duration_minutes as f64 / 60.0;
     let mut checks = tokio::task::JoinSet::new();
-    for slot in 1..=nodes {
+    for &slot in &slots {
         checks.spawn(ensure_quota(slot, needed_hours));
     }
     while let Some(joined) = checks.join_next().await {
@@ -1171,10 +1174,10 @@ pub async fn launch_cluster_shell(
     let suffix = random_suffix();
     let master_id = format!("cp-master-{}", suffix);
     let worker_ids: Vec<String> = (1..nodes).map(|i| format!("cp-worker{}-{}", i, suffix)).collect();
-    let all_slots: Vec<usize> = (1..=nodes).collect();
+    let all_slots: Vec<usize> = slots.clone();
 
     for idx in 0..nodes {
-        let slot = idx + 1;
+        let slot = slots[idx];
         let session = if idx == 0 { master_id.clone() } else { worker_ids[idx - 1].clone() };
         let mut job = Job::new(
             format!("job-cluster-node{}", idx),
@@ -1210,14 +1213,14 @@ pub async fn launch_cluster_shell(
                 .replace("__SESSION_ID__", wid)
                 .replace("__DURATION_MINUTES__", &duration_minutes.to_string())
                 .replace("__MASTER_SESSION_ID__", &master_id)
-                .replace("__NODE_LABEL__", &format!("node{}-slot{}", node_idx, node_idx + 1))
+                .replace("__NODE_LABEL__", &format!("node{}-slot{}", node_idx, slots[node_idx]))
                 .replace("__WEB_PASSWORD__", &password),
         );
     }
 
     let mut pushes = tokio::task::JoinSet::new();
     for (idx, script) in scripts.into_iter().enumerate() {
-        let slot = idx + 1;
+        let slot = slots[idx];
         let client = KaggleClient::new(&creds[idx].username, &creds[idx].key);
         let slug = shell_slug_for_slot(slot);
         let label = if idx == 0 { "master".to_string() } else { format!("worker node{}", idx) };
@@ -1288,13 +1291,13 @@ pub async fn launch_cluster_shell(
     let mut node_infos = Vec::with_capacity(nodes);
     node_infos.push(ClusterNodeInfo {
         node_index: 0,
-        slot: 1,
+        slot: slots[0],
         username: creds[0].username.clone(),
         files_url: read_ntfy_url(&client, &format!("{}-files", master_id), &re).await,
-        kernel_ref: format!("{}/{}", creds[0].username, shell_slug_for_slot(1)),
+        kernel_ref: format!("{}/{}", creds[0].username, shell_slug_for_slot(slots[0])),
     });
     for (i, wid) in worker_ids.iter().enumerate() {
-        let slot = i + 2;
+        let slot = slots[i + 1];
         node_infos.push(ClusterNodeInfo {
             node_index: i + 1,
             slot,

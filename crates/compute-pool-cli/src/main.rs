@@ -4,8 +4,8 @@ use colored::*;
 use comfy_table::{presets::UTF8_FULL, Cell, Color, ContentArrangement, Table};
 use compute_pool_core::{
     auth::{
-        load_credentials, load_settings, save_credentials, save_settings, validate_web_password,
-        Credentials, MAX_ACCOUNT_SLOTS,
+        cluster_slots, load_credentials, load_settings, save_credentials, save_settings,
+        validate_web_password, Credentials, MAX_ACCOUNT_SLOTS,
     },
     job::{Job, JobSpec, JobState},
     kaggle::KaggleClient,
@@ -64,6 +64,12 @@ enum Commands {
     #[command(name = "pwd")]
     Pwd,
 
+    /// Choose which configured accounts make up the cluster (default: all of them)
+    Cluster {
+        #[command(subcommand)]
+        sub: Option<ClusterSubcommand>,
+    },
+
     /// Manage multi-account pool and inspect GPU quota
     Accounts {
         #[command(subcommand)]
@@ -83,15 +89,11 @@ enum Commands {
         slot: usize,
     },
 
-    /// Launch live interactive GPU web terminal (single node or two-node task cluster)
+    /// Launch a live GPU web terminal: one account, or a cluster of the accounts chosen with `cluster`
     Shell {
-        /// Account slot number, or 'cluster' for a multi-node master-worker session
+        /// An account slot number, or 'cluster' (the default) for the accounts chosen with `compute-pool cluster`
         #[arg(short, long, default_value = "cluster")]
         slot: String,
-
-        /// Number of cluster nodes, one Kaggle account each (cluster mode only)
-        #[arg(short = 'n', long, default_value_t = 2)]
-        nodes: usize,
 
         /// Session duration in minutes (max 120)
         #[arg(short, long, default_value = "120")]
@@ -114,6 +116,20 @@ enum Commands {
         slot: Option<usize>,
     },
 
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterSubcommand {
+    /// Show which accounts the next cluster uses (also the default with no subcommand)
+    Show,
+    /// Use only these accounts, e.g. `cluster use 1 3`. The first one is the master.
+    Use {
+        /// Account slots, 1 to 8
+        #[arg(required = true, value_name = "SLOT")]
+        slots: Vec<usize>,
+    },
+    /// Use every configured account again
+    Reset,
 }
 
 #[derive(Subcommand, Debug)]
@@ -372,12 +388,14 @@ async fn execute_command(command: Commands) -> Result<()> {
         }
         Commands::Shell {
             slot,
-            nodes,
             duration,
             open,
             timeout,
         } => {
-            handle_shell(&slot, nodes, duration, open, timeout).await?;
+            handle_shell(&slot, duration, open, timeout).await?;
+        }
+        Commands::Cluster { sub } => {
+            handle_cluster(sub.unwrap_or(ClusterSubcommand::Show))?;
         }
         Commands::ShellStop { slot } => {
             handle_shell_stop(slot).await?;
@@ -441,6 +459,67 @@ fn ensure_policy_accepted() -> Result<()> {
     }
     settings.risk_acknowledged = true;
     save_settings(&settings)?;
+    Ok(())
+}
+
+fn join_slots(slots: &[usize]) -> String {
+    slots.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ")
+}
+
+fn configured_slots() -> Result<Vec<usize>> {
+    let mut configured = Vec::new();
+    for slot in 1..=MAX_ACCOUNT_SLOTS {
+        if load_credentials(slot)?.is_some() {
+            configured.push(slot);
+        }
+    }
+    Ok(configured)
+}
+
+/// `cluster` shows the accounts the next cluster uses. `use` and `reset` change them.
+fn handle_cluster(sub: ClusterSubcommand) -> Result<()> {
+    let mut settings = load_settings()?;
+    match sub {
+        ClusterSubcommand::Show => {
+            let configured = configured_slots()?;
+            if configured.is_empty() {
+                println!("No accounts are configured yet. Run `compute-pool login`.");
+                return Ok(());
+            }
+            let chosen = cluster_slots()?;
+            println!("\n{}", "Cluster accounts".bold());
+            for slot in &configured {
+                let user = load_credentials(*slot)?.map(|c| c.username).unwrap_or_default();
+                let mark = if chosen.contains(slot) {
+                    "in cluster".green().to_string()
+                } else {
+                    "not used".dimmed().to_string()
+                };
+                println!("  Slot {:<3} {:<28} {}", slot, user, mark);
+            }
+            let how = if settings.cluster_slots.is_some() {
+                "chosen with `cluster use`"
+            } else {
+                "all configured accounts, the default"
+            };
+            println!("\n  The cluster uses {} accounts ({}): {}.", chosen.len(), how, join_slots(&chosen));
+            println!("  Change it with `cluster use <slots>`, e.g. `cluster use 1 3`. Go back to all with `cluster reset`.");
+        }
+        ClusterSubcommand::Use { slots } => {
+            let chosen = compute_pool_core::auth::resolve_cluster_slots(&configured_slots()?, Some(&slots))?;
+            if chosen.len() < 2 {
+                anyhow::bail!("A cluster needs at least 2 accounts. Choose more with `cluster use <slots>`.");
+            }
+            settings.cluster_slots = Some(chosen.clone());
+            save_settings(&settings)?;
+            println!("{} The cluster will use accounts {}.", "*".green().bold(), join_slots(&chosen));
+        }
+        ClusterSubcommand::Reset => {
+            settings.cluster_slots = None;
+            save_settings(&settings)?;
+            println!("{} The cluster will use every configured account again.", "*".green().bold());
+        }
+    }
     Ok(())
 }
 
@@ -1026,7 +1105,6 @@ fn handle_jobs_reindex() -> Result<()> {
 
 async fn handle_shell(
     slot_arg: &str,
-    nodes: usize,
     duration: u32,
     open: bool,
     timeout: Option<u64>,
@@ -1040,12 +1118,14 @@ async fn handle_shell(
         set_web_password()?;
     }
     if slot_arg.eq_ignore_ascii_case("cluster") || slot_arg == "0" {
-        println!("\n{}", format!("Connecting {}-node GPU task cluster...", nodes).bold().cyan());
+        let slots = cluster_slots()?;
+        let nodes = slots.len();
+        println!("\n{}", format!("Connecting {}-node GPU task cluster (accounts {})...", nodes, join_slots(&slots)).bold().cyan());
         println!("{}", format!("  • Checking GPU quota on {} accounts...", nodes).dimmed());
         println!("{}", "  • Submitting master and worker kernels in parallel...".dimmed());
         println!("{}", "  • Bridging each worker over a Chisel/Cloudflare tunnel...".dimmed());
 
-        let info = launch_cluster_shell(nodes, duration, timeout).await?;
+        let info = launch_cluster_shell(slots, duration, timeout).await?;
         println!("\n{}", "Compute Pool -- GPU Task Cluster".bold().green());
         println!("  Nodes:                 {} (one Kaggle account each)", info.nodes.len());
         println!("  Master Web Terminal:   {}", info.web_url.bold().cyan());

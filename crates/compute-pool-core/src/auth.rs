@@ -24,6 +24,37 @@ pub struct Settings {
     /// Password for the web terminal and file manager on every node. Set by the user.
     #[serde(default)]
     pub web_password: Option<String>,
+    /// Accounts the cluster uses. None means every configured account.
+    #[serde(default)]
+    pub cluster_slots: Option<Vec<usize>>,
+}
+
+/// The slots a cluster uses: the chosen ones if set, otherwise every configured one.
+/// A chosen slot that is not configured is an error, not silently dropped.
+pub fn resolve_cluster_slots(configured: &[usize], selected: Option<&[usize]>) -> Result<Vec<usize>> {
+    let mut configured = configured.to_vec();
+    configured.sort_unstable();
+    let Some(selected) = selected else {
+        return Ok(configured);
+    };
+    let mut chosen = selected.to_vec();
+    chosen.sort_unstable();
+    chosen.dedup();
+    if chosen.is_empty() {
+        anyhow::bail!("The cluster needs at least one account. Run `compute-pool cluster reset`.");
+    }
+    for slot in &chosen {
+        if !configured.contains(slot) {
+            anyhow::bail!("Slot {} is not configured. Run `compute-pool login --slot {}`.", slot, slot);
+        }
+    }
+    Ok(chosen)
+}
+
+/// The slots the next cluster will use, from the stored selection.
+pub fn cluster_slots() -> Result<Vec<usize>> {
+    let configured: Vec<usize> = load_all_credentials()?.keys().copied().collect();
+    resolve_cluster_slots(&configured, load_settings()?.cluster_slots.as_deref())
 }
 
 pub fn get_credentials_dir() -> Result<PathBuf> {
@@ -128,6 +159,24 @@ mod tests {
         assert!(validate_web_password("back\\slash").is_err());
         assert!(validate_web_password("new\nline").is_err());
         assert!(validate_web_password("a b c d").is_err(), "spaces are not allowed");
+    }
+
+    #[test]
+    fn test_cluster_slots_default_to_every_configured_account() {
+        assert_eq!(resolve_cluster_slots(&[3, 1, 2], None).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_cluster_slots_use_only_the_chosen_accounts() {
+        // The example from the user: three accounts, cluster uses 1 and 3.
+        assert_eq!(resolve_cluster_slots(&[1, 2, 3], Some(&[3, 1])).unwrap(), vec![1, 3]);
+        assert_eq!(resolve_cluster_slots(&[1, 2, 3], Some(&[1, 1, 3])).unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn test_cluster_slots_reject_unconfigured_and_empty_selections() {
+        assert!(resolve_cluster_slots(&[1, 2], Some(&[1, 5])).is_err(), "slot 5 is not configured");
+        assert!(resolve_cluster_slots(&[1, 2], Some(&[])).is_err(), "empty selection");
     }
 
     #[test]

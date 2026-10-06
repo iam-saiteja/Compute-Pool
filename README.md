@@ -107,11 +107,12 @@ Eight is a limit in the code, not a tested maximum: only two-node clusters have 
 ```bash
 compute-pool login --slot 1
 compute-pool login --slot 2
-compute-pool shell --slot cluster            # 2 nodes (default)
-compute-pool shell --slot cluster --nodes 4  # N nodes, one Kaggle account per node
+compute-pool cluster                         # which accounts the cluster uses (default: all configured)
+compute-pool cluster use 1 3                 # use only slots 1 and 3, e.g. to leave slot 2 out
+compute-pool shell --slot cluster            # launch the cluster from the chosen accounts
 ```
 
-Each node needs its own account slot (`login --slot N`, up to 8). Before launching, the CLI checks every account has enough GPU hours left for the session; if any account doesn't, or any worker fails to come online, the whole cluster is stopped and the failing account is reported — you never end up with a partially-billed cluster you didn't ask for.
+Each node uses one configured account. `compute-pool cluster` chooses which accounts, and by default every configured account is used, in slot order. The first chosen account is the master. A cluster needs at least two accounts. Before launching, the CLI checks every account has enough GPU hours left for the session; if any account doesn't, or any worker fails to come online, the whole cluster is stopped and the failing account is reported — you never end up with a partially-billed cluster you didn't ask for.
 
 Inside the master terminal, `cluster-status` shows every node's state:
 
@@ -235,7 +236,8 @@ compute-pool pwd                     # set or change the web terminal / file man
 compute-pool accounts status         # GPU-hours remaining per configured account
 compute-pool probe --slot N          # quick GPU/driver check on one account
 compute-pool shell --slot N          # single-node interactive GPU terminal
-compute-pool shell --slot cluster [--nodes N] [--duration MIN]
+compute-pool cluster [show|use <slots>|reset]   # choose the accounts a cluster uses
+compute-pool shell --slot cluster [--duration MIN]
 compute-pool shell-stop [--slot N]   # tear down a session (all, if no slot given)
 compute-pool jobs submit --script train.py
 compute-pool jobs list
@@ -247,6 +249,7 @@ compute-pool jobs list
 
 - **No tight synchronous cross-node collectives.** `torch.distributed` (gloo/NCCL) needs direct node-to-node connections; Kaggle containers accept no inbound connections at all, so standard `torch.distributed` process groups across nodes don't work on this fabric regardless of configuration. Use the SSH-based primitives in `workers/kaggle/wire.py` instead (paradigms 2 and 3 above). Multi-GPU training *within* one node via `torch.distributed` is unaffected.
 - **Both pipeline stages currently download the full base model** before dropping the half they don't need ([#5](https://github.com/iam-saiteja/Compute-Pool/issues/5)) — saves steady-state memory, not startup time.
+- **Examples and clusters of three or more nodes.** `crun` and `pool-map` use every node in the cluster. The two example pipelines and `allreduce_logreg.py` are written for two nodes: they use node0 and node1, and any further node sits idle. Changing that means generalizing their stage or shard layout, which is not done.
 - **A third account is needed to test beyond 2 nodes' failure/recovery paths** ([#10](https://github.com/iam-saiteja/Compute-Pool/issues/10)).
 - See the [issue tracker](https://github.com/iam-saiteja/Compute-Pool/issues) for the full, current list with reproduction evidence from the live cluster.
 

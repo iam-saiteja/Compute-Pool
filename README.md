@@ -68,7 +68,7 @@ The cluster launch checks every account's GPU quota in parallel, so a larger clu
 
 - Run `compute-pool --help`, or `compute-pool <command> --help`, for the options of each command.
 - For a problem with a workload, the **examples are the reference**. Start with the closest one: `examples/cluster_comm/allreduce_logreg.py` for data-parallel, `examples/pipeline_lora/` for model-parallel, `crun`/`pool-map` for independent tasks.
-- Logs from a run show which side failed. A `[master] worker connection lost` line means the worker died; rerun the same command with the same job id to resume.
+- Logs from a run show which side failed. A `stage N disconnected; reconnecting it...` line means the pipeline recovered on its own -- nothing to do. A `worker connection lost ... discarded steps ... rerun this script` line means it gave up after repeated failed reconnects; rerun the same command with the same job id to resume.
 
 If you ask an AI assistant for help, paste this prompt first so it works from the same facts:
 
@@ -89,8 +89,8 @@ Ask me for the exact command and the full error before diagnosing. Then suggest 
 ## What this can do
 
 - **Data parallelism:** yes. Each node computes gradients on its share of the data and they are summed with an all-reduce over SSH. `examples/cluster_comm/allreduce_logreg.py` checks the result against a single-node run.
-- **Model parallelism (pipeline):** yes. A model is split across two nodes and micro-batches flow through both. `examples/pipeline_lora/` trains an 8B model's LoRA adapters this way, with checkpoint and resume.
-- **Several GPUs at the same time:** yes across nodes, since each node runs its own stage. Within a node, the layers are split across its GPUs, but the two GPUs run one after the other for a given micro-batch. Running them in parallel is not done yet (issue #14).
+- **Model parallelism (pipeline):** yes. A model is split into one stage per node (two nodes, three, or more -- verified on both), and every micro-batch flows through every stage in order. `examples/pipeline_lora/` trains an 8B model's LoRA adapters this way, with coordinated checkpoint/resume across every stage and automatic reconnect if a stage's link drops mid-run.
+- **Several GPUs at the same time:** yes across nodes, since each node runs its own stage. Within a node, both GPUs stay mostly idle regardless of how the work is split across them -- measured directly (0% utilization on every GPU, including with no cross-node link contention at all): the pipeline is bound by the link's bandwidth and round-trip latency, not by local compute, so local parallelism (software or a second GPU) has nothing to overlap with. See issue #14's closing comment for the measurement.
 - **Not supported:** tight collectives across nodes on every step (`torch.distributed` gloo/NCCL), and tensor parallelism across nodes. Both need direct node-to-node connections, which Kaggle does not allow.
 
 ## How many accounts
@@ -100,7 +100,7 @@ The code allows up to **8 account slots** (`MAX_ACCOUNT_SLOTS` in `auth.rs`). Ea
 - **Independent work** (`crun`, `pool-map`) scales with the number of nodes. The SSH ports and the registry grow with the cluster, and this is the path that scales best.
 - **Pipeline work** is two stages in the example. A three-stage pipeline is not implemented, so extra nodes do not speed up a single pipeline.
 
-Eight is a limit in the code, not a tested maximum: only two-node clusters have been run end to end. Three-node failure and recovery is open in [#10](https://github.com/iam-saiteja/Compute-Pool/issues/10).
+Eight is a limit in the code, not a tested maximum: two- and three-node clusters have been run end to end, including node failure and automatic recovery (tunnel restart, dead SSH server restart). Four or more is untested, not expected to be fundamentally different, but unproven.
 
 ## Quick start
 
@@ -174,7 +174,7 @@ That example is a minimal, numerically-checked reference (distributed vs. single
 
 ### 3. Model-parallel / pipeline training — split a model too large for one GPU across nodes
 
-For a model too large for a single node's GPU memory, split it in half (or more) across nodes and pipeline micro-batches through it: `examples/pipeline_lora/` fine-tunes an 8B-parameter Llama model's LoRA adapters this way, split across two nodes, and is verified end to end on a live cluster.
+For a model too large for a single node's GPU memory, split it into one stage per node and pipeline micro-batches through all of them: `examples/pipeline_lora/` fine-tunes an 8B-parameter Llama model's LoRA adapters this way, and is verified end to end on a live two- and three-node cluster.
 
 ```bash
 # On the master, inside the cluster shell:
@@ -183,8 +183,9 @@ python3 examples/pipeline_lora/pipeline_master.py
 
 What it demonstrates, all reusable in your own pipeline-parallel script:
 
-- **Checkpoint/resume** (`workers/kaggle/checkpoint.py`): both stages save adapter state periodically and resume automatically; killing a node mid-run costs nothing but the steps since the last checkpoint.
-- **Coordinated checkpointing across stages**: the master drives each save, so the two halves of the model can't end up checkpointed at different steps after a crash.
+- **Checkpoint/resume** (`workers/kaggle/checkpoint.py`): every stage saves adapter state periodically and resumes automatically; killing a node mid-run costs nothing but the steps since the last checkpoint.
+- **Coordinated checkpointing across stages**: the master drives each save, so no stage can end up checkpointed at a different step than the others after a crash.
+- **Automatic reconnect**: if one stage's link drops mid-run, the master reconnects it, rolls every other stage back to the last checkpoint, and keeps training -- it doesn't just end the run and ask you to rerun it (up to a retry limit, after which it does fall back to that).
 - **Dynamic fp16 loss scaling** (`workers/kaggle/amp.py`) owned by whichever side applies it at the loss, since that scale factor is baked into every gradient downstream of it.
 - **Held-out evaluation and EMA-smoothed training loss**, so you get a real learning-progress signal instead of noisy per-step loss.
 - **Real multi-example batching** with hand-built padding + attention masks, not batch-size-1 micro-batches.
@@ -246,9 +247,8 @@ compute-pool jobs list
 ## Known limitations
 
 - **No tight synchronous cross-node collectives.** `torch.distributed` (gloo/NCCL) needs direct node-to-node connections; Kaggle containers accept no inbound connections at all, so standard `torch.distributed` process groups across nodes don't work on this fabric regardless of configuration. Use the SSH-based primitives in `workers/kaggle/wire.py` instead (paradigms 2 and 3 above). Multi-GPU training *within* one node via `torch.distributed` is unaffected.
-- **Both pipeline stages currently download the full base model** before dropping the half they don't need ([#5](https://github.com/iam-saiteja/Compute-Pool/issues/5)) — saves steady-state memory, not startup time.
-- **Examples and clusters of three or more nodes.** `crun` and `pool-map` use every node in the cluster. The two example pipelines and `allreduce_logreg.py` are written for two nodes: they use node0 and node1, and any further node sits idle. Changing that means generalizing their stage or shard layout, which is not done.
-- **A third account is needed to test beyond 2 nodes' failure/recovery paths** ([#10](https://github.com/iam-saiteja/Compute-Pool/issues/10)).
+- **`allreduce_logreg.py` is written for exactly two nodes.** `crun` and `pool-map` use every node in the cluster, and `pipeline_lora` now splits into one stage per node, but the data-parallel example still hardcodes a single worker. Generalizing it to N nodes is not done.
+- **Pipeline throughput is link-bound, not compute-bound** ([#14](https://github.com/iam-saiteja/Compute-Pool/issues/14), closed with that finding): measured directly, with every GPU on every node near 0% utilization during training. Reducing bytes moved per step, or restructuring the transport itself, would help; local parallelism (tested, reverted) does not.
 - See the [issue tracker](https://github.com/iam-saiteja/Compute-Pool/issues) for the full, current list with reproduction evidence from the live cluster.
 
 ## Scope

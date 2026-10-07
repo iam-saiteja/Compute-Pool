@@ -6,7 +6,9 @@ It does not give you new GPUs. It pools GPU time you already have (Kaggle's free
 
 Each Kaggle session keeps its own GPUs; this project does not merge them into one CUDA device. What it does is wire the sessions together over SSH and let you choose how work moves across them: independent tasks, data-parallel training, or a model split across nodes. See [Ways to use this infrastructure](#ways-to-use-this-infrastructure).
 
-**Use case.** A group of students on one shared project needs more compute than any one of them has alone. Say there are eight of them: each creates their own Kaggle account, one person per account, exactly as Kaggle expects, and logs in to their own slot with `compute-pool login`. Nobody shares a password, and nobody controls more than one account. The group then runs the project's training job as one cluster built from everyone's own, individually-earned weekly quota.
+**Use case.** A group of students on one shared project needs more compute than any one of them has alone. Say there are eight of them: each has their own Kaggle account, one person per account, exactly as Kaggle expects, and the group runs the project's training job as one cluster built from everyone's own, individually-earned weekly quota.
+
+**How that works today, honestly described:** one teammate runs `compute-pool login --slot N` for each account and launches the cluster from their own machine. That machine's local credentials file ends up holding every teammate's Kaggle API key, because the CLI needs an account's key to launch that account's Kaggle session directly. No one's Kaggle password is shared, and an API key is a scoped, revocable credential, not full account access, but the keys themselves are centralized on one machine today. That's a real limitation of the current design, not a detail to gloss over. See [Roadmap](#roadmap) for where this is headed.
 
 This project is for educational and personal use.
 
@@ -238,6 +240,10 @@ The code allows up to 8 account slots. Two things decide how useful more of them
 - **Pipeline work** splits across however many nodes are online, but the examples in this repo have only been run on two and three.
 
 Eight is a limit in the code, not a tested maximum. Two- and three-node clusters have been run end to end, including a node failing and recovering automatically. Four or more is untested.
+
+## Roadmap
+
+**No shared API keys.** Today, one machine's local credentials file has to hold every teammate's Kaggle API key, because that one CLI instance is what launches each account's Kaggle session directly. The planned fix: each person runs `compute-pool` on their own machine and logs in with only their own account, so their key never leaves it. Instead of handing the key over, their own locally-launched node joins a master's cluster as a worker through a separate access grant, the master coordinates the job without ever holding a teammate's raw key. This isn't built yet; the single-credentials-file design described above is what actually runs today.
 
 ## Known limitations
 

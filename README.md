@@ -6,6 +6,10 @@ It does not give you new GPUs. It pools GPU time you already have (Kaggle's free
 
 Each Kaggle session keeps its own GPUs; this project does not merge them into one CUDA device. What it does is wire the sessions together over SSH and let you choose how work moves across them: independent tasks, data-parallel training, or a model split across nodes. See [Ways to use this infrastructure](#ways-to-use-this-infrastructure).
 
+**Use case.** A group of students on one shared project needs more compute than any one of them has alone. Say there are eight of them: each creates their own Kaggle account, one person per account, exactly as Kaggle expects, and logs in to their own slot with `compute-pool login`. Nobody shares a password, and nobody controls more than one account. The group then runs the project's training job as one cluster built from everyone's own, individually-earned weekly quota.
+
+This project is for educational and personal use.
+
 ## Architecture
 
 ```mermaid
@@ -265,6 +269,10 @@ In short: solid for the workload it's most tested on, functional but slow for pi
 
 ## Platform risk: read this before you use real Kaggle accounts
 
-Kaggle's policy, as stated in its own rules and community posts, is one account per person. Compute Pool's entire mechanism is pooling several. That's the pattern the policy describes, not an edge case of it. Every account in a pool is individually at risk of a ban.
+Kaggle's policy, as stated in its own rules and community posts, is one account per person. The use case this project is built for, a team where each member brings their own single account, respects that: nobody here controls more than one account, and nobody shares a login.
 
-The CLI asks you to accept this risk once, the first time you log in or launch a shell, and records your answer. That acceptance is you making an informed choice; it is not an agreement with Kaggle, and it does not change what Kaggle's policy says. The research behind this is in [issue history](https://github.com/iam-saiteja/Compute-Pool/issues?q=is%3Aissue+is%3Aclosed+platform), and it was done by a tool that could not read Kaggle's full terms directly, so check the current terms yourself before using this beyond your own private testing.
+What isn't verified is whether Kaggle's terms have anything further to say about several separate account holders deliberately combining their compute for one shared job. That's a different question from the one-account-per-person rule, and this project's research could not confirm an answer either way: it was done by a tool that could not read Kaggle's full terms directly. So the risk isn't zero, it just isn't the same risk as one person running several accounts. Check Kaggle's current terms yourself before relying on this for anything beyond your own team's experimentation, especially if you'd use it outside a small, informal group.
+
+The CLI asks you to accept this risk once, the first time you log in or launch a shell, and records your answer. That acceptance is you making an informed choice; it is not an agreement with Kaggle, and it does not change what Kaggle's terms actually say. The research behind this is in [issue history](https://github.com/iam-saiteja/Compute-Pool/issues?q=is%3Aissue+is%3Aclosed+platform).
+
+**If, instead, one person is behind every account in the pool:** that is the exact pattern Kaggle's one-account-per-person rule describes, not an edge case of it, and every account used that way is individually at risk of a ban.
